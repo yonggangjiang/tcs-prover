@@ -19,7 +19,7 @@ asymptotic goal in the statement.
 
 ```mermaid
 flowchart TD
-    S["Optional statement review"] --> A["Persistent author: a coordinator of author subagents, or one author"]
+    S["Optional statement review"] --> A["Persistent author, with its examiner"]
     A -- "continue research" --> A
     A -- "complete candidate" --> C["Critic + its independent critics"]
     C -- "reject: exact bugs and reset rounds" --> A
@@ -42,8 +42,8 @@ role's model and reasoning (see [Models and API connections](models.md)) and:
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| Author subagents | 3 | 0 to 10. 1 or more: an [author coordinator](#the-author-coordinator) runs up to that many author subagents at a time. 0: one author works alone, with no subagent tool. |
-| Subagent models | Same as the coordinator | With 1 or more author subagents. **Choose for each** gives each author subagent its own model and reasoning: a Codex CLI, Claude Code or API connection model, as the roles offer. See [the author's team](#the-authors-team). |
+| Parallel agents | 1 | 1 to 11: how many agents work at a time. 1: the author works alone. 2 or more: the author may also start subagents of its own, up to one fewer than this number at a time. See [the proof author](#the-author). |
+| Examiner | On | About once an hour a fresh session of the author's model examines the whole run and reports to the author. See [the examiner](#the-examiner). |
 | Independent critics | 3 | Fresh critics the critic starts on each proof version, 1 to 10. |
 | Maximum consecutive critic rounds | 2 | Edited passes in a row, 1 to 100; at the limit the latest repaired proof is accepted. |
 | Time limit in hours | 0 (none) | See [the job page](job-page.md#time-limit-and-progress-summary). |
@@ -126,26 +126,50 @@ Stopping a review is described under
 One root author conversation (a Codex goal thread or a Claude Code
 conversation) works on the statement for the whole run, across pauses,
 restarts, context compaction and critic rejections. What it does depends on
-**Author subagents** (`-authorSubagents N` in the terminal), 0 to 10, default 3:
+**Parallel agents**, 1 to 11, default 1 (in the terminal, `-authorSubagents N`
+with one fewer: the author's own subagents, 0 to 10):
 
-- **1 or more:** it is an [author coordinator](#the-author-coordinator), which
-  runs up to that many author subagents at a time and does not try to prove the
-  statement itself.
-- **0:** one author works on the proof alone, without a subagent tool. Its
+- **1:** the author works on the proof alone, without a subagent tool. Its
   instructions (the `author` prompt in `workflows/author_critic.yaml`) ask it to
   prove the exact statement even when it looks like a hard or long-standing open
-  problem, to think deeply and to try substantially different approaches when
-  one stalls. Its goal, continuation, reopen, resume and repair prompts repeat
-  that it must not give up. None of them asks for research notebooks or a file
-  layout.
+  problem, to keep its memory in the `memory` folder of its working directory
+  (its conversation is compacted from time to time, and what is not written
+  down is lost), to think deeply and to try substantially different approaches
+  when one stalls. Its goal, continuation, reopen, resume and repair prompts
+  repeat that it must not give up.
+- **2 or more:** the same author, with the same prompt, may also hand parts of
+  the work to subagents of its own: its program's subagent tool (Codex's or
+  Claude Code's), limited to one fewer than the number at a time, as Codex's
+  Ultra mode delegates. The `subagents` text tells it how many it may start.
+  The subagents run the author's model.
 
-The number, and with it the mode (coordinator or one author), is saved when the
+The earlier team design, the [author coordinator](#the-author-coordinator), is
+no longer what a new job gets: a job runs it only when it asks for it (in the
+terminal, `-teamCoordinator`; in a start request, `authorMode`), and a
+job that started with a coordinator keeps it when it is resumed or continued.
+
+The number, and with it the mode (an author, or the earlier coordinator), is saved when the
 job starts, shown in **Run settings**, and kept by resumes, continuations and
-folder runs. Jobs from before coordinator mode keep working as they did: one
-saved without the number runs one author, and one saved with 1 or more runs its
-author with the `author` prompt, which then ends with "You may start up to N
-independent subagents at a time, for example to explore other approaches or to
-check calculations; you do not need to ask the user."
+folder runs. With 2 or more parallel agents the `author` prompt ends with the
+`subagents` text: "You may start up to N independent subagents at a time, for
+example to explore other approaches or to check calculations; you do not need to
+ask the user." A job saved without the number (from before the setting) runs one
+author.
+
+### The examiner
+
+With **Examiner** on (the default), TCS Prover starts an examiner beside the
+author about once an hour while the author works, from the first hour on. Each
+examination is a fresh conversation of the author's model in the author's
+folder, with the `author_examiner` text as its whole instruction (**Edit
+prompts → Author → Examiner instructions**): it examines the whole run and
+judges whether progress towards a complete proof keeps growing. Its final reply
+is saved as `team/member-1/<k>-report.md` and sent into the author's running
+turn, framed by `author_examiner_report` (by default `[REPORT FROM THE
+EXAMINER]` and the report), the way a chat message is; the author goes on
+working with it, and the activity log shows *Examiner report delivered*. Codex
+and Claude Code authors both get it. **Examiner** off, or an empty
+`author_examiner` text, runs the author without one.
 
 ### The goal loop
 
@@ -197,14 +221,15 @@ mode):
 
 ### The author coordinator
 
-The coordinator does not try to prove the statement itself. Its prompt asks it
+This is the earlier team design, which a job runs only when it asks for it (see
+[the proof author](#the-author)). The coordinator does not try to prove
+the statement itself. Its prompt asks it
 to run the team of author subagents and check the team's health, so that
 progress on the problem grows steadily with the time spent, until the team has
-a complete proof that has been checked. The strategy is its own: how it
-organizes the team and its memory, how it judges progress (there are no fixed
-criteria; it can search the run's whole record in `transcript.jsonl` in its
-working folder), and how it brings the team back to steady progress when
-progress stalls or slows.
+a complete proof. The authors do the mathematics: it gives them the original
+exact statement and does not decide what each author should solve. How it
+organizes the team and its memory is its own choice, and it uses the
+examiner's reports and the authors' to judge whether to change that.
 
 - **Prompts.** Its first prompt is the per-job `coordinator` prompt, in place of
   the `author` prompt (**Coordinator prompt** in **Edit prompts → Coordinator**;
@@ -306,9 +331,14 @@ Claude Code's own subagents.
   examiner is idle, some author has reported before, and the last examination
   began at least an hour ago. Each examination is a fresh run of the
   coordinator's model, one turn long, in the same working folder; its whole
-  instruction is `team_examiner` (**Edit prompts → Team**: judge whether the
-  team makes steady progress, whether it has moved since several hours ago,
-  whether it repeats itself, and what it should do next; change no file). Its
+  instruction is `team_examiner` (**Edit prompts → Team**: examine the whole
+  trajectory; judge whether progress towards a complete proof grows steadily
+  with the time spent, what is still missing, and how that has changed since
+  several hours ago and since its own earlier reports; examine the
+  coordination and say what should change in how the team is run, leaving the
+  mathematics to the authors; check whether earlier changes helped). The
+  coordinator's prompt leaves the examination of the whole run to these
+  reports. Its
   final reply is its report, saved as `team/member-<N+1>/<k>-report.md`, and
   `team_wait` returns it like an author's report, usually while the author is
   still working. The coordinator cannot assign or stop the examiner;
@@ -479,9 +509,8 @@ reads them and makes the one decision.
 
 ### Subagents: what the program enforces
 
-Only the critic and, with **Author subagents** 1 or more, the author (an author
-coordinator, or the author of a job from before coordinator mode) have
-subagents; the statement reviewer, the LaTeX writer and the paused author's
+Only the critic and, with **Parallel agents** 2 or more, the author (or an
+author coordinator) have subagents; the statement reviewer, the LaTeX writer and the paused author's
 replies have none.
 
 An author coordinator with [TCS Prover's team](#the-authors-team) has exactly

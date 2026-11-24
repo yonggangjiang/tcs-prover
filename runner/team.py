@@ -509,13 +509,16 @@ class Team:
 
     def __init__(self, members, *, prompts, directory, attempt, configuration, emit, render, retry_note,
                  retry_seconds=60, stop_process=None, conversation=None, discard=None, unavailable=None,
-                 describe=None, examiner=None):
+                 describe=None, examiner=None, lone=False):
         self.members = {entry["member"]: _Member(entry) for entry in members}
         # The examiner's seat (an entry like a member's, numbered after the members), or None: without the
         # team_examiner text there is none. The coordinator's tools cannot address it.
         self.examiner = (_Member(examiner) if examiner and str(prompts.get("team_examiner") or "").strip()
                          and examiner["member"] not in self.members else None)
-        self.examined = 0.0   # time.time() as the last examination began
+        # A lone author's examiner (no members, no coordinator): examinations come every EXAMINATION_SECONDS from
+        # the start, whatever is reported, and examine() starts them; take_reports() collects their reports.
+        self.lone = lone
+        self.examined = time.time() if lone else 0.0   # time.time() as the last examination began
         self.reported = False  # an author of this team has finished an assignment
         self.prompts, self.directory = prompts, Path(directory)
         self.attempt, self.configuration, self.emit, self.render = attempt, configuration, emit, render
@@ -664,12 +667,15 @@ class Team:
         """Start an examination when one is due (EXAMINATION_SECONDS); called with the lock held."""
 
         seat = self.examiner
-        if (seat is None or self.closed is not None or seat.state != "idle" or not self.running()
+        if (seat is None or self.closed is not None or seat.state != "idle"
                 or time.time() - self.examined < EXAMINATION_SECONDS):
             return
-        if not self.reported and not any(reported(self.directory, number) for number in self.members):
-            return  # Nothing to examine yet: no author has reported.
-        self.reported = True
+        if not self.lone:
+            if not self.running():
+                return
+            if not self.reported and not any(reported(self.directory, number) for number in self.members):
+                return  # Nothing to examine yet: no author has reported.
+            self.reported = True
         seat.state, seat.task, seat.since = "working", EXAMINER_TASK, time.time()
         self.examined = seat.since
         seat.count = max(seat.count, highest_report(self.directory, seat.number)) + 1
@@ -754,6 +760,21 @@ class Team:
                 if left <= 0:
                     return f"No assignment finished within {minutes:g} minutes.\n" + self.listing()
                 self.cond.wait(min(left, 5))
+
+    def examine(self):
+        """Start an examination when one is due (a lone author's examiner, see ``lone``)."""
+
+        with self.cond:
+            self._examine()
+
+    def take_reports(self):
+        """The reports that finished since the last call, each once: {head, where, text, file} (a lone author's
+        examiner, whose reports reach the author instead of a team_wait)."""
+
+        with self.cond:
+            reports = list(self.done)
+            self.done.clear()
+        return reports
 
     def release_waits(self):
         """End every running team_wait without taking a report or an attention, and leave the team working.

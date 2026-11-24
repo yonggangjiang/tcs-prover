@@ -1716,8 +1716,11 @@ def pause_request_cause(path):
 
 def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                  node_name="author", stages=None, initial_instruction="", handoff_note="", coordinator=False,
-                 alone=None, texts=None, team=None, service=None):
+                 alone=None, texts=None, team=None, service=None, examiner=None):
     """Run the persistent author through Claude with the Codex goal-session protocol.
+
+    ``examiner`` is the author's examiner (workflow_runner.start_team(lone=True)): each report it finishes is sent
+    into the author's running turn as author_examiner_report, the way a live instruction is.
 
     Drop-in replacement for workflow_runner.goal_session: same generator
     protocol, events, labels, pause/time-limit behaviour and WorkflowPaused
@@ -1878,6 +1881,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     # message uuid -> (kind, steer id or re-anchor text) until Claude echoes it as consumed,
     # and the same for input given up on after QUEUED_INPUT_SECONDS.
     pending, given_up = {}, {}
+    # The examiner's reports the author has not received yet, oldest first, and when the next try may go.
+    examiner_reports, examiner_wait = [], {"until": 0.0}
     # A coordinator with TCS Prover's team that works without it is listed under Needs your attention while it works
     # on (workflow_runner.CoordinatorWatch): its model calls (one assistant message ID per request) and team calls,
     # each of which worked when TCS Prover's team answered it without an error, and the team's own count of members
@@ -2044,12 +2049,17 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         began = not state["running"]
         if began:
             begin_turn(f"turn-{uuid.uuid4().hex[:12]}")
-        if item[0] in {"steer", "compaction"} and not unexpected:
+        if item[0] in {"steer", "compaction", "examiner"} and not unexpected:
             state["steered"] = True
         if item[0] == "steer":
             state["steer"] = item[1]
             emit("status", label="Author instruction accepted", authorSteerDelivered=item[1],
                  text="The current conversation has received the live instruction.", threadId=thread)
+        elif item[0] == "examiner":
+            if examiner_reports and (examiner_reports[0].get("file") or "examiner") == item[1]:
+                examiner_reports.pop(0)
+            emit("status", label="Examiner report delivered", examinerReport=item[1],
+                 text="The author's current conversation has received the examiner's report.", threadId=thread)
         return began
 
     def answer_server(message):
@@ -2162,6 +2172,27 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 except Exception as exc:  # noqa: BLE001 - a warning must never stop the watcher.
                     team_watch.team = False
                     emit("diagnostic", text=f"The coordinator's team warnings stopped: {exc}", threadId=thread)
+            if examiner is not None and not pausing.is_set():
+                examiner.examine()
+                examiner_reports.extend(examiner.take_reports())
+                if (examiner_reports and time.monotonic() >= examiner_wait["until"]
+                        and not any(kind == "examiner" for kind, _ in list(pending.values()))):
+                    with lock:
+                        # Under the lock that ends turns, like a live instruction: only while a turn still runs.
+                        if state["active"] and state["running"] and state["turn"]:
+                            report = examiner_reports[0]
+                            identity = report.get("file") or "examiner"
+                            text = runtime.render_template((texts or {}).get("author_examiner_report") or "{report}",
+                                                           {"report": report["text"]})
+                            try:
+                                send_user(text, "examiner", identity)
+                                emit("request", label="Examiner report sent to the author", text=text,
+                                     threadId=session, examinerReport=identity)
+                            except (OSError, ValueError) as exc:
+                                examiner_wait["until"] = time.monotonic() + 60
+                                emit("diagnostic", threadId=thread,
+                                     text=f"The examiner's report could not be sent to the author yet ({exc}); it "
+                                          "is sent again.")
             if state["active"] and state["running"] and state["turn"]:
                 command = runtime.pending_author_steer(options.get("author_steer_file"), state["steer"])
                 if not command:
@@ -2788,6 +2819,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             # its caller is gone, and they are the next attempt's. The CLI has stopped and the team left the
             # service above, so no late call of this attempt starts another.
             team.release_waits()
+        if examiner is not None and retry is None:
+            examiner.close(ending["reason"])
         if subagents is not None and hasattr(subagents, "stopped"):
             # Its subagents ran in the CLI: the activity log says that those still running stopped.
             subagents.stopped(ending["reason"])

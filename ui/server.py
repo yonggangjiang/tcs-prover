@@ -57,18 +57,24 @@ except Exception:  # noqa: BLE001 - an edited workflow file must never keep the 
     DEFAULT_CRITIC_COUNT = 3
 MAX_CRITIC_COUNT = getattr(runtime, "MAX_CRITIC_COUNT", 10)
 # Subagents the proof author may start at a time (workflow_runner.py --author-subagents); 0 gives it no subagent tool.
-# With 1 or more a new job's author is a coordinator (AUTHOR_MODES): the runner's default (from author_critic.yaml),
-# or 3 when the runner does not define it.
+# The job setting authorSubagents: how many subagents the proof author may start at a time, one fewer than the
+# form's Parallel agents (the author itself is the first agent). 0, the default, is an author that works alone: the
+# runner's default (from author_critic.yaml), or 0 when the runner does not define it.
 try:
     DEFAULT_AUTHOR_SUBAGENTS = runtime.DEFAULT_AUTHOR_SUBAGENTS
 except Exception:  # noqa: BLE001 - an edited workflow file must never keep the server from starting.
-    DEFAULT_AUTHOR_SUBAGENTS = 3
+    DEFAULT_AUTHOR_SUBAGENTS = 0
 MAX_AUTHOR_SUBAGENTS = getattr(runtime, "MAX_AUTHOR_SUBAGENTS", 10)
 # How a job's proof author works, recorded when the job starts (authorMode; workflow_runner.py --author-mode):
-# "coordinator", with Author subagents 1 or more, coordinates that many author subagents; "author" works alone. A
-# job saved without it (every job from before the coordinator) is "author", and one saved without authorSubagents
-# has 0, so no older job becomes a coordinator when it is resumed or continued.
+# "author", every new job's unless it asks otherwise, proves the statement itself, alone or (authorSubagents 1 or
+# more) with its program's own subagent tool; "coordinator", the earlier team design, does not prove the statement
+# but coordinates that many author subagents. A job keeps the mode it recorded: one that started with a coordinator
+# is resumed and continued with one, and a job saved without a mode (every job from before the coordinator) is
+# "author".
 AUTHOR_MODES = ("coordinator", "author")
+# What a start passes for a job that keeps a coordinator job's mode (_kept_author_mode()): a coordinator while it has
+# 1 or more author subagents, else an author.
+KEPT_COORDINATOR = "kept-coordinator"
 # The author coordinator's progress log, which the job page shows (state.coordinatorProgress): the runner's
 # memory/progress.md in the author's working folder. The page gets its last MAX_PROGRESS_LOG_CHARS characters.
 MEMORY_FOLDER = getattr(runtime, "MEMORY_FOLDER", "memory")
@@ -1728,6 +1734,10 @@ def web_prompt_options(body, roles, source=None):
 # A job's goal loop when it records none: every job from before has Codex's goal mode (workflow_runner.GOAL_LOOPS);
 # new jobs, saved settings and requests without the setting get TCS Prover's.
 DEFAULT_GOAL_LOOP = "tcs"
+# The Examiner setting of a new job (the job setting examiner): an examiner beside the proof author, which TCS Prover
+# starts about once an hour and whose report it sends to the author (the author_examiner text). A job from before
+# the setting records none: it has an examiner only if it saved an author_examiner text of its own.
+DEFAULT_EXAMINER = True
 LEGACY_GOAL_LOOP = "codex"
 # The texts a job runs with (its promptSet, by catalog name: prompt_catalog), saved at its start in its controller
 # folder and its run folder; every launch passes the controller's copy to the runner (--prompt-set-file).
@@ -1767,6 +1777,8 @@ def web_team_options(body, source=None):
     source = source or {}
     return {"goal_loop": body.get("goalLoop", source.get("goalLoop", DEFAULT_GOAL_LOOP)),
             "author_subagent_models": body.get("authorSubagentModels", source.get("authorSubagentModels")),
+            # The Examiner setting: the request's, else the source job's, else on.
+            "examiner": body.get("examiner", source.get("examiner", DEFAULT_EXAMINER)),
             "prompt_overrides": texts, "prompt_edits": edits, "legacy_team": legacy}
 
 
@@ -1873,6 +1885,9 @@ def saved_team_state(run_dir):
         edits = saved_prompt_edits(run_dir)
         if edits is not None:
             state["promptEdits"] = edits
+    # The Examiner setting; a job from before it had an examiner only with an author_examiner text of its own.
+    state["examiner"] = (settings["examiner"] if isinstance(settings.get("examiner"), bool)
+                         else bool(texts is not None and str(texts.get("author_examiner") or "").strip()))
     return state
 
 
@@ -2183,15 +2198,18 @@ PROOF_PROMPTS = ("author", "critic", "final", "coordinator")
 def recorded_author_mode(author_subagents, requested=None):
     """The authorMode a job records when it starts (AUTHOR_MODES), for its number of author subagents.
 
-    ``requested`` None takes it from the number (coordinator with 1 or more); "author" keeps an author that
-    works alone (an older job and its continuations, or a terminal run's choice); "coordinator" needs 1 or more.
+    ``requested`` None or "author" is an author; "coordinator" asks for the earlier team design and needs 1 or
+    more author subagents; KEPT_COORDINATOR (a job that keeps a coordinator job's mode) is a coordinator with 1 or
+    more and an author with none.
     """
 
+    if requested == KEPT_COORDINATOR:
+        return "coordinator" if author_subagents else "author"
     if requested not in (None, *AUTHOR_MODES):
         raise ValueError("Choose coordinator or author as the author mode.")
     if requested == "coordinator" and not author_subagents:
         raise ValueError("The author coordinator needs Author subagents 1 or more.")
-    return "author" if requested == "author" or not author_subagents else "coordinator"
+    return "coordinator" if requested == "coordinator" else "author"
 
 
 def saved_author_mode(run_dir):
@@ -2494,6 +2512,8 @@ def empty_state(trace=None, trace_version=0):
         # Who runs a Codex author's goal loop (workflow_runner.GOAL_LOOPS): a job from before records none and has
         # Codex's ("codex"), see restore_saved_app.
         "goalLoop": DEFAULT_GOAL_LOOP,
+        # The Examiner setting (DEFAULT_EXAMINER).
+        "examiner": DEFAULT_EXAMINER,
         # The Subagent models setting: None ("Same as the coordinator") or one {model, effort} per author subagent.
         "authorSubagentModels": None,
         # A coordinator's TCS Prover team ([{member, model, modelLabel, program, effort, connection}]), or None: no
@@ -3634,7 +3654,7 @@ class App:
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
             "authorRepairDelivered", "pendingReanchor", "relatedWorksPending", "folderBatch", "authorQuestion",
             "timeLimitHistory", "resumeQueuedAt",
-            "goalLoop", "authorSubagentModels", "authorTeam", "legacyTeam", "apiWebSearch",
+            "goalLoop", "authorSubagentModels", "authorTeam", "legacyTeam", "apiWebSearch", "examiner",
         )
         # The solver rechecks historical settings while UI events persist
         # thread/steering state. Readers must never observe a truncated JSON.
@@ -4211,19 +4231,19 @@ class App:
         return state
 
     def _kept_author_mode(self, requested, source=None, in_place=False):
-        """The author mode a start asks for (see recorded_author_mode()), keeping older single authors single.
+        """The author mode a start asks for (see recorded_author_mode()): a job keeps the mode of the job it revises
+        or continues.
 
-        A job revised in place (``in_place``) that never recorded a mode (a job from before the coordinator) or
-        whose author works alone with subagents (only such a job and a continuation of one have that), and a
-        continuation of the saved job ``source`` whose author worked alone, keep an author that works alone;
-        anything else asks for ``requested``.
+        A job revised in place (``in_place``) and a continuation of the saved job ``source`` keep that job's mode:
+        an author stays an author, and a coordinator job stays one (KEPT_COORDINATOR). Anything else asks for
+        ``requested`` (None: an author).
         """
 
-        if in_place and (not self.state.get("authorModeRecorded", True)
-                         or (self.state.get("authorMode") == "author" and self.state.get("authorSubagents"))):
-            return "author"
-        if source and saved_author_mode(source) == "author":
-            return "author"
+        if in_place and self.run_dir:
+            return (KEPT_COORDINATOR if self.state.get("authorModeRecorded", True)
+                    and self.state.get("authorMode") == "coordinator" else "author")
+        if source:
+            return KEPT_COORDINATOR if saved_author_mode(source) == "coordinator" else "author"
         return requested
 
     @staticmethod
@@ -4263,9 +4283,11 @@ class App:
         retrieval_mode="live", retrieval_cutoff_utc="",
         workflow_stages=None, coordinator_prompt=None, author_mode=None,
         goal_loop=DEFAULT_GOAL_LOOP, author_subagent_models=None, prompt_overrides=None, prompt_edits=None,
-        legacy_team=False,
+        legacy_team=False, examiner=DEFAULT_EXAMINER,
     ):
         """Normalize and validate settings shared by both input modes.
+
+        ``examiner`` is the Examiner setting (DEFAULT_EXAMINER): whether the proof author gets an examiner.
 
         ``author_mode`` is the author mode a start asks for (recorded_author_mode()); the coordinator prompt is
         checked, and kept, only for a job whose author is a coordinator (else it is the default, unused).
@@ -4390,6 +4412,8 @@ class App:
             raise ValueError("Historical search requires Proof author enabled and Statement review disabled.")
         if goal_loop not in runtime.GOAL_LOOPS:
             raise ValueError("Choose TCS Prover or Codex as the goal loop.")
+        if not isinstance(examiner, bool):
+            raise ValueError("Choose on or off for the examiner.")
         historical = search_options["retrievalMode"] == "historical"
         if historical or legacy_team:
             goal_loop = LEGACY_GOAL_LOOP
@@ -4421,6 +4445,7 @@ class App:
                             **(prompt_overrides or {})}
         return {
             "goalLoop": goal_loop,
+            "examiner": examiner,
             "authorSubagentModels": team_models,
             "authorTeam": author_team,
             "legacyTeam": bool(legacy_team),
@@ -5084,6 +5109,9 @@ class App:
         if self.state.get("apiWebSearch"):
             # The API connections whose own search service the job searches through, as the job recorded them.
             options.extend(["--set", "api_web_search=" + json.dumps(self.state["apiWebSearch"])])
+        if self.state.get("examiner") is False:
+            # The Examiner setting is off (the runner's default is on, with an author_examiner text).
+            options.extend(["--set", "examiner=false"])
         models = self.state.get("authorSubagentModels")
         if team and models and not conversation:
             options.extend(["--author-subagent-models", json.dumps(models, separators=(",", ":"))])
@@ -9823,6 +9851,10 @@ def restore_saved_app(app, *, owned=True):
             # The API connections the job searches through (a job from before records none: it searches as before).
             if isinstance(settings.get("apiWebSearch"), list):
                 state["apiWebSearch"] = [value for value in settings["apiWebSearch"] if providers.is_api_id(value)]
+            # The Examiner setting (a job from before records none, see below).
+            if isinstance(settings.get("examiner"), bool):
+                state["examiner"] = settings["examiner"]
+                persisted_settings.add("examiner")
             # Roles a restart already moved to their replacement keep their warning.
             if isinstance(settings.get("replacedRoles"), list):
                 replaced_roles.update(role for role in settings["replacedRoles"] if role in ROLES)
@@ -9925,6 +9957,10 @@ def restore_saved_app(app, *, owned=True):
     if "goalLoop" not in persisted_settings:
         state.update(goalLoop=LEGACY_GOAL_LOOP, authorTeam=None, authorSubagentModels=None, goalLoopRecorded=False,
                      legacyTeam=True)
+    if "examiner" not in persisted_settings:
+        # A job from before the Examiner setting keeps what it had: an examiner only with a text of its own.
+        state["examiner"] = bool(isinstance(state["promptSet"], dict)
+                                 and str(state["promptSet"].get("author_examiner") or "").strip())
 
     direct_statement = False
     try:
@@ -11379,6 +11415,7 @@ class Server(ThreadingHTTPServer):
             writer_effort=body.get("writerEffort", legacy_effort),
             **web_prompt_options(body, ("review", *PROOF_PROMPTS), app.state if run_id else None),
             team_options=web_team_options(body, app.state if run_id else None),
+            author_mode=body.get("authorMode"),
             speed_mode=body.get("speedMode", DEFAULT_SPEED),
             reasoning_summary=body.get(
                 "reasoningSummary", DEFAULT_REASONING_SUMMARY
@@ -11489,6 +11526,8 @@ class Server(ThreadingHTTPServer):
             "writer_effort": body.get("writerEffort", legacy_effort),
             **web_prompt_options(body, PROOF_PROMPTS),
             "team_options": web_team_options(body),
+            # A request may ask for the earlier team design ("coordinator"); otherwise the job's author is an author.
+            "author_mode": body.get("authorMode"),
             "speed_mode": body.get("speedMode", DEFAULT_SPEED),
             "reasoning_summary": body.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
             **({"workflow_stages": normalize_workflow_stages(body["workflowStages"])} if "workflowStages" in body else {}),

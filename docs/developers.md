@@ -246,9 +246,9 @@ Keep custom definitions outside the bundled `workflows/` folder.
 The first runs proof search, criticism and LaTeX; the second LaTeX alone. Both
 skip statement review. `.venv/bin/python workflow_runner.py --help` lists the
 model, reasoning, time-limit, critic-round, critic-count and prompt options.
-`--author-subagents N` (the workflow's default, 3) and `--author-mode
-{auto,coordinator,author}` (default `auto`: a coordinator when N is 1 or more)
-choose how the author works, and `--coordinator-prompt-file` gives the
+`--author-subagents N` (the workflow's default, 0) and `--author-mode
+{auto,coordinator,author}` (default `auto`, an author; `coordinator` asks for
+the earlier team design and needs N 1 or more) choose how the author works, and `--coordinator-prompt-file` gives the
 coordinator's first prompt, as `--author-prompt-file` gives the author's. The
 server always passes the mode the job recorded. `--goal-loop {tcs,codex}` (default
 `tcs`), `--author-team {tcs,builtin}` (default `tcs`), `--author-subagent-models
@@ -310,9 +310,11 @@ end with exit status 0.
 
 ## The author coordinator
 
-With Author subagents 1 or more (3 by default) the author node runs its
-coordinator binding: one persistent conversation, as for the author, that hands
-the problem-solving to its subagents. What the runner and the server add:
+A job that asks for author mode `coordinator` (the earlier team design; a new
+job's author is an author unless it asks, see `server.recorded_author_mode()`)
+runs the author node's coordinator binding with its 1 or more author subagents:
+one persistent conversation, as for the author, that hands the problem-solving
+to its subagents. What the runner and the server add:
 
 - **The recorded mode.** A job records `authorMode` (`coordinator` or `author`)
   in its state and `job-settings.json` when it starts, from its own number; one
@@ -321,12 +323,11 @@ the problem-solving to its subagents. What the runner and the server add:
   without `authorSubagents` with 0, and such a job saves no mode later
   (`authorModeRecorded` false, kept through every revision of its statement in
   place), so it stays a single author when it is resumed, revised in place (any
-  number of times) or continued (`App._kept_author_mode`, which also keeps a job
-  revised in place whose author works alone with subagents, as only an older job
-  or a continuation of one does); an older job with 1 or more keeps the author
-  prompt plus the `subagents` note. A continuation keeps an author that worked
-  alone, and a continued coordinator keeps its coordinator
-  prompt as a continued author keeps its author prompt. Every launch and every
+  number of times) or continued (`App._kept_author_mode`: a job revised in place and a
+  continuation keep the mode of the job they come from); an author with 1 or
+  more subagents has the author prompt plus the `subagents` note. A continued
+  coordinator keeps its coordinator prompt as a continued author keeps its
+  author prompt. Every launch and every
   reply turn of the paused author passes `--author-mode` with the recorded mode.
 - **The coordinator prompt** is a per-job prompt like the author's:
   `default_prompts()["coordinator"]` (the binding's prompt), `PROMPT_ROLES`

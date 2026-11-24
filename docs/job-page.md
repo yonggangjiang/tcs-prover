@@ -54,7 +54,9 @@ runs with. Its **Proof author** row ends with how the author works:
   coordinator*.
 - A coordinator with the program's own subagents (a web-cutoff run, or a job
   from before the team) reads *coordinator, up to 3 author subagents at a time*.
-- With **Author subagents** 0 it reads *works alone*. When the model of a
+- An author reads *works alone* with **Parallel agents** 1, and with more
+  *3 parallel agents: up to 2 subagents of its own at a time*; the **Examiner**
+  row below it says whether the author has an examiner. When the model of a
   coordinator job without the team has no subagent tool, its author works
   alone, and the row says why: *works alone: GPT 5.6 Luna (older) has no
   subagent tool (coordinator mode needs one)*. A job from before coordinator

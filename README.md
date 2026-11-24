@@ -78,14 +78,13 @@ and `irm https://claude.ai/install.ps1 | iex`.
 
 1. **Statement review.** A model removes ambiguities and loopholes from your
    statement; you approve the result (**Approve and start**) or send feedback.
-2. **Author.** By default an author coordinator works on the proof, as long as
-   it takes: it does not prove the statement itself, but runs up to 3 author
-   subagents at a time, keeps the team's memory and a progress log (shown on the
-   job page), checks that progress keeps growing, and hands in a
-   complete proof. With **Author subagents** 0, one author works on it alone.
-   Each subagent can run a model of its own (Codex CLI, Claude Code or an API
-   key), and TCS Prover runs the author's turns itself; **Edit prompts** shows
-   every text it sends, editable for the next job.
+2. **Author.** One author works on the proof, as long as it takes, in a single
+   conversation. It keeps its own memory on disk, and about once an hour an
+   examiner (a fresh session of the same model) examines the whole run and
+   reports to it. With **Parallel agents** 2 or more it may also hand parts of
+   the work to subagents of its own. TCS Prover runs the author's turns
+   itself; **Edit prompts** shows every text it sends, editable for the next
+   job.
 3. **Critic.** A critic starts independent critics (3 by default) that hunt for
    bugs, fixes what it can, and sends critical errors back to the author.
 4. **Writing.** A LaTeX writer turns the proof into a paper and compiles the PDF.

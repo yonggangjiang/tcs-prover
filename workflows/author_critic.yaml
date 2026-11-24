@@ -8,11 +8,13 @@ nodes:
     stage: solve
     prompt: author
     lifecycle: [goal, continuation, compaction, repair, resume, reopen, summary, conversation, chat, related_works, handoff_refused, subagents]
-    # The run's Author subagents setting (0 to 10): with 1 or more the author gets the subagent tool, limited to that
-    # many at a time; with 0 it has no subagent tool and works alone.
-    subagents: {option: author_subagents, default: 3, minimum: 0}
-    # With Author subagents 1 or more (default 3) the author node runs a coordinator: its first prompt is the per-job
-    # coordinator prompt, and these lifecycle prompts replace the author's; the others stay shared. 0 runs the author alone.
+    # The run's Parallel agents setting, as the number of subagents the author may start (author_subagents, 0 to 10:
+    # one fewer than Parallel agents). 0, the default: the author works alone and has no subagent tool. 1 or more:
+    # it gets its program's own subagent tool, limited to that many at a time, and the subagents note below.
+    subagents: {option: author_subagents, default: 0, minimum: 0}
+    # The earlier team design, for a run that asks for it (author mode "coordinator", with 1 or more subagents) and
+    # for the jobs that recorded it: the author node runs a coordinator whose first prompt is the per-job coordinator
+    # prompt, and these lifecycle prompts replace the author's; the others stay shared.
     coordinator:
       prompt: coordinator
       lifecycle: {goal: coordinator_goal, continuation: coordinator_continuation, reopen: coordinator_reopen, compaction: coordinator_compaction, resume: coordinator_resume, repair: coordinator_repair, summary: coordinator_summary, report: coordinator_report}
@@ -83,7 +85,10 @@ prompts:
   # On a computer where TCS Prover cannot read proof.md safely (Windows), the runner adds a short note
   # after this prompt, the continuation prompt and the repair prompt asking for the proof in the reply.
   author: |-
-    The following is the statement to prove. Solving it is important to my life, so you must solve it, even if it looks like a long-standing open problem. Do not give up just because a problem is hard or open: I know the answer, and I need you to come up with the solution.
+    The following is the statement to prove. Do not give up just because a problem is hard or open.
+
+    YOUR MEMORY
+    Your conversation will be compacted from time to time, and whatever is not written down is lost. Keep your memory in the memory folder of your working directory, organized as you see fit; you are responsible for maintaining it.
 
     Think deeply and hard. Explore substantially diversified approaches: when one line of attack stalls, try a genuinely different idea instead of small variations of the same one, and keep track of what you have ruled out. Submit only a proof you have checked.
 
@@ -173,29 +178,29 @@ prompts:
     RELATED WORKS:
     The user has provided related works for this problem in the related-works folder of your working directory; related-works/INDEX.md lists them. Read what is relevant. The proof you submit must still be complete and self-contained; the critic does not see these files.
   # EDIT SUBAGENTS NOTE HERE: {author_subagents} is their number.
-  # Appended to the first prompt of an author that works alone with Author subagents 1 or more: a job saved before the
-  # author coordinator existed, or a workflow_runner.py run with --author-mode author.
+  # Appended to the first prompt of an author with Parallel agents 2 or more (author_subagents 1 or more), which may
+  # start subagents with its program's own subagent tool.
   subagents: |-
     You may start up to {author_subagents} independent subagents at a time, for example to explore other approaches or to check calculations; you do not need to ask the user.
 
   # EDIT COORDINATOR HERE: the first prompt of the author coordinator (Author subagents 1 or more), a per-job prompt
   # like the author's. {author_subagents} is the run's Author subagents setting.
   coordinator: |-
-    You are the coordinator of a team of author subagents working on the statement below. You do not try to prove the statement yourself. Your job is to run and check the healthiness of the team so that progress on solving the problem grows steadily with the time spent, until the team has a complete proof that has been checked.
+    You are the coordinator of a team of author subagents working on the statement below. You do not try to prove the statement yourself. Your job is to run and check the healthiness of the team so that progress on solving the problem grows steadily with the time spent, until the team has a complete proof.
 
     The team must solve it, even if it looks like a long-standing open problem. Do not let the team give up because the problem is hard or open.
 
     YOUR TEAM
-    You can run up to {author_subagents} author subagents at a time. You should provide them with the exact statement to be solved, ask them to think deeply and hard, and try substantially diversified approaches to make sure the progress grows steadily.
+    You can run up to {author_subagents} author subagents at a time. The authors do the mathematics: give them the original exact statement to solve. Do not decide yourself what each author should solve.
 
     YOUR MEMORY
     Your conversation will be compacted from time to time, and whatever is not written down is lost, including what your subagents are doing. Keep the team's memory in the memory folder of your working directory, organized as you see fit. You should observe and decide how the memory should be maintained, so that the author team with this memory can make steady progress along the time, instead of circulating or being stuck. Keep a log of the team's progress in memory/progress.md; the user reads it on the job page.
 
     EXAMINING PROGRESS
-    The trajectory of the run is everything you and the authors have done so far: your assignments, the authors' reports, and the files in your working directory and its memory folder. transcript.jsonl there is the complete raw record of every step, and it is very large. Always keep the whole trajectory in mind, however long it grows, not only the latest report or the last hour. It is far too much to read at once, so find your own way to do this that keeps working as it grows: you may write scripts that extract what matters, read it part by part and keep summaries, or do anything else that works. Do this while the authors work, so that when a report comes back you already know where the whole run stands and no author waits long for its next assignment. There are no clear criteria on the progress towards an open problem, and you are responsible to use the trajectory and the memory to judge yourself about whether the team is making steady progress towards resolving the problem as time grows. Decide yourself what would have to change for the team to be closer to a solution, and keep track of how that has moved over the whole trajectory. Make this judgement every time a report comes back: has it moved since several hours ago, and is the team doing again something it already did? Then decide what the team does next, and give the author the context and instructions it needs to build on what the team already has. If you realize any ill behavior, that the progress is not growing or the team is repeating itself, do not put it down to the difficulty of the problem: examine how you instruct the authors, how you organize the team and the memory of your design, find what causes it, change that, and check later whether the change helped.
+    An examiner examines the whole run about once an hour; its report reaches you with team_wait. Use its reports and the authors' to judge whether you should change how you instruct the authors and organize the team and its memory, and check later whether the change helped.
 
     HANDING IN
-    When the team has a complete proof that has been checked, write it to proof.md and reply with exactly this line and nothing else:
+    When the team has a complete proof, write it to proof.md and reply with exactly this line and nothing else:
     PROOF_FILE: proof.md
     The critic reads only proof.md and the statement, so the proof must be complete and self-contained.
 
@@ -206,7 +211,7 @@ prompts:
   # author's prompt of the same lifecycle key. The goal and the continuation point to the coordinator prompt (Codex
   # repeats the goal in each of its automatic turns); reopen, compaction, resume and repair repeat it.
   coordinator_goal: |-
-    Coordinate the team as your coordinator prompt says, until the team hands in a complete proof that has been checked.
+    Coordinate the team as your coordinator prompt says, until the team hands in a complete proof.
   coordinator_continuation: |-
     Continue coordinating the team as your coordinator prompt says; do not end the work.
   coordinator_reopen: |-
@@ -235,7 +240,7 @@ prompts:
   # Sent instead of the continuation when a coordinator's final reply names no proof file (it is kept as a
   # progress report and never reaches the critic).
   coordinator_report: |-
-    Your last reply was not handed to the critic: TCS Prover takes a reply as a hand-in only when it is the line PROOF_FILE: proof.md and nothing else, so it was kept as a progress report. If the team's proof is complete and checked, write it to proof.md and reply with exactly that line. Otherwise keep coordinating the team; do not end the work.
+    Your last reply was not handed to the critic: TCS Prover takes a reply as a hand-in only when it is the line PROOF_FILE: proof.md and nothing else, so it was kept as a progress report. If the team's proof is complete, write it to proof.md and reply with exactly that line. Otherwise keep coordinating the team; do not end the work.
 
   # EDIT GOAL LOOP HERE. TCS Prover's goal loop (Goal loop "TCS Prover", the default): a Codex author or coordinator
   # works in turns that TCS Prover starts. After every turn that did not end the goal, it sends this text as the next
@@ -360,12 +365,31 @@ prompts:
   # conversation with the coordinator's model; examining the run is its only task, and its report reaches the
   # coordinator through team_wait like an assignment's. Leave it empty to run without an examiner.
   team_examiner: |-
-    You are the examiner of a team that works on the statement in checked-statement.md in this folder: a coordinator who assigns the work and author subagents who do the mathematics. You are not a member of the team and you do not try to prove the statement yourself. This folder is the team's working directory: its memory folder holds the team's notes and its progress log, team/ holds the authors' reports in order, team/timeline.md lists the assignments and reports with their times, and transcript.jsonl is the complete raw record of every step (it is very large, so search it rather than read it whole).
+    You are the examiner of a team that works on the statement in checked-statement.md in this folder: a coordinator who runs the team and author subagents who do the mathematics and choose their own approaches. This folder is the team's working directory: its memory folder holds the team's notes and its progress log, team/ holds the authors' reports in order, team/timeline.md lists the assignments and reports with their times, and transcript.jsonl is the complete raw record of every step (it is very large, so search it rather than read it whole).
 
-    Examine the whole trajectory and judge whether the team is making steady progress towards resolving the problem as time grows. Decide what would have to change for the team to be closer to a solution, and how that has moved over the whole trajectory: has it moved since several hours ago, and is the team doing again something it already did? Then say what the team should do next.
+    Examine the whole trajectory, not only the latest work. Judge whether progress towards a complete proof of the statement is growing steadily with the time spent: what is still missing between the team's work and a complete proof, and how that has changed since several hours ago and since your own previous reports, which are in team/ beside the authors'.
 
-    Your final reply is your report to the coordinator: make it specific enough to be checked (file names, lemma names, times). Do not change any file.
+    Examine the coordination: how the coordinator instructs the authors, organizes the team and keeps its memory, and how that shapes the trajectory. Where progress is not growing, find what causes it and say what should change in how the team is run; the authors decide the mathematics, so do not choose it for them. Check whether changes made after your earlier reports helped.
+
+    Your final reply is your report to the coordinator.
+
   # What the coordinator is told about the examiner: added to the description of team_wait when there is one.
+  # EDIT EXAMINER HERE: the whole instruction of the author's examiner (the job's Examiner setting, on by default).
+  # TCS Prover starts it itself about once an hour while the author works, each time in a fresh conversation with the
+  # author's model in the author's folder; its report is saved in team/ and sent into the author's running turn
+  # framed by author_examiner_report. Empty: no examiner, whatever the setting.
+  author_examiner: |-
+    You are the examiner of an author who works on the statement in checked-statement.md in this folder and chooses its own approaches. This folder is the author's working directory: its memory folder holds the author's notes, team/ holds your previous reports, and transcript.jsonl is the complete raw record of every step (it is very large, so search it rather than read it whole).
+
+    Examine the whole trajectory, not only the latest work. Judge whether progress towards a complete proof of the statement is growing steadily with the time spent: what is still missing between the author's work and a complete proof, and how that has changed since several hours ago and since your previous reports.
+
+    Examine how the author works and keeps its memory, and how that shapes the trajectory. Where progress is not growing, find what causes it and say what should change. Check whether changes made after your earlier reports helped.
+
+    Your final reply is your report to the author: your conclusion and your suggestions.
+  # How the examiner's report reaches the author: {report} is the report.
+  author_examiner_report: |-
+    [REPORT FROM THE EXAMINER]
+    {report}
   team_examiner_note: |-
     An examiner also works beside your authors: TCS Prover starts it itself from time to time while an author works, in a fresh conversation whose only task is to examine the whole run so far, and its report comes with this tool like an assignment's.
   team_tool_members: |-

@@ -46,8 +46,7 @@ you edited.
 ## Save these settings…
 
 **Save these settings…** keeps the form's settings: the selected stages, each
-role's source, model and reasoning, author subagents, the subagent models
-(*Same as the coordinator*, or each author subagent's model and reasoning),
+role's source, model and reasoning, parallel agents, the examiner,
 independent critics, critic rounds, the time limit, the web search cutoff, the
 generation speed and the activity log detail. Never a goal loop: every new job
 runs [TCS Prover's](workflow.md#the-goal-loop).
@@ -96,17 +95,15 @@ it opens, so connections added or removed in another tab count.
 - A saved web search cutoff loads as saved; whether it can run (Statement review
   off, Codex CLI models, a time in the past) is checked when you start, as for
   any job.
-- Saved settings keep the number of author subagents they were saved with,
-  also settings saved before the author coordinator existed: 0 starts one
-  author working alone, 1 or more an
-  [author coordinator](workflow.md#the-author-coordinator) with that many author
-  subagents. TCS Prover's original settings use 3, and so do saved settings that
-  hold no number (saved before the setting existed).
-- TCS Prover's original settings use *Same as the coordinator* for the
-  [subagent models](workflow.md#the-authors-team), and so do saved settings
-  from before that setting existed. A saved subagent model of a removed API
-  connection loads as GPT 6.2 Sol with a note, as a role's does (*Author
-  subagent 2 model not available …*).
+- Saved settings keep the number of
+  [parallel agents](workflow.md#the-author) they were saved with (as the
+  author's own subagents, one fewer). TCS Prover's original settings use 1, an
+  author that works alone, and so do saved settings that hold no number.
+  Settings saved while a new job's author was a coordinator load as an author
+  with that many subagents of its own, and any model they chose for each author
+  subagent is dropped as they load.
+- TCS Prover's original settings have the [examiner](workflow.md#the-examiner)
+  on, and so do saved settings from before that setting existed.
 - Settings saved while the form still offered a goal loop may hold one: it is
   left out as they load, without a note, and the job runs TCS Prover's goal
   loop.

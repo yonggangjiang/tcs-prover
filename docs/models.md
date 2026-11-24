@@ -4,10 +4,9 @@ Every role (statement reviewer, proof author, critic, LaTeX writer) runs through
 one of two programs on your computer: the **Codex CLI** (the default) or
 **Claude Code**. They provide the author's conversation and every model call.
 GPT 6.2 Sol at Max reasoning and Standard speed is the default for every role (GPT 6.2 needs the Codex CLI
-0.170 or later: older versions refuse it with a ChatGPT sign-in). The author
-coordinator's subagents run the coordinator's model, or with **Subagent models →
-Choose for each** a model of their own each, from the same sources (see
-[the author's team](workflow.md#the-authors-team)).
+0.170 or later: older versions refuse it with a ChatGPT sign-in). The author's
+own subagents (**Parallel agents** 2 or more) and its examiner run the author's
+model (see [the author](workflow.md#the-author)).
 
 Choose per role under **Advanced settings** on the New problem page, or on
 **Models & API** in the sidebar: a **Source**, then a **Model**, then its
@@ -177,7 +176,7 @@ The four GPT models use your ChatGPT login and offer `low` through `max`.
   generation, up to 2× on GPT 6.1 Sol and Astra and 1.5× on the other models.
   It can use up credits faster.
 - **Ultra** is no longer offered. It was Max plus Codex's own task delegation,
-  which had no count; subagents now follow the run's **Author subagents** and
+  which had no count; subagents now follow the run's **Parallel agents** and
   **Independent critics** settings. A saved job, script or flag that says
   `ultra` runs as `max`, and the activity log says so once.
 - The older `gpt-5.6-sol`, `gpt-5.6-terra` and `gpt-5.6-luna` are still

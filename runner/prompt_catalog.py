@@ -46,16 +46,22 @@ ENTRIES = (
      "The paused author's progress summary (Pause and summarize, and when the time limit is reached)."),
     ("conversation", "Author", "Reply to a message",
      "The paused author's reply to a chat message ({message})."),
+    ("author_examiner", "Author", "Examiner instructions",
+     "The whole instruction of the author's examiner (the job's Examiner setting): TCS Prover starts it about once "
+     "an hour while the author works, each time in a fresh conversation with the author's model, and sends its "
+     "report into the author's running turn. Empty: no examiner."),
+    ("author_examiner_report", "Author", "Examiner report",
+     "Frames the examiner's report as it reaches the author: {report} is the report."),
     ("chat", "Author", "Chat message",
      "Frames a chat message sent to the working author or coordinator: {message}, and {answer_file} for an answer."),
     ("related_works", "Author", "Related works",
      "Appended to the first prompt when the job has related works."),
     ("subagents", "Author", "Subagents note",
-     "Appended to the first prompt of an author that works alone with subagents (jobs from before the coordinator, "
-     "terminal runs with --author-mode author); {author_subagents} is their number."),
+     "Appended to the first prompt of an author with Parallel agents 2 or more, which may start subagents of its "
+     "own; {author_subagents} is their number (one fewer than Parallel agents)."),
     ("coordinator", "Coordinator", "Coordinator prompt",
-     "The first prompt of the author coordinator (Author subagents 1 or more). {author_subagents} is the number of "
-     "author subagents; [STATEMENT] is replaced by the statement."),
+     "The first prompt of the author coordinator, the earlier team design that a job runs only when it asks for "
+     "it. {author_subagents} is the number of author subagents; [STATEMENT] is replaced by the statement."),
     ("coordinator_goal", "Coordinator", "Coordinator goal", "Replaces the author goal for the coordinator."),
     ("coordinator_continuation", "Coordinator", "Coordinator continuation",
      "Replaces the author continuation for the coordinator."),

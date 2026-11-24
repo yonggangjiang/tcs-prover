@@ -65,11 +65,12 @@ STAGES = {"review": "review", "author": "author", "critic": "critic", "writer": 
 # How warnings name a role ("Critic model not available: …"), as the form's stages do.
 ROLE_WORDS = {"review": "Reviewer", "author": "Author", "critic": "Critic", "writer": "Writer"}
 # What a preset keeps: the form's settings in its order (proofJobSettings() without promptOverrides and goalLoop).
-# Never the goal loop, which is no setting of the form: one that settings saved before hold is dropped as they load.
+# Never the goal loop or the per-subagent models of the earlier team design, which are no settings of the form:
+# those that settings saved before hold are dropped as they load.
 SETTINGS = ("workflowStages", "reviewModel", "reviewEffort", "authorModel", "authorEffort", "authorSubagents",
             "criticModel", "criticEffort", "criticCount", "criticRounds", "writerModel", "writerEffort",
             "thinkingHours", "speedMode", "reasoningSummary", "retrievalMode", "retrievalCutoffUtc",
-            "authorSubagentModels")
+            "examiner")
 # What a preset keeps of each API model it names (from its catalog row): no key, no address.
 API_FIELDS = ("label", "model", "format", "sourceId", "sourceLabel")
 # Default settings: how the page names them, and their id in its list. The name always means them: it is never
@@ -128,9 +129,8 @@ def builtin_settings():
         "writerModel": server.DEFAULT_WRITER_MODEL, "writerEffort": server.DEFAULT_REASONING_EFFORT,
         "thinkingHours": server.DEFAULT_THINKING_HOURS, "speedMode": server.DEFAULT_SPEED,
         "reasoningSummary": server.DEFAULT_REASONING_SUMMARY, "retrievalMode": "live", "retrievalCutoffUtc": "",
-        # "Same as the coordinator" for the author subagents' models: saved settings from before have none and load
-        # with it.
-        "authorSubagentModels": None,
+        # The Examiner setting: saved settings from before have none and load with the default.
+        "examiner": server.DEFAULT_EXAMINER,
     }
 
 
@@ -253,7 +253,10 @@ def valid_settings(values, *, stored=False):
             settings["reasoningSummary"] = values["reasoningSummary"]
         settings["retrievalMode"], settings["retrievalCutoffUtc"] = _cutoff(
             values.get("retrievalMode", "live"), values.get("retrievalCutoffUtc", ""))
-        settings["authorSubagentModels"] = _member_models(values.get("authorSubagentModels"), settings, stored)
+        if "examiner" in values:
+            if not isinstance(values["examiner"], bool):
+                raise PresetError("Choose on or off for the examiner.")
+            settings["examiner"] = values["examiner"]
     except PresetError:
         raise
     except (ValueError, runtime.Error) as exc:
@@ -261,35 +264,10 @@ def valid_settings(values, *, stored=False):
     return settings
 
 
-def _member_models(value, settings, stored):
-    """The Subagent models setting: None ("Same as the coordinator") or one {model, effort} per author subagent.
-
-    It applies to the Author stage with 1 or more author subagents; otherwise it is not kept (None), as Start
-    keeps no setting of a stage that is off. A list of another length than Author subagents is refused.
-    """
-
-    if value is None:
-        return None
-    count = settings["authorSubagents"]
-    if not settings["workflowStages"]["author"] or not count:
-        return None
-    if not isinstance(value, list) or len(value) != count:
-        raise PresetError(f"Choose a model for each of the {count} author subagent{'s' if count != 1 else ''}, or "
-                          "Same as the coordinator.")
-    members = []
-    for number, entry in enumerate(value, 1):
-        if not isinstance(entry, dict) or set(entry) != {"model", "effort"}:
-            raise PresetError(f"Author subagent {number} needs a model and a reasoning effort.")
-        members.append({"model": _model(entry["model"], "author", stored), "effort": _effort(entry["effort"], "author")})
-    return members
-
-
 def _models(settings):
-    """[(who, model)] of every model the settings name: each role's, then each author subagent's chosen one."""
+    """[(who, model)] of every model the settings name: each role's."""
 
-    return [*((role, settings[f"{role}Model"]) for role in ROLES),
-            *((f"member-{number}", entry["model"])
-              for number, entry in enumerate(settings.get("authorSubagentModels") or [], 1))]
+    return [(role, settings[f"{role}Model"]) for role in ROLES]
 
 
 def _name(value, *, new=False):
@@ -539,12 +517,6 @@ def _unavailable(settings, api_models, resolve):
             saved = api_models.get(model)
             label = f"{saved['sourceLabel']} · {saved['label']}" if saved else model
         else:
-            continue
-        if role.startswith("member-"):
-            # An author subagent's chosen model ("member-<n>"): loading puts the coordinator's model there.
-            number = int(role.split("-", 1)[1])
-            missing.append({"role": "author", "member": number, "model": model, "label": label,
-                            "text": f"Author subagent {number} model not available: {label}"})
             continue
         missing.append({"role": role, "model": model, "label": label,
                         "text": f"{ROLE_WORDS[role]} model not available: {label}"})

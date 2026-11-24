@@ -351,38 +351,26 @@
                         <option value="low">Low</option>
                       </select>
                       <span id="authorModelProvider" class="provider-chip" data-provider="codex">Codex CLI</span>
-                      <label for="authorSubagents">4 · Subagents</label>
-                      <input id="authorSubagents" type="number" min="0" max="10" step="1" value="3"
-                        aria-describedby="authorSubagentsHelp">
-                      <p id="authorSubagentsHelp" class="help model-setting-help">
-                        0: one author works on the proof by itself. 1 or more (default 3): the author is a
-                        coordinator: it does not prove the statement itself, but runs up to this many author
-                        subagents at a time, keeps the team's memory and checks that progress keeps growing; its
-                        progress log appears on the job page.
+                      <!-- How many agents work at a time: the author, and the subagents it may start with its
+                           program's own subagent tool (one fewer; the job setting authorSubagents). -->
+                      <label for="parallelAgents">4 · Parallel agents</label>
+                      <input id="parallelAgents" type="number" min="1" max="11" step="1" value="1"
+                        aria-describedby="parallelAgentsHelp">
+                      <p id="parallelAgentsHelp" class="help model-setting-help">
+                        How many agents work at a time. 1 (default): the author works on the proof by itself.
+                        2 or more: the author may also hand parts of the work to subagents of its own, up to one
+                        fewer than this number at a time.
                       </p>
-                      <!-- Which model each author subagent runs (app.js renderTeamModels): shown with 1 or more
-                           subagents; "Choose for each" lists one row per subagent in authorTeamModels below. With a
-                           web cutoff it stays "Same as the coordinator" and the help says why. -->
-                      <label id="authorSubagentModelsLabel" for="authorSubagentModelsMode">5 · Subagent models</label>
-                      <select id="authorSubagentModelsMode" aria-describedby="authorSubagentModelsHelp">
-                        <option value="same" selected>Same as the coordinator</option>
-                        <option value="each">Choose for each</option>
+                      <!-- The author's examiner (the job setting examiner; the author_examiner text). -->
+                      <label for="authorExaminer">5 · Examiner</label>
+                      <select id="authorExaminer" aria-describedby="authorExaminerHelp">
+                        <option value="on" selected>On — default</option>
+                        <option value="off">Off</option>
                       </select>
-                      <p id="authorSubagentModelsHelp" class="help model-setting-help">Every author subagent runs the
-                        coordinator's model and reasoning.</p>
-                    </div>
-                    <!-- Choose for each: one row per author subagent ("Subagent 1" … N) with the roles' Source, Model
-                         and Reasoning menus (app.js renderTeamModels builds the rows). Spans the grid under the
-                         Proof author; hidden unless the author stage is on, with 1 or more subagents, no web cutoff
-                         and Choose for each. -->
-                    <div id="authorTeamSetting" class="model-setting team-models" role="group"
-                      aria-labelledby="authorTeamTitle" aria-describedby="authorTeamHelp" hidden>
-                      <h3 id="authorTeamTitle" class="model-role-title">Proof author · subagent models</h3>
-                      <p id="authorTeamHelp" class="help model-setting-help">Each author subagent runs the model chosen
-                        here; the coordinator gives it assignments through TCS Prover's team tools.</p>
-                      <div class="team-models-head" aria-hidden="true"><span></span><span>1 · Source</span>
-                        <span>2 · Model</span><span>3 · Reasoning</span></div>
-                      <div id="authorTeamRows" class="team-model-rows"></div>
+                      <p id="authorExaminerHelp" class="help model-setting-help">
+                        On: about once an hour a fresh session of the author's model examines the whole run and
+                        reports to the author, who goes on working with the report.
+                      </p>
                     </div>
                     <div id="criticModelSetting" class="model-setting">
                       <h3 class="model-role-title">Independent critic</h3>
@@ -1265,7 +1253,7 @@
             aria-describedby="presetSaveSummary">
         </div>
         <p id="presetSaveSummary" class="preset-summary"></p>
-        <p id="presetSaveScope" class="help">Saves stages, models and reasoning, subagents, critics and rounds,
+        <p id="presetSaveScope" class="help">Saves stages, models and reasoning, parallel agents, the examiner, critics and rounds,
           time limit, web search cutoff, speed and activity log detail. Not saved: the statement, related works
           and edited prompts.</p>
         <p id="presetSaveError" class="notice" role="alert" hidden></p>

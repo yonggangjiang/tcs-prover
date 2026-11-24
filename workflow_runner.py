@@ -118,15 +118,17 @@ HARNESS_TEXTS = {
     "codex_compact_prompt": None, "codex_coordinator_note": None,
     "team_note": {"members"}, "team_member": {"assignment"},
     "team_examiner": None, "team_examiner_note": None,
+    "author_examiner": None, "author_examiner_report": {"report"},
     "team_tool_members": None, "team_tool_assign": None, "team_tool_assign_member": None,
     "team_tool_assign_assignment": None, "team_tool_wait": None, "team_tool_wait_timeout_minutes": None,
     "team_tool_followup": None, "team_tool_followup_member": None, "team_tool_followup_message": None,
     "team_tool_stop": None, "team_tool_stop_member": None,
 }
 # The prompts that may be empty: Codex's compact_prompt (empty: Codex's own summary instructions), the note for
-# a Codex coordinator (empty: none is sent), and the examiner's instruction and what the coordinator is told of it
-# (no instruction: the team has no examiner).
-EMPTY_ALLOWED_PROMPTS = ("codex_compact_prompt", "codex_coordinator_note", "team_examiner", "team_examiner_note")
+# a Codex coordinator (empty: none is sent), the examiner's instruction and what the coordinator is told of it
+# (no instruction: the team has no examiner), and a lone author's examiner (empty: none).
+EMPTY_ALLOWED_PROMPTS = ("codex_compact_prompt", "codex_coordinator_note", "team_examiner", "team_examiner_note",
+                         "author_examiner")
 _GOAL_STAGES = {"initial": "solve", "resume": "repair", "failure": "failure"}
 # Where TCS Prover cannot read the author's proof file safely (Windows; see
 # proof_handoff.file_handoff_supported()), the runner adds this note after the
@@ -4670,10 +4672,11 @@ def member_usage(event, trace):
             "modelCalls": own.get("calls")}
 
 
-def start_team(members, *, prompts, directory, settings, stage, node_name, examiner=None):
+def start_team(members, *, prompts, directory, settings, stage, node_name, examiner=None, lone=False):
     """The author coordinator's team (runner/team.Team) of ``members`` (team.team_members()), ready for its tools.
 
-    ``examiner`` is the examiner's seat (an entry like a member's), which the team starts itself (team.Team).
+    ``examiner`` is the examiner's seat (an entry like a member's), which the team starts itself (team.Team). With
+    ``lone`` it is a lone author's examiner: no members, an examination about every hour (goal_session's examiner).
 
     Its members' records and events go to the run's records as the coordinator's subagents (stage ``stage``, node
     ``node_name``), each with its member's number and model and its assignment's id (subagentId,
@@ -4729,7 +4732,7 @@ def start_team(members, *, prompts, directory, settings, stage, node_name, exami
                      render=render_template, retry_note=AUTHOR_RETRY_NOTE, retry_seconds=MODEL_RETRY_SECONDS,
                      stop_process=stop_process, conversation=conversation, discard=sessions.discard,
                      unavailable=lambda error: isinstance(error, ConversationUnavailable),
-                     describe=describe_failure, examiner=examiner)
+                     describe=describe_failure, examiner=examiner, lone=lone)
 
 
 def save_final_input(statement, solution, directory=None):
@@ -5610,8 +5613,11 @@ def _root_message(message, thread):
 
 def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                  node_name="author", stages=None, initial_instruction="", handoff_note="", coordinator=False,
-                 texts=None, team=None, service=None):
+                 texts=None, team=None, service=None, examiner=None):
     """Run one goal-enabled thread with lifecycle instructions supplied by YAML.
+
+    ``examiner`` is a lone author's examiner (start_team(lone=True)): each report it finishes is sent into the
+    author's running turn as author_examiner_report, the way a live instruction is.
 
     Yield its final answer only after goal completion; accept follow-up feedback
     through ``send``. The model manages its own work in the supplied workspace.
@@ -5741,6 +5747,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
              "idle_since": None}
     attempt = continued.get("attempt") if isinstance(continued.get("attempt"), int) else None
     pending_steers = {}
+    # A lone author's examiner reports not yet received by the author, oldest first, and when the next try may go.
+    examiner_reports, examiner_wait = [], {"until": 0.0}
     # Live instructions Codex did not accept: offered again at the next turn or later.
     held, told = {}, set()
     pending_compaction = continued.get("pending_compaction") or None
@@ -5906,6 +5914,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             # The controller recognizes a restored instruction by its command id.
             emit("request", label="Live author instruction sent", text=instruction, threadId=thread,
                  steerId=identity)
+        elif kind == "examiner":
+            emit("request", label="Examiner report sent to the author", text=instruction, threadId=thread,
+                 examinerReport=identity)
 
     def check(kind):
         probe["at"] = time.monotonic()  # Before sending: the answer may arrive at once.
@@ -6010,6 +6021,20 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                         steer(command[1], command[0])
                     except (runtime.Error, OSError) as exc:
                         hold(command[0], f"Could not send the live instruction ({exc})")
+            if examiner is not None and not pausing.is_set():
+                examiner.examine()
+                examiner_reports.extend(examiner.take_reports())
+                if (state["turn"] and examiner_reports and time.monotonic() >= examiner_wait["until"]
+                        and not any(item[2] == "examiner" for item in list(pending_steers.values()))):
+                    report = examiner_reports[0]
+                    try:
+                        steer(runtime.render_template((texts or {}).get("author_examiner_report") or "{report}",
+                                                      {"report": report["text"]}),
+                              report.get("file") or "examiner", "examiner")
+                    except (runtime.Error, OSError) as exc:
+                        examiner_wait["until"] = time.monotonic() + 60
+                        emit("diagnostic", text=f"The examiner's report could not be sent to the author yet ({exc}); "
+                                                "it is sent again.", threadId=thread)
 
     def start_turn(instruction):
         # A retry re-sends this instruction unless the thread received it.
@@ -6204,6 +6229,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                         pending_compaction = instruction
                         emit("diagnostic", text=f"Codex did not accept the context re-anchor ({reason}); it is sent "
                                                 "again when the next turn starts.")
+                    elif kind == "examiner":
+                        examiner_wait["until"] = time.monotonic() + 60
+                        emit("diagnostic", text=f"Codex did not accept the examiner's report ({reason}); it is sent "
+                                                "again.", threadId=thread)
                     else:
                         hold(identity, f"Codex did not accept the live instruction ({reason})")
                 elif kind == "steer":
@@ -6211,6 +6240,12 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     state["steered"] = True
                     emit("status", label="Author instruction accepted", authorSteerDelivered=identity,
                          text="The current conversation has received the live instruction.", threadId=thread)
+                elif kind == "examiner":
+                    if examiner_reports and (examiner_reports[0].get("file") or "examiner") == identity:
+                        examiner_reports.pop(0)
+                    emit("status", label="Examiner report delivered", examinerReport=identity,
+                         text="The author's current conversation has received the examiner's report.",
+                         threadId=thread)
             method, turn = message.get("method"), params.get("turn") or {}
             if method in {"item/started", "item/completed"}:
                 item = params.get("item") if isinstance(params.get("item"), dict) else {}
@@ -6404,6 +6439,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             # its caller is gone, and they are the next attempt's. The team left the service above, so no late call
             # of this attempt starts another.
             team.release_waits()
+        if examiner is not None and not final.get("retry"):
+            examiner.close(ending["reason"])
         if rpc and thread and state["active"] and not tcs:
             def pause():
                 try:
@@ -7835,12 +7872,13 @@ def _lifecycle_map(lifecycle):
 def author_mode(node, options):
     """How a goal node's author works in this run: "coordinator" or "author".
 
-    The author coordinator runs the node's coordinator binding (author_critic.yaml): it delegates the work to
-    its subagents, the node's number of them at a time. The run's ``author_mode`` option says which
-    (AUTHOR_MODES): "auto", the default, runs the coordinator when the node binds one and its number of
-    subagents (subagent_count()) is 1 or more; "author" runs the author alone even then, as the jobs saved
-    before the coordinator did (the server always passes the mode a job recorded at its start).
-    "coordinator" needs that binding and 1 or more subagents. A mode the run cannot have is a
+    The author works on the statement itself: alone, or, with 1 or more subagents (subagent_count(), the run's
+    Parallel agents setting less one), with its program's own subagent tool and the subagents note. The author
+    coordinator, the earlier team design, runs the node's coordinator binding (author_critic.yaml) instead: it
+    does not prove the statement itself but delegates the work to its subagents. The run's ``author_mode``
+    option says which (AUTHOR_MODES): "author", and "auto", the default, run the author; "coordinator" runs the
+    coordinator and needs that binding and 1 or more subagents (the server always passes the mode a job
+    recorded at its start, so a job that started with a coordinator keeps it). A mode the run cannot have is a
     ConfigurationError, which no retry changes.
     """
 
@@ -7853,7 +7891,7 @@ def author_mode(node, options):
             raise ConfigurationError("The author coordinator needs Author subagents 1 or more."
                                      if node.get("coordinator") else "This workflow's author has no coordinator prompts.")
         return "author"
-    return "author" if mode == "author" else "coordinator"
+    return "coordinator" if mode == "coordinator" else "author"
 
 
 def _settings(node, options):
@@ -8164,7 +8202,8 @@ def prepare_memory_folder(directory, stage):
 
     The folder is owner-only where the system has such permissions. An entry of that name that is already
     there is left exactly as it is, whatever it holds. A folder that cannot be made is said in a diagnostic;
-    the coordinator can still make it itself.
+    the coordinator can still make it itself. An author that works on the statement itself makes its memory
+    folder when it first writes there (its prompt asks it to keep one): TCS Prover creates no file for it.
     """
 
     try:
@@ -9294,6 +9333,8 @@ def _execute(workflow, state, options, prompts):
     # TCS Prover's MCP service of this runner (team.Service) and the author coordinator's team, by node: made when
     # an author needs them, ended with the run's steps.
     services, teams = [], {}
+    # A lone author's examiner by node (start_team(lone=True)), kept across the author's attempts like a team.
+    examiners = {}
     options.setdefault("_workflow_started", _now())
     retry_clock(options)
     # The time limit stops only the author: later steps always finish (see workflow_remaining). They
@@ -9485,6 +9526,21 @@ def _execute(workflow, state, options, prompts):
                     prompt, session_prompts, instruction = start["prompt"], start["prompts"], start["recovery"]
                     if alone is not None:
                         alone.pop("bound")
+                    # The author's examiner (the run's ``examiner`` option, the job's Examiner setting; on unless
+                    # it says otherwise), with an author_examiner text: TCS Prover starts it about once an hour and
+                    # its reports go into the author's running turn (the goal session's ``examiner``). The earlier
+                    # team design has the team's own examiner instead.
+                    lone_examiner = None
+                    if (crew is None and not coordinator and options.get("examiner", True) is not False
+                            and str(texts.get("author_examiner") or "").strip()):
+                        lone_examiner = examiners.get(current)
+                        if lone_examiner is None or lone_examiner.closed is not None:
+                            seat = {**team_module.team_members(None, settings["model"], settings["effort"], 1)[0],
+                                    "member": 1}
+                            lone_examiner = examiners[current] = start_team(
+                                [], prompts={**texts, "team_examiner": texts["author_examiner"]},
+                                directory=directory, settings=settings, stage=stage_name, node_name=current,
+                                examiner=seat, lone=True)
                     # A live run whose author's model, or a team member's, gets no web search tool from Codex says so
                     # as it starts (the run goes on without it).
                     note_no_web_search(stage_name, current, settings["model"], members if crew is not None else (),
@@ -9502,6 +9558,7 @@ def _execute(workflow, state, options, prompts):
                         stages=node.get("stages"), node_name=current, texts=texts,
                         **({"coordinator": True} if coordinator else {}), **({"alone": alone} if alone else {}),
                         **({"team": crew} if crew is not None else {}),
+                        **({"examiner": lone_examiner} if lone_examiner is not None else {}),
                         **({"service": service} if service is not None else {}),
                     )
                     launchers[current] = (launch, instruction)
@@ -9618,7 +9675,7 @@ def _execute(workflow, state, options, prompts):
     finally:
         for session in sessions.values():
             session.close()
-        for crew in teams.values():
+        for crew in (*teams.values(), *examiners.values()):
             crew.close("It stopped when the run's steps ended.")
         for service in services:
             service.close()

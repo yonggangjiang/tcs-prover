@@ -19,7 +19,7 @@ from .current_run import CurrentRunError, select_current_dashboard
 from .review import review_worker_main
 from .server import (
     App, Server, AUTO_LAUNCH_SPACING_SECONDS, AUTO_RESUME_SECONDS, DEFAULT_AUTHOR_MODEL, DEFAULT_AUTHOR_SUBAGENTS,
-    DEFAULT_GOAL_LOOP,
+    DEFAULT_EXAMINER, DEFAULT_GOAL_LOOP,
     DEFAULT_CRITIC_COUNT, MAX_AUTHOR_SUBAGENTS,
     DEFAULT_CRITIC_MODEL, DEFAULT_CRITIC_ROUNDS, DEFAULT_REASONING_EFFORT, DEFAULT_REASONING_SUMMARY,
     DEFAULT_SPEED, DEFAULT_THINKING_HOURS, DEFAULT_WRITER_MODEL, HOST,
@@ -207,13 +207,15 @@ def direct_cli_options(
     reasoning_summary=DEFAULT_REASONING_SUMMARY,
     author_prompt_file=None, critic_prompt_file=None, final_prompt_file=None,
     coordinator_prompt_file=None, goal_loop=DEFAULT_GOAL_LOOP, author_subagent_models=None,
+    author_mode=None, examiner=DEFAULT_EXAMINER,
 ):
     """Load optional prompt files and validate direct-workflow CLI settings.
 
-    As in every new job, a terminal run's author is a coordinator with 1 or more author subagents and works
-    alone with 0 (see server.recorded_author_mode()). ``goal_loop`` and ``author_subagent_models`` (a JSON list
-    of {"model", "effort"}, or None: every member runs the coordinator's model) are the Goal loop and Subagent
-    models settings.
+    As in every new job, a terminal run's author proves the statement itself: alone with 0 author subagents, and
+    with 1 or more it may start that many with its program's own subagent tool. ``author_mode`` "coordinator" asks
+    for the earlier team design instead (see server.recorded_author_mode()), to which the coordinator prompt and
+    ``author_subagent_models`` (a JSON list of {"model", "effort"}, or None: every member runs the coordinator's
+    model) apply. ``goal_loop`` is the Goal loop setting and ``examiner`` the Examiner setting.
     """
 
     prompt_files = {
@@ -248,6 +250,7 @@ def direct_cli_options(
         goal_loop=goal_loop,
         author_subagent_models=json.loads(author_subagent_models) if isinstance(author_subagent_models, str)
         else author_subagent_models,
+        author_mode=author_mode, examiner=examiner,
     )
     return {
         "critic_rounds": options["criticRounds"],
@@ -267,8 +270,9 @@ def direct_cli_options(
         "coordinator_prompt": options["coordinatorPrompt"],
         "speed_mode": options["speedMode"],
         "reasoning_summary": options["reasoningSummary"],
+        "author_mode": options["authorMode"],
         "team_options": {"goal_loop": options["goalLoop"], "author_subagent_models": options["authorSubagentModels"],
-                         "prompt_overrides": {}},
+                         "examiner": options["examiner"], "prompt_overrides": {}},
     }
 
 
@@ -742,18 +746,35 @@ def main():
         dest="author_subagents", type=int, default=DEFAULT_AUTHOR_SUBAGENTS,
         metavar="N",
         help=(
-            f"author subagents, 0 to {MAX_AUTHOR_SUBAGENTS} (default: {DEFAULT_AUTHOR_SUBAGENTS}): with 1 or more "
-            "the proof author is a coordinator that runs up to N author subagents at a time; 0 gives it no "
-            "subagent tool, and it works alone"
+            f"subagents the proof author may start at a time, 0 to {MAX_AUTHOR_SUBAGENTS} (default: "
+            f"{DEFAULT_AUTHOR_SUBAGENTS}): one fewer than the form's Parallel agents. 0: the author works alone; "
+            "N: it may start up to N subagents with its program's own subagent tool"
+        ),
+    )
+    # Not --author-mode: no new option may share a prefix with --author-model, which is abbreviated (--author-m).
+    parser.add_argument(
+        "-teamCoordinator", "--teamCoordinator", "--team-coordinator",
+        dest="team_coordinator", action="store_true",
+        help=(
+            "run the earlier team design: the proof author does not prove the statement itself but coordinates "
+            "--author-subagents author subagents (1 or more) through TCS Prover's team tools"
+        ),
+    )
+    parser.add_argument(
+        "-examiner", "--examiner",
+        dest="examiner", choices=("on", "off"), default="on" if DEFAULT_EXAMINER else "off",
+        help=(
+            "the author's examiner (default: on): about once an hour TCS Prover starts a fresh session of the "
+            "author's model that examines the whole run and reports to the author"
         ),
     )
     parser.add_argument(
         "-authorSubagentModels", "--authorSubagentModels", "--author-subagent-models",
         dest="author_subagent_models", metavar="JSON", default=None,
         help=(
-            "the model of each author subagent: a JSON list of exactly N entries {\"model\": MODEL, \"effort\": "
-            "EFFORT} (N = --author-subagents), any model the role menus offer; omitted: every author subagent runs "
-            "the author's model"
+            "with --team-coordinator, the model of each author subagent: a JSON list of exactly N entries "
+            "{\"model\": MODEL, \"effort\": EFFORT} (N = --author-subagents), any model the role menus offer; "
+            "omitted: every author subagent runs the author's model"
         ),
     )
     parser.add_argument(
@@ -870,6 +891,7 @@ def main():
                 coordinator_prompt_file=args.coordinator_prompt_file,
                 goal_loop=args.goal_loop,
                 author_subagent_models=args.author_subagent_models,
+                author_mode="coordinator" if args.team_coordinator else "author", examiner=args.examiner == "on",
                 verbose_events=args.verbose_events,
             )
         except (OSError, TypeError, ValueError) as exc:
