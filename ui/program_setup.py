@@ -142,12 +142,28 @@ ALPINE_COMMAND = ("Alpine Linux: the libraries Claude Code needs (as root)", "ap
 SANDBOX_COMMANDS = [("Debian or Ubuntu", "sudo apt install bubblewrap socat"),
                     ("Fedora", "sudo dnf install bubblewrap socat")]
 # LaTeX: what to install per system (TCS Prover runs none of these). A row has a command to copy, or a link.
+# The LaTeX editor's papers need more than a basic LaTeX: TeX Live's latexextra collection (cleveref, enumitem,
+# mathtools ...) and the algorithm and theorem packages of its mathscience collection (algorithm, algpseudocode,
+# algorithm2e, thmtools). Debian's texlive-latex-extra has the first only, Fedora's scheme-medium the second only,
+# hence the second package in each. TinyTeX installs in the home folder without administrator rights, where the
+# LaTeX step finds it (workflow_runner.TEX_TOOL_FOLDERS); its command was checked from an empty home folder on Linux
+# (exit 0, about 400 MB, the product's latexmk command builds a PDF with these packages; 21 Nov 2026). Naming the four
+# packages instead of all of mathscience avoids a plain-TeX format of that collection that fails to build there.
+TINYTEX_INSTALL = 'curl -sL "https://yihui.org/tinytex/install-bin-unix.sh" | sh'
+TINYTEX_PACKAGES = "collection-latexextra algorithms algorithmicx algorithm2e thmtools"
 LATEX_COMMANDS = {
     "macos": [{"label": "MacTeX", "text": "Download it from", "link": "https://tug.org/mactex/"},
               {"label": "Homebrew", "command": "brew install --cask mactex-no-gui",
-               "note": "About 5 GB; asks for an administrator password."}],
-    "linux": [{"label": "Debian or Ubuntu", "command": "sudo apt install latexmk texlive-latex-extra"},
-              {"label": "Fedora", "command": "sudo dnf install latexmk texlive-scheme-medium"},
+               "note": "About 5 GB; asks for an administrator password."},
+              {"label": "TinyTeX, in your home folder",
+               "command": f"{TINYTEX_INSTALL} && ~/Library/TinyTeX/bin/*/tlmgr install {TINYTEX_PACKAGES}",
+               "note": "About 400 MB in ~/Library/TinyTeX. It may ask for your password only to put TeX on PATH, "
+                       "which TCS Prover does not need."}],
+    "linux": [{"label": "Debian or Ubuntu", "command": "sudo apt install latexmk texlive-latex-extra texlive-science"},
+              {"label": "Fedora", "command": "sudo dnf install latexmk texlive-scheme-medium texlive-collection-latexextra"},
+              {"label": "TinyTeX, in your home folder, without administrator rights",
+               "command": f"{TINYTEX_INSTALL} && ~/.TinyTeX/bin/*/tlmgr install {TINYTEX_PACKAGES}",
+               "note": "About 400 MB in ~/.TinyTeX."},
               {"label": "Other Linux", "text": "TeX Live from", "link": "https://tug.org/texlive/"}],
     "windows": [{"label": "TeX Live", "text": "Download it from", "link": "https://tug.org/texlive/windows.html",
                  "note": "It includes Perl, which latexmk needs."},
@@ -155,8 +171,9 @@ LATEX_COMMANDS = {
                 {"label": "Perl for latexmk, with MiKTeX", "command": "winget install StrawberryPerl.StrawberryPerl"}],
     "other": [{"label": "TeX Live", "text": "Download it from", "link": "https://tug.org/texlive/"}],
 }
-LATEX_HELP = ("TCS Prover does not run these: they need administrator rights and several gigabytes. Afterwards click "
-              "Check again; the LaTeX step also looks in the standard TeX folders.")
+LATEX_HELP = ("TCS Prover does not run these. The system packages need administrator rights and several gigabytes; "
+              "TinyTeX installs in your home folder without them. Afterwards click Check again; the LaTeX step also "
+              "looks in the standard TeX folders, TinyTeX's among them.")
 
 # The hosts a sign-in link may lead to (any other address is shown as plain text, with a warning).
 LINK_HOSTS = {"codex": ("auth.openai.com", "chatgpt.com"),

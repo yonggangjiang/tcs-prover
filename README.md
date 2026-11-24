@@ -64,7 +64,10 @@ and `irm https://claude.ai/install.ps1 | iex`.
   for their format installed (Setup installs it too), with no sign-in.
 - **LaTeX** makes the PDF (`latexmk` and `pdflatex`): [MacTeX](https://tug.org/mactex/)
   or `brew install --cask mactex-no-gui` on macOS, [TeX Live](https://tug.org/texlive/)
-  or MiKTeX elsewhere. Setup shows the command for your system; you run it.
+  or MiKTeX elsewhere, or [TinyTeX](https://yihui.org/tinytex/) in your home folder
+  without administrator rights. Papers need TeX Live's `latexextra` collection and
+  its algorithm and theorem packages. Setup shows the command for your system; you
+  run it.
 - Nothing here stops a start: a job whose program or LaTeX is missing says so,
   tries again every minute, and continues by itself once you install it. Runs
   with a web cutoff timestamp are the exception: they need the native Codex CLI,
