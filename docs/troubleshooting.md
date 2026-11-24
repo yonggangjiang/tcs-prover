@@ -130,6 +130,12 @@ yourself to choose it). The conversations themselves stay in the Codex home,
 so saved conversations keep resuming; Codex builds the databases there once,
 in about a minute. Codex used outside TCS Prover keeps using `~/.codex`.
 
+**A job on a network home stops changing, but its page still says it is running.**
+A write to the run folder can hang on a network file system that stopped answering. Since 24 Nov 2026
+TCS Prover keeps reading the runner's events while a save hangs, so the run itself goes on and the job
+page catches up once the write returns. A server started before that version freezes the job instead:
+restart TCS Prover, which pauses and resumes its jobs.
+
 ## Jobs
 
 **No PDF.** The job waits at **Compile PDF** with *Waiting to retry a command

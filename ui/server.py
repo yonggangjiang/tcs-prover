@@ -10,6 +10,7 @@ import http.client
 import json
 import math
 import os
+import queue
 import re
 import secrets
 import shutil
@@ -1310,38 +1311,72 @@ class SleepWatch:
         return gap if gap > self.MARGIN_SECONDS else 0.0
 
 
+# How long the server may take to handle one line of a runner's output before it reads ahead (runner_lines()).
+RUNNER_LINE_SECONDS = 20
 _OUTPUT_END = object()
 
 
-def runner_lines(stream):
-    """The lines of a runner's output, read on a thread of their own and handed out in order.
+def runner_lines(stream, patience=None):
+    """The lines of a runner's output, in order, for a caller that handles each line before taking the next.
 
-    Reading never waits for the caller. A caller that is slow to handle a line, for example while saving it to a
-    run folder whose network filesystem stopped answering, would otherwise stop reading the pipe. The runner's
-    every thread writes its events to that pipe, its watchdog included, so once the pipe is full they all block:
-    the run stops without a failure, a pause or a check that could notice it (a job stalled 5 hours this way on
-    an NFS home, 23 Nov 2026). An error reading the stream is raised to the caller after the lines before it.
+    Normally each line is read when the caller asks for it. But a caller can be stuck on a line, for example
+    while saving it to a run folder whose network filesystem stopped answering. Then nothing reads the pipe, and
+    once it is full every thread of the runner blocks, because they all write their events to it, its watchdog
+    included: the run stops with no failure, pause or check that could notice (a job stalled 5 hours this way
+    on an NFS home, 23 Nov 2026). So when the caller has held a line for ``patience`` seconds
+    (RUNNER_LINE_SECONDS), a thread of its own reads the rest of the stream ahead into memory, and the caller
+    gets those lines in order. An error reading the stream reaches the caller after the lines before it.
     """
 
-    lines = queue.SimpleQueue()
+    patience = RUNNER_LINE_SECONDS if patience is None else patience
+    source, lines, guard = iter(stream), queue.SimpleQueue(), threading.Lock()
+    state = {"held_since": None, "reading_ahead": False, "ended": False}
 
-    def pump():
+    def read_ahead():
         try:
-            for line in stream:
+            for line in source:
                 lines.put(line)
         except (OSError, ValueError) as exc:
             lines.put(exc)
         finally:
             lines.put(_OUTPUT_END)
 
-    threading.Thread(target=pump, name="runner-output", daemon=True).start()
-    while True:
-        line = lines.get()
-        if line is _OUTPUT_END:
-            return
-        if isinstance(line, BaseException):
-            raise line
-        yield line
+    def watch():
+        while True:
+            time.sleep(min(1.0, patience / 4))
+            with guard:
+                if state["ended"] or state["reading_ahead"]:
+                    return
+                held = state["held_since"]
+                # Only while the caller holds a line: when it is reading, the stream is its own.
+                if held is not None and time.monotonic() - held >= patience:
+                    state["reading_ahead"] = True
+                    threading.Thread(target=read_ahead, name="runner-output", daemon=True).start()
+                    return
+
+    threading.Thread(target=watch, name="runner-output-watch", daemon=True).start()
+    try:
+        while True:
+            with guard:
+                state["held_since"] = None
+                reading_ahead = state["reading_ahead"]
+            if reading_ahead:
+                line = lines.get()
+                if line is _OUTPUT_END:
+                    return
+                if isinstance(line, BaseException):
+                    raise line
+            else:
+                try:
+                    line = next(source)
+                except StopIteration:
+                    return
+            with guard:
+                state["held_since"] = time.monotonic()
+            yield line
+    finally:
+        with guard:
+            state["ended"] = True
 
 
 def reap_runner(process):
@@ -4713,7 +4748,7 @@ class App:
                 return
             process.stdin.write(statement + ("\0" + feedback if feedback else ""))
             process.stdin.close()
-            for line in process.stdout:
+            for line in runner_lines(process.stdout):
                 record = self.parse_line(line, "review")
                 self.add_trace(record)
                 self._follow_model_retry(record)
@@ -7151,7 +7186,7 @@ class App:
                       "keeps running; its remaining events are saved, and it settles from its saved files "
                       "when the runner ends."})
         try:
-            for line in process.stdout:
+            for line in runner_lines(process.stdout):
                 record = self.parse_line(line, self.state["stage"] or "solve")
                 if record.get("kind") != "node_input":  # A step's input stays in memory only (see _read_records).
                     save(record)
@@ -7241,7 +7276,7 @@ class App:
         # Whether the author submitted during this runner (see the end of this method).
         submitted = False
         try:
-            for line in process.stdout:
+            for line in runner_lines(process.stdout):
                 if self.output_stream is not None:
                     try:
                         self.output_stream.write(line)
@@ -8728,7 +8763,7 @@ class App:
 
         reply, compacted, failure, problem, code = None, False, "", "", None
         try:
-            for line in process.stdout:
+            for line in runner_lines(process.stdout):
                 if self.output_stream is not None:
                     try:
                         self.output_stream.write(line)

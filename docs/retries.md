@@ -204,7 +204,10 @@ and retries a failed resume every minute; a terminal run does the same. A critic
 or LaTeX step that fails outside its model call pauses at that step with its
 exact input and is resumed there the same way. A file write that fails, for
 example on a full disk, is retried in place every minute, keeping the step's
-result. Retry times survive restarts and need no open browser tab. The paused job
+result. A save that does not return at all, as on a network file system that
+stopped answering, does not stop the run either: once TCS Prover has spent 20
+seconds on one event of a runner, it reads the runner's later events ahead
+into memory, so the runner never waits on it. Retry times survive restarts and need no open browser tab. The paused job
 shows its next retry time; **Keep paused** cancels automatic retries, and
 **Resume** retries at once.
 
