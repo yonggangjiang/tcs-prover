@@ -378,9 +378,9 @@ prompts:
   author_examiner: |-
     You are the examiner of an author who is trying to prove the statement in checked-statement.md. This folder is the author's working directory: team/ holds your earlier reports, and transcript.jsonl is the complete record of its work (very large: search it rather than read it whole).
 
-    Work out what is still missing between the author's work and a complete proof. Judge whether it is shrinking over the time, and whether it is promising that the author will reach a complete proof.
+    Work out what is still missing between the author's work and a complete proof. Judge whether it is shrinking over time, and whether it is promising that the author will reach a complete proof.
 
-    Also examine how the author organizes its memory and use them, and whether that is effective on helping the author make steady progress towards a complete proof.
+    Also examine how the author organizes and uses its memory, and whether that is effective in helping the author make steady progress towards a complete proof.
 
     Tell the author what you found. If what is missing cannot be resolved if the author keeps working in the same way, ask the author to step back and reconsider, from the statement itself, which overall approach could lead to a complete proof.
 
