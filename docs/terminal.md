@@ -14,8 +14,8 @@ This sends the whole file to the proof author, like turning off **Statement
 review** and keeping the other three stages on. It starts no web server and
 opens no browser. Without options it uses the built-in defaults (Default
 settings, saved with **Save these settings…**, apply only to the web form): 3
-independent critics per round, one author that works alone with an hourly
-examiner (see below), at most 2 consecutive edited critic passes (the
+independent critics per round, one author that works alone with an examiner
+(see below), at most 2 consecutive edited critic passes (the
 second accepts its repaired proof), no time limit, GPT 6.2 Sol at Max for every
 proof role, the built-in prompts, Standard speed and concise reasoning
 summaries.
@@ -24,9 +24,9 @@ The proof author proves the statement itself and keeps its memory in the
 `memory` folder of the job's folder under `runs/`. With `-authorSubagents N`
 it may also start up to N subagents of its own at a time (its program's
 subagent tool; the web form's **Parallel agents** is this number plus one, the
-author itself). About once an hour an examiner, a fresh session of the author's
-model, examines the whole run and reports to the author; `-examiner off` runs
-without it.
+author itself). Each time the author's conversation is compacted, an examiner, a
+fresh session of the author's model, examines the whole run and reports to the
+author; `-examiner off` runs without it.
 
 `-teamCoordinator` asks for the earlier team design instead: the author
 does not prove the statement itself, but runs `-authorSubagents` author
@@ -78,7 +78,7 @@ python3 web_ui.py statement.md --author-model gpt-6-astra --speed-mode standard
 | `-criticCount N` | `3` | Independent critics the critic starts as its subagents on each proof version before it decides: `1` to `10`. Every round starts this many fresh critics. |
 | `-authorSubagents N` | `0` | Subagents the proof author may start at a time, `0` to `10`: one fewer than the form's **Parallel agents**. `0`: the author works alone. N: it may start up to N subagents with its program's own subagent tool. |
 | `-teamCoordinator` | off | Runs the earlier team design (see above) instead of an author that proves the statement itself; it needs `-authorSubagents` 1 or more. |
-| `-examiner on\|off` | `on` | The author's examiner: about once an hour a fresh session of the author's model examines the whole run and reports to the author. |
+| `-examiner on\|off` | `on` | The author's examiner: each time the author's conversation is compacted, a fresh session of the author's model examines the whole run and reports to the author. |
 | `-authorSubagentModels JSON` | the author's model | With `-teamCoordinator`, the model of each author subagent: a JSON list of exactly `-authorSubagents` entries `{"model": MODEL, "effort": LEVEL}`, with any model `-authorModel` accepts, for example `'[{"model": "gpt-6.1-sol", "effort": "max"}, {"model": "claude-opus-5-5", "effort": "high"}, {"model": "gpt-6-astra", "effort": "max"}]'`. Omitted: every author subagent runs the author's model and reasoning. Not with a web cutoff. |
 | `-goalLoop LOOP` | `tcs` | Who runs a Codex author's goal loop: `tcs`, TCS Prover (it sends the editable goal continuation after every turn that did not end the goal, and the author ends it with `update_goal`), or `codex`, Codex's built-in goal mode. Claude Code authors always run TCS Prover's loop. |
 | `-thinkingHours HOURS` | `0` | Time limit in hours of the job's active work: `0` (the default) for none, or any positive number. Reaching it stops the proof author; the critic and LaTeX steps after a submission always finish, so an accepted proof is never cut off. Saved work is kept. |

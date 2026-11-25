@@ -47,14 +47,14 @@ ENTRIES = (
     ("conversation", "Author", "Reply to a message",
      "The paused author's reply to a chat message ({message})."),
     ("author_examiner", "Author", "Examiner instructions",
-     "The whole instruction of the author's examiner (the job's Examiner setting): TCS Prover starts it about once "
-     "an hour while the author works, each time in a fresh conversation with the author's model, and sends its "
+     "The whole instruction of the author's examiner (the job's Examiner setting): TCS Prover starts it each time "
+     "the author's conversation is compacted, in a fresh conversation with the author's model, and sends its "
      "report into the author's running turn. Empty: no examiner."),
     ("author_examiner_report", "Author", "Examiner report",
      "Frames the examiner's report as it reaches the author: {report} is the report."),
     ("examiner_note", "Author", "Examiner note",
-     "Appended to the author's first prompt while the job's Examiner is on: it tells the author that an examiner "
-     "reports to it and what its reports are."),
+     "Appended to the author's first prompt while the job's Examiner is on: it tells the author what its examiner "
+     "is and what to do with its reports."),
     ("chat", "Author", "Chat message",
      "Frames a chat message sent to the working author or coordinator: {message}, and {answer_file} for an answer."),
     ("related_works", "Author", "Related works",

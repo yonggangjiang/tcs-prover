@@ -101,21 +101,17 @@ prompts:
   # {revision_number} and {instruction}.
   goal: >-
     Prove the exact statement given in the initial prompt with a complete,
-    rigorous argument. Do not give up: think deeply and hard, and try
-    substantially different approaches until the proof is complete.
+    rigorous argument.
   # EDIT AUTHOR CONTINUATION HERE: sent after an author turn that did not end the goal: TCS Prover's goal
   # loop places it first in goal_continuation; Codex's goal mode sends it only when Codex does not continue
   # by itself; Claude Code gets it as it is. Placeholders as for the goal.
   continuation: >-
-    Keep working on the same statement and do not give up. Think deeply and
-    hard, and try approaches substantially different from the ones that failed;
-    I know the statement can be proved. When your proof is complete, write it to
+    Keep working on the same statement. When your proof is complete, write it to
     proof.md and reply with exactly PROOF_FILE: proof.md.
   # EDIT REOPEN HERE: the first message when a paused, stopped or restarted author's saved conversation is
   # reopened. Placeholders as for the goal.
   reopen: >-
-    Keep working on the same statement and do not give up. Think deeply and
-    hard, and try approaches substantially different from the ones that failed.
+    Keep working on the same statement.
   # EDIT COMPACTION HERE: sent into the running turn after the author's conversation was compacted;
   # {original_prompt} is its first prompt. Placeholders as for the goal.
   compaction: |-
@@ -126,14 +122,14 @@ prompts:
   # EDIT RESUME HERE: the first message of a new conversation that continues the author's work (its saved one
   # is gone or too long), or after a reply turn compacted it. Placeholders as for the goal.
   resume: |-
-    Keep working on the statement below, building on any previous work in this conversation or in your working directory. Do not give up: think deeply and hard, and try substantially different approaches where earlier ones failed.
+    Keep working on the statement below, building on any previous work in this conversation or in your working directory.
 
     ORIGINAL AUTHOR PROMPT:
     {original_prompt}
   # EDIT REPAIR HERE: sent after the critic rejects the proof: {solution} is the critic's candidate (with its
   # safe fixes), {bugs} its findings, {round} the critic round. Placeholders as for the goal.
   repair: |-
-    Fix the unresolved errors the critic found in this candidate, then write the complete corrected proof to proof.md and reply with exactly PROOF_FILE: proof.md. Do not give up on the statement.
+    Fix the unresolved errors the critic found in this candidate, then write the complete corrected proof to proof.md and reply with exactly PROOF_FILE: proof.md.
 
     CURRENT CANDIDATE:
     {solution}
@@ -179,9 +175,34 @@ prompts:
   # start subagents with its program's own subagent tool.
   subagents: |-
     You may start up to {author_subagents} independent subagents at a time, for example to explore other approaches or to check calculations; you do not need to ask the user.
+  # EDIT EXAMINER HERE: the whole instruction of the author's examiner (the job's Examiner setting, on by default).
+  # TCS Prover starts it itself each time the author's conversation is compacted (unless the last examination is still
+  # running), in a fresh conversation with the author's model in the author's folder; its report is saved in team/ and
+  # sent into the author's running turn framed by author_examiner_report. Empty: no examiner, whatever the setting.
+  author_examiner: |-
+    You are the examiner of an author who is trying to prove the statement in checked-statement.md. This folder is the author's working directory: team/ holds your earlier reports, and transcript.jsonl is the complete record of its work (very large: search it rather than read it whole).
 
-  # EDIT COORDINATOR HERE: the first prompt of the author coordinator (Author subagents 1 or more), a per-job prompt
-  # like the author's. {author_subagents} is the run's Author subagents setting.
+    Work out what is still missing between the author's work and a complete proof, checking for yourself what you rely on instead of taking the author's word for it. Judge whether it is shrinking over time, and whether it is promising that the author will reach a complete proof.
+
+    Also examine how the author organizes and uses its memory, and whether that is effective in helping the author make steady progress towards a complete proof.
+
+    Tell the author what you found. If what is missing cannot be resolved if the author keeps working in the same way, ask the author to step back and reconsider, from the statement itself, which overall approach could lead to a complete proof.
+
+    Your final reply is your report to the author.
+  # EDIT EXAMINER NOTE HERE: appended as written.
+  # Appended to the author's first prompt while the job's Examiner is on (with an author_examiner text), so that
+  # {original_prompt} carries it into the later prompts: it tells the author what its examiner is.
+  examiner_note: |-
+    YOUR EXAMINER
+    Each time your conversation is compacted, an examiner reads your whole record and your memory folder from outside and sends you a report headed [REPORT FROM THE EXAMINER]. Take its findings seriously, but your goal does not change: a complete proof of the original statement.
+  # EDIT EXAMINER REPORT HERE: how the examiner's report reaches the author: {report} is the report.
+  author_examiner_report: |-
+    [REPORT FROM THE EXAMINER]
+    {report}
+
+  # EDIT COORDINATOR HERE: the first prompt of the author coordinator (author mode "coordinator", only when a run asks
+  # for it), a per-job prompt like the author's. {author_subagents} is the number of subagents it may run at a time
+  # (one fewer than Parallel agents).
   coordinator: |-
     You are the coordinator of a team of author subagents working on the statement below. You do not try to prove the statement yourself. Your job is to run and check the healthiness of the team so that progress on solving the problem grows steadily with the time spent, until the team has a complete proof.
 
@@ -341,7 +362,7 @@ prompts:
 
   # EDIT TEAM HERE: appended to the coordinator's first prompt (after the related works), so that {original_prompt}
   # carries it into the later prompts. {members} is the list of members, one line each
-  # ("- member 1: GPT 6.1 Sol (Codex CLI)").
+  # ("- member 1: GPT 6.2 Sol (Codex CLI)").
   team_note: |-
     YOUR TEAM
     Your author subagents are TCS Prover team members, each running its own model:
@@ -355,11 +376,9 @@ prompts:
 
     Your final reply is your report to the coordinator.
 
-  # EDIT TEAM TOOLS HERE: the descriptions of the coordinator's team tools (TCS Prover's MCP server "tcs") and of their
-  # arguments, as the coordinator reads them. No placeholders; used as written.
-  # EDIT EXAMINER HERE: the examiner's whole instruction. The examiner is a seat beside the authors that TCS Prover
-  # itself starts while an author works (about once an hour, once an author has reported), each time in a fresh
-  # conversation with the coordinator's model; examining the run is its only task, and its report reaches the
+  # EDIT TEAM EXAMINER HERE: the team examiner's whole instruction. The examiner is a seat beside the authors that
+  # TCS Prover itself starts while an author works (about once an hour, once an author has reported), each time in a
+  # fresh conversation with the coordinator's model; examining the run is its only task, and its report reaches the
   # coordinator through team_wait like an assignment's. Leave it empty to run without an examiner.
   team_examiner: |-
     You are the examiner of a team that works on the statement in checked-statement.md in this folder: a coordinator who runs the team and author subagents who do the mathematics and choose their own approaches. This folder is the team's working directory: its memory folder holds the team's notes and its progress log, team/ holds the authors' reports in order, team/timeline.md lists the assignments and reports with their times, and transcript.jsonl is the complete raw record of every step (it is very large, so search it rather than read it whole).
@@ -369,34 +388,12 @@ prompts:
     Examine the coordination: how the coordinator instructs the authors, organizes the team and keeps its memory, and how that shapes the trajectory. Where progress is not growing, find what causes it and say what should change in how the team is run; the authors decide the mathematics, so do not choose it for them. Check whether changes made after your earlier reports helped.
 
     Your final reply is your report to the coordinator.
-
   # What the coordinator is told about the examiner: added to the description of team_wait when there is one.
-  # EDIT EXAMINER HERE: the whole instruction of the author's examiner (the job's Examiner setting, on by default).
-  # TCS Prover starts it itself about once an hour while the author works, each time in a fresh conversation with the
-  # author's model in the author's folder; its report is saved in team/ and sent into the author's running turn
-  # framed by author_examiner_report. Empty: no examiner, whatever the setting.
-  author_examiner: |-
-    You are the examiner of an author who is trying to prove the statement in checked-statement.md. This folder is the author's working directory: team/ holds your earlier reports, and transcript.jsonl is the complete record of its work (very large: search it rather than read it whole).
-
-    Work out what is still missing between the author's work and a complete proof. Judge whether it is shrinking over time, and whether it is promising that the author will reach a complete proof.
-
-    Also examine how the author organizes and uses its memory, and whether that is effective in helping the author make steady progress towards a complete proof.
-
-    Tell the author what you found. If what is missing cannot be resolved if the author keeps working in the same way, ask the author to step back and reconsider, from the statement itself, which overall approach could lead to a complete proof.
-
-    Your final reply is your report to the author.
-  # EDIT EXAMINER NOTE HERE: appended as written.
-  # Appended to the author's first prompt while the job's Examiner is on (with an author_examiner text): it tells the
-  # author that an examiner reports to it, and what its reports are.
-  examiner_note: |-
-    YOUR EXAMINER
-    About once an hour an examiner reads your whole record and your memory folder and sends you a report, which arrives as a message headed [REPORT FROM THE EXAMINER]. It sees the whole run from outside, so take seriously what it says about your progress and about what is still missing. Its report is advice, not a new task: the mathematics stays yours, and your task is still a complete proof of the statement.
-  # How the examiner's report reaches the author: {report} is the report.
-  author_examiner_report: |-
-    [REPORT FROM THE EXAMINER]
-    {report}
   team_examiner_note: |-
     An examiner also works beside your authors: TCS Prover starts it itself from time to time while an author works, in a fresh conversation whose only task is to examine the whole run so far, and its report comes with this tool like an assignment's.
+
+  # EDIT TEAM TOOLS HERE: the descriptions of the coordinator's team tools (TCS Prover's MCP server "tcs") and of their
+  # arguments, as the coordinator reads them. No placeholders; used as written.
   team_tool_members: |-
     List your team's members: each member's number, its model and the program that runs it, and its state (idle; working on an assignment, named by its first line, since a given time; or stopping). Check it before you assign work, so that no member stays idle.
   team_tool_assign: |-

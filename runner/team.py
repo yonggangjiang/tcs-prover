@@ -74,7 +74,8 @@ TEAM_FOLDER = "team"
 # The examiner (Team's ``examiner``): a seat beside the authors whose only task is to examine the whole run, in a
 # fresh conversation each time, with the team_examiner text as its whole instruction. TCS Prover starts an
 # examination itself, never the coordinator: when the coordinator assigns work or waits, an author is working, the
-# examiner is idle, some author has reported before, and the last examination began at least this long ago.
+# examiner is idle, some author has reported before, and the last examination began at least this long ago. A lone
+# author's examiner has no clock: goal_session starts an examination each time the author's conversation is compacted.
 EXAMINATION_SECONDS = 60 * 60
 EXAMINER_TASK = "Examination of the whole run"
 # The list of assignments and reports with their times, which the examiner reads: team/timeline.md.
@@ -515,10 +516,11 @@ class Team:
         # team_examiner text there is none. The coordinator's tools cannot address it.
         self.examiner = (_Member(examiner) if examiner and str(prompts.get("team_examiner") or "").strip()
                          and examiner["member"] not in self.members else None)
-        # A lone author's examiner (no members, no coordinator): examinations come every EXAMINATION_SECONDS from
-        # the start, whatever is reported, and examine() starts them; take_reports() collects their reports.
+        # A lone author's examiner (no members, no coordinator): examine() starts an examination whenever it is called
+        # (goal_session calls it when the author's conversation is compacted) and the last one has ended, whatever is
+        # reported; take_reports() collects their reports.
         self.lone = lone
-        self.examined = time.time() if lone else 0.0   # time.time() as the last examination began
+        self.examined = 0.0   # time.time() as the last examination began
         self.reported = False  # an author of this team has finished an assignment
         self.prompts, self.directory = prompts, Path(directory)
         self.attempt, self.configuration, self.emit, self.render = attempt, configuration, emit, render
@@ -664,17 +666,17 @@ class Team:
                 "with team_wait.")
 
     def _examine(self):
-        """Start an examination when one is due (EXAMINATION_SECONDS); called with the lock held."""
+        """Start an examination when one is due: a team's EXAMINATION_SECONDS after the last one began, a lone
+        author's whenever examine() asks; called with the lock held. True when one started."""
 
         seat = self.examiner
-        if (seat is None or self.closed is not None or seat.state != "idle"
-                or time.time() - self.examined < EXAMINATION_SECONDS):
-            return
+        if seat is None or self.closed is not None or seat.state != "idle":
+            return False
         if not self.lone:
-            if not self.running():
-                return
+            if time.time() - self.examined < EXAMINATION_SECONDS or not self.running():
+                return False
             if not self.reported and not any(reported(self.directory, number) for number in self.members):
-                return  # Nothing to examine yet: no author has reported.
+                return False  # Nothing to examine yet: no author has reported.
             self.reported = True
         seat.state, seat.task, seat.since = "working", EXAMINER_TASK, time.time()
         self.examined = seat.since
@@ -690,6 +692,7 @@ class Team:
         self._record(seat, "started", seat.task)
         seat.thread.start()
         self._timeline(f"examiner: examination {seat.assignment} starts")
+        return True
 
     def _timeline(self, head, body=""):
         """Add an entry to team/timeline.md, which the examiner reads (only with an examiner; best effort)."""
@@ -762,10 +765,12 @@ class Team:
                 self.cond.wait(min(left, 5))
 
     def examine(self):
-        """Start an examination when one is due (a lone author's examiner, see ``lone``)."""
+        """Start an examination now, unless the last one is still running or the team has stopped (a lone author's
+        examiner, see ``lone``: goal_session calls it when the author's conversation is compacted). True when one
+        started."""
 
         with self.cond:
-            self._examine()
+            return self._examine()
 
     def take_reports(self):
         """The reports that finished since the last call, each once: {head, where, text, file} (a lone author's

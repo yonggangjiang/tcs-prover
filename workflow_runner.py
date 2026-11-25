@@ -4674,11 +4674,21 @@ def member_usage(event, trace):
             "modelCalls": own.get("calls")}
 
 
+def examine_after_compaction(examiner, emit, thread):
+    """The author's conversation was compacted: its examiner (start_team(lone=True)) starts an examination, unless
+    the last one is still running."""
+
+    if not examiner.examine():
+        emit("diagnostic", text="The author's conversation was compacted while the examiner was still examining the "
+                                "run; no new examination starts.", threadId=thread)
+
+
 def start_team(members, *, prompts, directory, settings, stage, node_name, examiner=None, lone=False):
     """The author coordinator's team (runner/team.Team) of ``members`` (team.team_members()), ready for its tools.
 
     ``examiner`` is the examiner's seat (an entry like a member's), which the team starts itself (team.Team). With
-    ``lone`` it is a lone author's examiner: no members, an examination about every hour (goal_session's examiner).
+    ``lone`` it is a lone author's examiner: no members, an examination each time the author's conversation is
+    compacted (goal_session's examiner).
 
     Its members' records and events go to the run's records as the coordinator's subagents (stage ``stage``, node
     ``node_name``), each with its member's number and model and its assignment's id (subagentId,
@@ -5618,8 +5628,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                  texts=None, team=None, service=None, examiner=None):
     """Run one goal-enabled thread with lifecycle instructions supplied by YAML.
 
-    ``examiner`` is a lone author's examiner (start_team(lone=True)): each report it finishes is sent into the
-    author's running turn as author_examiner_report, the way a live instruction is.
+    ``examiner`` is a lone author's examiner (start_team(lone=True)): it examines the run each time the author's
+    conversation is compacted, and each report it finishes is sent into the author's running turn as
+    author_examiner_report, the way a live instruction is.
 
     Yield its final answer only after goal completion; accept follow-up feedback
     through ``send``. The model manages its own work in the supplied workspace.
@@ -6024,7 +6035,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     except (runtime.Error, OSError) as exc:
                         hold(command[0], f"Could not send the live instruction ({exc})")
             if examiner is not None and not pausing.is_set():
-                examiner.examine()
                 examiner_reports.extend(examiner.take_reports())
                 if (state["turn"] and examiner_reports and time.monotonic() >= examiner_wait["until"]
                         and not any(item[2] == "examiner" for item in list(pending_steers.values()))):
@@ -6286,6 +6296,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                         if state["turn"]:
                             steer(pending_compaction, key, "compaction")
                             pending_compaction = None
+                        if examiner is not None:
+                            examine_after_compaction(examiner, emit, thread)
             elif method == "thread/goal/updated":
                 status = (params.get("goal") or {}).get("status")
             elif method == "thread/tokenUsage/updated":
@@ -9537,9 +9549,9 @@ def _execute(workflow, state, options, prompts):
                     prompt, session_prompts, instruction = start["prompt"], start["prompts"], start["recovery"]
                     if alone is not None:
                         alone.pop("bound")
-                    # The author's examiner (``examined`` above): TCS Prover starts it about once an hour and its
-                    # reports go into the author's running turn (the goal session's ``examiner``). The earlier team
-                    # design has the team's own examiner instead.
+                    # The author's examiner (``examined`` above): TCS Prover starts it each time the author's
+                    # conversation is compacted and its reports go into the author's running turn (the goal
+                    # session's ``examiner``). The earlier team design has the team's own examiner instead.
                     lone_examiner = None
                     if crew is None and not coordinator and examined:
                         lone_examiner = examiners.get(current)

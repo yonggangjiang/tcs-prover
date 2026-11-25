@@ -3157,7 +3157,7 @@ function renderRunOverview() {
             state.authorSubagents === 1 ? "" : "s"} of its own at a time`) : "Off"],
     // The author's examiner (the Examiner setting; a coordinator job has its team's examiner instead).
     ...(stages.author && state.authorMode !== "coordinator" && typeof state.examiner === "boolean"
-      ? [["Examiner", state.examiner ? "On: reports to the author about once an hour" : "Off"]] : []),
+      ? [["Examiner", state.examiner ? "On: reports to the author after each compaction of its conversation" : "Off"]] : []),
     // How the author's turns follow one another (a job from before the setting records none).
     ...(stages.author && ["tcs", "codex"].includes(state.goalLoop) ? [["Goal loop", jobGoalLoopText()]] : []),
     // The limit now, and every change of it and pause at it (the server's records).

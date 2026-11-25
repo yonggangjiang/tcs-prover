@@ -764,8 +764,8 @@ def main():
         "-examiner", "--examiner",
         dest="examiner", choices=("on", "off"), default="on" if DEFAULT_EXAMINER else "off",
         help=(
-            "the author's examiner (default: on): about once an hour TCS Prover starts a fresh session of the "
-            "author's model that examines the whole run and reports to the author"
+            "the author's examiner (default: on): each time the author's conversation is compacted, TCS Prover "
+            "starts a fresh session of the author's model that examines the whole run and reports to the author"
         ),
     )
     parser.add_argument(

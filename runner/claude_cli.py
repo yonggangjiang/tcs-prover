@@ -1719,8 +1719,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                  alone=None, texts=None, team=None, service=None, examiner=None):
     """Run the persistent author through Claude with the Codex goal-session protocol.
 
-    ``examiner`` is the author's examiner (workflow_runner.start_team(lone=True)): each report it finishes is sent
-    into the author's running turn as author_examiner_report, the way a live instruction is.
+    ``examiner`` is the author's examiner (workflow_runner.start_team(lone=True)): it examines the run each time the
+    author's conversation is compacted, and each report it finishes is sent into the author's running turn as
+    author_examiner_report, the way a live instruction is.
 
     Drop-in replacement for workflow_runner.goal_session: same generator
     protocol, events, labels, pause/time-limit behaviour and WorkflowPaused
@@ -2173,7 +2174,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     team_watch.team = False
                     emit("diagnostic", text=f"The coordinator's team warnings stopped: {exc}", threadId=thread)
             if examiner is not None and not pausing.is_set():
-                examiner.examine()
                 examiner_reports.extend(examiner.take_reports())
                 if (examiner_reports and time.monotonic() >= examiner_wait["until"]
                         and not any(kind == "examiner" for kind, _ in list(pending.values()))):
@@ -2671,6 +2671,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                         with lock:
                             send_user(anchor, "compaction", anchor)
                         emit("request", label="Author context re-anchor after compaction", text=anchor, threadId=session)
+                        if examiner is not None:
+                            runtime.examine_after_compaction(examiner, emit, session)
                 continue
             if kind == "user" and message.get("isReplay"):
                 with lock:

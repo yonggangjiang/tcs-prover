@@ -1735,7 +1735,8 @@ def web_prompt_options(body, roles, source=None):
 # new jobs, saved settings and requests without the setting get TCS Prover's.
 DEFAULT_GOAL_LOOP = "tcs"
 # The Examiner setting of a new job (the job setting examiner): an examiner beside the proof author, which TCS Prover
-# starts about once an hour and whose report it sends to the author (the author_examiner text). A job from before
+# starts each time the author's conversation is compacted and whose report it sends to the author (the
+# author_examiner text). A job from before
 # the setting records none: it has an examiner only if it saved an author_examiner text of its own.
 DEFAULT_EXAMINER = True
 LEGACY_GOAL_LOOP = "codex"
