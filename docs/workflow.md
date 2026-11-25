@@ -164,9 +164,11 @@ examination is a fresh conversation of the author's model in the author's
 folder, with the `author_examiner` text as its whole instruction (**Edit
 prompts → Author → Examiner instructions**): it works out what is still missing
 between the author's work and a complete proof, judges whether that is shrinking
-and whether it is any easier than the statement itself, and tells the author; if
-what is missing is no easier than the statement, it asks the author to step back
-and reconsider the overall approach. Its final reply is saved as
+over time and whether the author looks likely to reach a complete proof, examines
+how the author organizes and uses its memory and whether that helps it make
+steady progress, and tells the author; if what is missing cannot be resolved by
+working the same way, it asks the author to step back and reconsider the overall
+approach. Its final reply is saved as
 `team/member-1/<k>-report.md` and sent into the author's running turn, framed by
 `author_examiner_report` (by default `[REPORT FROM THE EXAMINER]` and the
 report), the way a chat message is; the author goes on working with it, and the
