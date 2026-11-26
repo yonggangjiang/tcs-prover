@@ -2,6 +2,7 @@
 
 import bisect
 import codecs
+import copy
 import decimal
 import errno
 import getpass
@@ -37,6 +38,7 @@ from retrieval import runtime as retrieval_runtime
 from runner import claude_cli, prompt_catalog, providers, records
 from runner import team as team_module
 from . import model_calls, named_batches, ownership, page_files, presets, program_setup, related_works, retrieval
+from . import runner_process
 from .local_host import same_origin, trusted_host
 from .review import REVIEW_PROMPT
 
@@ -565,17 +567,49 @@ DAMAGED_CHECKPOINT_FIELDS = {
 }
 
 
+# Small files every job's state reads, as last read: {path: (its identity, size, change time and mode, the value)}.
+# A file is read again only when one of those changed (_unchanged_read()); the job list reads them for every job.
+_FILE_READS = {}
+_FILE_READS_LOCK = threading.Lock()
+
+
+def _unchanged_read(path, read):
+    """``read(path)``, or what it gave last time when the file (not followed if a link) is the same as then."""
+
+    path = Path(path)
+    try:
+        info = os.lstat(path)
+        mark = (info.st_ino, info.st_size, info.st_mtime_ns, info.st_mode)
+    except OSError:
+        mark = None
+    key = str(path)
+    with _FILE_READS_LOCK:
+        known = _FILE_READS.get(key)
+    if mark is not None and known is not None and known[0] == mark:
+        return copy.deepcopy(known[1])
+    value = read(path)
+    if mark is not None:
+        with _FILE_READS_LOCK:
+            _FILE_READS[key] = (mark, copy.deepcopy(value))
+            if len(_FILE_READS) > 20_000:
+                _FILE_READS.clear()
+    return value
+
+
 def read_pause_object(run_dir):
     """Read pause.json for display and routing; a missing or damaged file reads as {}.
 
     Only Resume needs a valid checkpoint, and it checks one with load_pause_checkpoint.
     """
 
-    try:
-        checkpoint = json.loads(controlled_path(run_dir, PAUSE_FILENAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError, RecursionError):
-        return {}
-    return checkpoint if isinstance(checkpoint, dict) else {}
+    def read(path):
+        try:
+            checkpoint = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError):
+            return {}
+        return checkpoint if isinstance(checkpoint, dict) else {}
+
+    return _unchanged_read(controlled_path(run_dir, PAUSE_FILENAME), read)
 
 
 def span_text(seconds):
@@ -1222,16 +1256,16 @@ def memory_path_parts(path):
     return parts
 
 
-def _memory_root(workspace):
-    """Open the memory folder of the author's working folder ``workspace`` for a walk that follows no link, or
-    return None when it is not a real folder.
+def _memory_root(workspace, folder_name=MEMORY_FOLDER):
+    """Open the memory folder (``folder_name``) of the author's working folder ``workspace`` for a walk that
+    follows no link, or return None when it is not a real folder.
 
     The author can write that folder. Where a folder can be opened below an open one (os.open with dir_fd), the
     walk holds each folder open, so none can be swapped for a link meanwhile: an int. Elsewhere (Windows) it is
     the folder's path, and every entry is checked before it is used.
     """
 
-    folder = Path(workspace) / MEMORY_FOLDER
+    folder = Path(workspace) / folder_name
     try:
         info = os.lstat(folder)
     except OSError:
@@ -1333,14 +1367,15 @@ def list_memory_files(workspace):
             "truncated": limits["truncated"]}
 
 
-def _memory_file_descriptor(workspace, parts):
+def _memory_file_descriptor(workspace, parts, folder_name=MEMORY_FOLDER):
     """Open one file of the author's memory read-only (``parts``: memory_path_parts()), or return None.
+    ``folder_name``: the folder below ``workspace`` it is in (the examiner's reports are in team/).
 
     As for a chat answer (_author_file_descriptor), with the file's folders opened one below the other: a link
     anywhere on the way, a FIFO, and a file with a second hard link are never read.
     """
 
-    handle = _memory_root(workspace)
+    handle = _memory_root(workspace, folder_name)
     try:
         for name in parts[:-1]:
             if handle is None:
@@ -1371,8 +1406,9 @@ def _memory_file_descriptor(workspace, parts):
         _memory_leave(handle)
 
 
-def read_memory_file(workspace, path):
-    """One file of the author's memory as the job page shows it, or None when it cannot be read now.
+def read_memory_file(workspace, path, folder_name=MEMORY_FOLDER):
+    """One file of the author's memory as the job page shows it, or None when it cannot be read now
+    (``folder_name``: the folder below ``workspace`` it is in, memory/ unless said otherwise).
 
     ``path`` names it as list_memory_files() does (memory_path_parts(); ValueError otherwise). Its first
     MEMORY_FILE_READ_BYTES are read, which hold at least its first MAX_MEMORY_FILE_CHARS characters, decoded as
@@ -1384,7 +1420,7 @@ def read_memory_file(workspace, path):
     not a file that is read (_memory_file_descriptor()). The text is untrusted model output: shown, never run.
     """
 
-    descriptor = _memory_file_descriptor(workspace, memory_path_parts(path))
+    descriptor = _memory_file_descriptor(workspace, memory_path_parts(path), folder_name)
     if descriptor is None:
         return None
     try:
@@ -1413,6 +1449,46 @@ def read_memory_file(workspace, path):
     return {"path": path, "text": shown, "chars": len(shown), "binary": binary,
             "truncated": not binary and (not whole or len(text) > len(shown)), "bytes": info.st_size,
             "updatedAt": datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat()}
+
+
+# The examiner's reports of a job (App.examiner_reports()): the transcript lines that can be about them, its
+# examinations (an examiner seat's "Author subagent started/finished/failed", subagentId member-<seat>-<k>) and the
+# author's receipt of a report ("Examiner report delivered", examinerReport team/member-<seat>/<k>-report.md).
+EXAMINER_LINE_MARKERS = (b'"subagentExaminer": true', b'"label": "Examiner report delivered"')
+EXAMINATION_ID = re.compile(r"member-([1-9][0-9]{0,5})-([1-9][0-9]{0,6})\Z")
+EXAMINER_REPORT_PATH = re.compile(r"team/member-([1-9][0-9]{0,5})/([1-9][0-9]{0,6})-report\.md\Z")
+EXAMINER_TEAM_FOLDER = "team"
+_examiner_scan_lock = threading.Lock()
+
+
+def follow_examiner_report(entries, record):
+    """Add what one transcript record says of the examiner's reports to ``entries`` ({examination id: entry})."""
+
+    if not isinstance(record, dict):
+        return
+    when = record.get("time") if isinstance(record.get("time"), str) else ""
+    if record.get("subagentExaminer") is True and isinstance(record.get("subagentId"), str):
+        found = EXAMINATION_ID.match(record["subagentId"])
+        state = record.get("subagentState")
+        if not found or state not in {"started", "finished", "failed"}:
+            return
+        seat, number = int(found.group(1)), int(found.group(2))
+    elif record.get("label") == "Examiner report delivered" and isinstance(record.get("examinerReport"), str):
+        found = EXAMINER_REPORT_PATH.match(record["examinerReport"])
+        if not found:
+            return
+        seat, number, state = int(found.group(1)), int(found.group(2)), "delivered"
+    else:
+        return
+    entry = entries.setdefault(f"member-{seat}-{number}", {
+        "id": f"member-{seat}-{number}", "seat": seat, "number": number, "state": "running", "startedAt": "",
+        "finishedAt": "", "deliveredAt": "", "file": f"{EXAMINER_TEAM_FOLDER}/member-{seat}/{number}-report.md"})
+    if state == "started":
+        entry["startedAt"] = entry["startedAt"] or when
+    elif state == "delivered":
+        entry["deliveredAt"] = entry["deliveredAt"] or when
+    else:
+        entry.update(state=state, finishedAt=when)
 
 
 def delivered_repair(record):
@@ -1470,6 +1546,11 @@ def runner_lines(stream, patience=None):
     gets those lines in order. An error reading the stream reaches the caller after the lines before it.
     """
 
+    if getattr(stream, "follows_file", False) is True:
+        # A runner's log (runner_process.LogFollower): the runner never waits for its reader, so nothing is read
+        # ahead, and the follower knows which lines were handled.
+        yield from stream
+        return
     patience = RUNNER_LINE_SECONDS if patience is None else patience
     source, lines, guard = iter(stream), queue.SimpleQueue(), threading.Lock()
     state = {"held_since": None, "reading_ahead": False, "ended": False}
@@ -2027,6 +2108,31 @@ def saved_team_state(run_dir):
 
 
 TRACE_LIMIT = 1500
+# What the job page receives of a transcript record (page_record()): a text longer than PAGE_TEXT_LIMIT characters is
+# cut there, and a model event of a kind the page never shows (anything but PAGE_EVENT_NAMES: Codex's whole-turn
+# diffs, token and rate-limit updates, ...) keeps only its name and conversation ids. Such a record carries
+# "shortened": {"id"} and the page asks for the whole of it only when the reader wants it (GET /trace-record,
+# App.trace_record()). The server keeps every record whole, and transcript.jsonl has them all.
+PAGE_TEXT_LIMIT = 16_000
+# What a job's window was made of, kept in its controller folder (TRACE_INDEX_FILE) so that a restart reads only what
+# was added to transcript.jsonl since (App._load_trace()): where the scan ended, a digest of the TRACE_INDEX_CHECK
+# bytes before that point (a transcript that was replaced or cut is scanned again whole), the line count, the
+# window's lines and the pinned ones (where each starts and how long it is). Made by another version of this file
+# (CODE_DIGEST), it is not used.
+TRACE_INDEX_FILE = "trace-index.json"
+TRACE_INDEX_CHECK = 4096
+CODE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
+# What restoring a job found in its transcript (restore_saved_app()'s pass over it), kept in its controller folder: a
+# restart that finds the transcript and the state the pass starts from unchanged takes it from there, without reading
+# the transcript (a long run's is hundreds of megabytes). Made by another version of this file, it is not used.
+RESTORE_SCAN_FILE = "restore-scan.json"
+RESTORE_SCAN_NAMES = ("relevant", "first_time", "last_time", "any_records", "transcript_speed",
+                      "observed_role_settings", "post_review_request", "last_work_node", "author_finished",
+                      "submitted_since_resume", "ended_with_error", "delivered_steers", "stop_in_force",
+                      "replaced_roles")
+PAGE_EVENT_NAMES = frozenset({"item/started", "item.started", "item/completed", "item.completed",
+                              "item/agentMessage/delta", "item/reasoning/summaryTextDelta", "turn/started",
+                              "turn.started", "turn/completed", "turn.completed", "thread/goal/updated"})
 # The events of the subagents' own conversations (codex_event records with root false: the author's subagents,
 # the critic's independent critics) keep a window of their own, beside TRACE_LIMIT, so busy subagents never push the
 # author's or the critic's own records out of the page's live window. transcript.jsonl keeps every record.
@@ -2043,21 +2149,155 @@ LASTING_KINDS = {"review_result", "critic_result", "author_result", "final_resul
                  "partial_result", "convention_result"}
 
 
+def _shortened_value(value, limit):
+    """(whether anything was cut, ``value`` with every text longer than ``limit`` cut there); copies only what it
+    changes."""
+
+    if isinstance(value, str):
+        return (True, value[:limit] + "…") if len(value) > limit else (False, value)
+    if isinstance(value, dict):
+        cut, copy = False, None
+        for key, item in value.items():
+            changed, shorter = _shortened_value(item, limit)
+            if changed:
+                copy = dict(value) if copy is None else copy
+                copy[key], cut = shorter, True
+        return cut, (copy if cut else value)
+    if isinstance(value, list):
+        cut, copy = False, None
+        for index, item in enumerate(value):
+            changed, shorter = _shortened_value(item, limit)
+            if changed:
+                copy = list(value) if copy is None else copy
+                copy[index], cut = shorter, True
+        return cut, (copy if cut else value)
+    return False, value
+
+
+def record_token(record):
+    """What names a record of a job's window for GET /trace-record: where it is in memory, and a check of what it is,
+    as the address of a record that left the window can be given to another one."""
+
+    fields = json.dumps([record.get(key) for key in ("kind", "stage", "node", "label", "time")], default=str)
+    return f"{id(record):x}-{hashlib.sha256(fields.encode('utf-8')).hexdigest()[:12]}"
+
+
+def page_record(record):
+    """``record`` as the job page receives it (see PAGE_TEXT_LIMIT): the record itself, or a shortened copy that
+    says so ("shortened": {"id": what GET /trace-record takes (record_token()), "omitted": the page shows none of
+    it})."""
+
+    if not isinstance(record, dict):
+        return record
+    token = {"id": record_token(record)}
+    if record.get("kind") == "codex_event" and isinstance(record.get("event"), dict):
+        event = record["event"]
+        name = event.get("method") or event.get("type")
+        if name not in PAGE_EVENT_NAMES:
+            params = event.get("params") if isinstance(event.get("params"), dict) else {}
+            kept = {key: params[key] for key in ("threadId", "turnId") if isinstance(params.get(key), str)}
+            slim = {key: value for key, value in event.items() if key in ("method", "type", "emittedAtMs")}
+            return {**record, "event": {**slim, **({"params": kept} if "method" in event else kept)},
+                    "shortened": {**token, "omitted": True}}
+    keep = {"report"} if record.get("kind") == "critic_result" else set()
+    cut, copy = False, None
+    for key, value in record.items():
+        if key in keep:
+            continue
+        changed, shorter = _shortened_value(value, PAGE_TEXT_LIMIT)
+        if changed:
+            copy = dict(record) if copy is None else copy
+            copy[key], cut = shorter, True
+    return {**copy, "shortened": token} if cut else record
+
+
+# A model event's line in transcript.jsonl (add_trace writes every record in one key order): {"kind": "codex_event",
+# "stage": …, ["node": …,] "event": {…}, then flat fields such as "root", "subagentId", "activityLabel", "time"}.
+# Model events are nearly all of a long run's transcript, and a restart needs only their flat fields, so
+# light_codex_record() reads those without parsing the event: in its place only the event's name
+# ({"method" or "type": name, "light": True}).
+_LIGHT_HEAD = re.compile(rb'\{"kind": "codex_event", "stage": "([^"\\]*)"(?:, "node": "([^"\\]*)")?, "event": \{')
+# The flat fields after the event: "key": a text without escapes, a whole number, true, false or null.
+_LIGHT_FIELD = re.compile(rb'\s*"(\w+)": ("[^"\\]*"|-?\d+|true|false|null)\s*(,|\}\s*$)')
+_LIGHT_TAIL_KEYS = frozenset({"root", "time", "subagentId", "subagentMember", "subagentModel", "subagentExaminer",
+                              "activityLabel", "conversationId"})
+_LIGHT_VALUES = {b"true": True, b"false": False, b"null": None}
+_LIGHT_NAME = re.compile(rb'"(method|type)": "([^"\\]*)"')
+
+
+def light_codex_record(line):
+    """The record of one model event's transcript line (bytes) without its event (only its name in its place), or None
+    when the line is not laid out as add_trace writes one, or is an author's completed message (important_record()
+    pins those): such lines are parsed whole."""
+
+    head = _LIGHT_HEAD.match(line)
+    if head is None:
+        return None
+    name = line[head.end():head.end() + 48]
+    if (b"completed" in name and (b"agentMessage" in line or b"agent_message" in line)):
+        return None
+    end = len(line)
+    for _ in range(4):
+        # The event's closing brace is the last "}, " before the flat fields.
+        end = line.rfind(b'}, "', head.end(), end)
+        if end < 0:
+            return None
+        tail, position, fields = line[end + 3:], 0, {}
+        while True:
+            field = _LIGHT_FIELD.match(tail, position)
+            if field is None:
+                break
+            key, value = field.group(1).decode("ascii"), field.group(2)
+            if key not in _LIGHT_TAIL_KEYS:
+                break
+            fields[key] = (value[1:-1].decode("utf-8", errors="replace") if value[:1] == b'"'
+                           else _LIGHT_VALUES[value] if value in _LIGHT_VALUES else int(value))
+            position = field.end()
+            if field.group(3) != b",":
+                if "time" in fields and position == len(tail):
+                    record = {"kind": "codex_event", "stage": head.group(1).decode("utf-8", errors="replace")}
+                    if head.group(2) is not None:
+                        record["node"] = head.group(2).decode("utf-8", errors="replace")
+                    named = _LIGHT_NAME.match(line, head.end())
+                    record["event"] = ({named.group(1).decode("ascii"):
+                                        named.group(2).decode("utf-8", errors="replace"), "light": True}
+                                       if named else {"light": True})
+                    record.update(fields)
+                    return record
+                break
+    return None
+
+
+def window_record(record):
+    """``record`` as a job's window keeps it in memory: a model event of a kind the page never shows (see
+    PAGE_EVENT_NAMES) without its payload (Codex's whole-turn diffs alone can fill hundreds of megabytes), anything
+    else as it is. The server reads no such event from the window, and transcript.jsonl keeps the whole record."""
+
+    if not isinstance(record, dict) or record.get("kind") != "codex_event" or not isinstance(record.get("event"), dict):
+        return record
+    event = record["event"]
+    name = event.get("method") or event.get("type")
+    if name in PAGE_EVENT_NAMES or not isinstance(name, str):
+        return record
+    return {**record, "event": {("method" if "method" in event else "type"): name}}
+
+
 def subagent_record(record):
     """Whether a transcript record is an event of a subagent's own conversation (see SUBAGENT_TRACE_LIMIT)."""
 
     return isinstance(record, dict) and record.get("kind") == "codex_event" and record.get("root") is False
 
 
-def bounded_pinned(pinned):
-    """Drop the oldest pinned milestones beyond the bound, never a result or an approval."""
+def bounded_pinned(pinned, fields=lambda record: (record.get("kind"), record.get("label"))):
+    """Drop the oldest pinned milestones beyond the bound, never a result or an approval. ``fields(entry)`` gives an
+    entry's (kind, label): a record's by default."""
 
-    others = [index for index, record in enumerate(pinned)
-              if record.get("kind") not in LASTING_KINDS and record.get("label") != "Critic approved"]
+    others = [index for index, entry in enumerate(pinned)
+              if fields(entry)[0] not in LASTING_KINDS and fields(entry)[1] != "Critic approved"]
     if len(others) <= PINNED_LIMIT:
         return pinned
     dropped = set(others[PINNED_HEAD:len(others) - (PINNED_LIMIT - PINNED_HEAD)])
-    return [record for index, record in enumerate(pinned) if index not in dropped]
+    return [entry for index, entry in enumerate(pinned) if index not in dropped]
 
 
 def without_completed_deltas(records):
@@ -3963,7 +4203,14 @@ class App:
         return [value] if isinstance(value, dict) else []
 
     def _load_trace(self):
-        """Restore the append-only local transcript after a restart."""
+        """Restore the append-only local transcript after a restart: the live window (as add_trace keeps it), the
+        pinned records and the line count.
+
+        A model event's line is read light (light_codex_record(): it is never pinned, and one the page never shows
+        is kept without its payload, window_record()); only the window's other lines and the pinned ones are read
+        whole, at the end. What the scan found is kept in TRACE_INDEX_FILE, so the next load scans only the lines
+        added since.
+        """
 
         if not self.trace_file:
             return [], 0, []
@@ -3971,31 +4218,76 @@ class App:
             descriptor = open_run_log(self.trace_file, os.O_RDONLY)
             if descriptor is None:
                 return [], 0, []
-            # The live window as add_trace keeps it, with each record's number (its line, as its traceVersion).
-            own, theirs, pinned, total = deque(maxlen=TRACE_LIMIT), deque(maxlen=SUBAGENT_TRACE_LIMIT), [], 0
-            with os.fdopen(descriptor, encoding="utf-8", errors="replace") as stream:
+            index_path = controller_directory(self.trace_file.parent) / TRACE_INDEX_FILE
+            with os.fdopen(descriptor, "rb") as stream:
+                # The window: (number, where the line starts, its length, its record, or None until it is read);
+                # the pinned lines: (where it starts, its length, its kind, its label).
+                own, theirs, pinned, total, offset = (deque(maxlen=TRACE_LIMIT), deque(maxlen=SUBAGENT_TRACE_LIMIT),
+                                                      [], 0, 0)
+                saved = _saved_trace_index(index_path, stream)
+                if saved is not None:
+                    own.extend(saved["own"])
+                    theirs.extend(saved["theirs"])
+                    pinned, total, offset = saved["pinned"], saved["total"], saved["end"]
+                stream.seek(offset)
                 for line in stream:
                     total += 1
+                    start, offset = offset, offset + len(line)
                     try:
                         if line.strip():
-                            record = json.loads(line)
+                            light = light_codex_record(line)
+                            record = light if light is not None else json.loads(
+                                line.decode("utf-8", errors="replace"))
                             if not readable_record(record):
                                 continue
-                            (theirs if subagent_record(record) else own).append((total, record))
-                            if important_record(record):
-                                pinned.append(record)
+                            kept = record
+                            if light is not None:
+                                # A model event the page shows is read whole at the end; one it never shows is
+                                # kept as window_record() keeps it.
+                                event = light["event"]
+                                name = event.get("method") or event.get("type")
+                                kept = (None if name in PAGE_EVENT_NAMES or not isinstance(name, str) else
+                                        {**light, "event": {key: value for key, value in event.items()
+                                                            if key != "light"}})
+                            (theirs if subagent_record(record) else own).append((total, start, len(line), kept))
+                            if light is None and important_record(record):
+                                pinned.append((start, len(line), record.get("kind"), record.get("label")))
                                 if len(pinned) > PINNED_LIMIT + PINNED_SLACK:
-                                    pinned = bounded_pinned(pinned)
+                                    pinned = bounded_pinned(pinned, lambda entry: entry[2:4])
                     except (ValueError, RecursionError):
                         continue
-            entries = sorted([*own, *theirs], key=lambda entry: entry[0])
+                end, window = offset, sorted([*own, *theirs], key=lambda entry: entry[0])
+                pinned = bounded_pinned(pinned, lambda entry: entry[2:4])
+                # The lines to read whole, each once, in the file's order: a pinned record in the window is the
+                # same record there (retained_trace() keeps it once).
+                window_lines = {start for _, start, _, kept in window if kept is not None}
+                wanted = sorted({(start, size) for _, start, size, kept in window if kept is None}
+                                | {(start, size) for start, size, _, _ in pinned if start not in window_lines})
+                read = {}
+                for start, size in wanted:
+                    stream.seek(start)
+                    try:
+                        record = json.loads(stream.read(size).decode("utf-8", errors="replace"))
+                    except (ValueError, RecursionError):
+                        continue
+                    if readable_record(record):
+                        read[start] = record
+                entries = [(number, kept if kept is not None else read[start])
+                           for number, start, size, kept in window if kept is not None or start in read]
+                # A pinned line in the window is the window's record (the same object, as add_trace keeps it).
+                in_window = {start: record for (_, start, _, _), (_, record) in zip(
+                    [entry for entry in window if entry[3] is not None or entry[1] in read], entries)}
+                pinned_records = [in_window.get(start) or read[start] for start, _, _, _ in pinned
+                                  if start in in_window or start in read]
+                if saved is None or end != saved["end"]:
+                    _save_trace_index(index_path, stream, end, total, own, theirs, pinned)
             kept = {id(record) for record in without_completed_deltas([record for _, record in entries])}
             entries = [entry for entry in entries if id(entry[1]) in kept]
             records = [record for _, record in entries]
             self._trace_index = (records, [number for number, _ in entries],
                                  [sum(not subagent_record(record) for record in records),
                                   sum(subagent_record(record) for record in records)])
-            return records, total, bounded_pinned(pinned)
+            return records, total, pinned_records
         except OSError:
             return [], 0, []
 
@@ -4016,6 +4308,17 @@ class App:
                                          [len(trace) - subagents, subagents])
         return index[1], index[2]
 
+    def trace_record(self, identity):
+        """The whole record of the job's window that page_record() named ``identity``, or ValueError when it has left
+        the window (its text is then in transcript.jsonl)."""
+
+        address = identity.split("-", 1)[0] if isinstance(identity, str) else ""
+        with self.lock:
+            for record in self.retained_trace():
+                if format(id(record), "x") == address and record_token(record) == identity:
+                    return record
+        raise ValueError("That record is no longer in the job's window; the whole of it is in transcript.jsonl.")
+
     def retained_trace(self):
         """Combine pinned milestones with the bounded recent-event window."""
 
@@ -4026,12 +4329,27 @@ class App:
             *recent,
         ]
 
-    def add_trace(self, record):
-        """Timestamp, retain, and persist one transcript record; return it as it was saved."""
+    def add_trace(self, record, written_at=None):
+        """Timestamp, retain, and persist one transcript record; return it as it was saved.
+
+        ``written_at``: when the runner wrote a record that is read late (after a restart, from its log). It
+        is its time in the transcript when it lies between the job's previous record and now; any other record
+        gets the time it was received.
+        """
 
         # Put the receipt time last so a child cannot replace the audit timestamp.
-        entry = {**record, "time": datetime.now(timezone.utc).isoformat()}
+        now = datetime.now(timezone.utc)
+        stamp = now
+        if isinstance(written_at, str) and written_at:
+            try:
+                written = datetime.fromisoformat(written_at)
+                if written.tzinfo is not None and written <= now:
+                    stamp = max(written, getattr(self, "_last_trace_time", written))
+            except ValueError:
+                pass
+        entry = {**record, "time": stamp.isoformat()}
         with self.lock:
+            self._last_trace_time = stamp
             # Secure the private log before writing its first sensitive byte.
             if not self.trace_file:
                 raise OSError("No problem run is active.")
@@ -4044,7 +4362,7 @@ class App:
             for added in (entry, notice) if notice else (entry,):
                 versions, counts = self._trace_index_locked()
                 trace = self.state["trace"]
-                trace.append(added)
+                trace.append(window_record(added))
                 self.state["traceVersion"] += 1
                 versions.append(self.state["traceVersion"])
                 # The live window keeps the newest TRACE_LIMIT records of the job itself and, apart, the newest
@@ -4168,8 +4486,10 @@ class App:
             )
         return value.strip() if isinstance(value, str) else ""
 
-    def snapshot(self, after=None):
-        """Copy state, optionally returning only newly appended records."""
+    def snapshot(self, after=None, trace=True, brief=False):
+        """Copy state, optionally returning only newly appended records; without ``trace``, none. ``brief`` (the job
+        list, read at every poll of the overview for every job): no records either, nor what only the job's page shows
+        (its statement, prompts and model menus, downloads, current proof, chat items and related works)."""
 
         with self.lock:
             # First: closing a question adds a record, which this copy must include.
@@ -4205,19 +4525,19 @@ class App:
                                      "readOnly": not historical and getattr(runtime, "CONVERSATION_READ_ONLY", True),
                                      # What the chat's Send and Summary do now (see _chat_mode_locked).
                                      "mode": mode, "note": note, "summary": summary, "summaryNote": summary_note,
-                                     "items": self._conversation_copies_locked()}
-            works_problem = self.related_works_problem()
-            workspace = self._author_workspace() if run_dir else None
+                                     "items": [] if brief else self._conversation_copies_locked()}
+            works_problem = "" if brief else self.related_works_problem()
+            workspace = self._author_workspace() if run_dir and not brief else None
             folder_batch = state.get("folderBatch") or ""
             try:
-                state["statement"] = saved_statement(self.run_dir) if self.run_dir else ""
+                state["statement"] = saved_statement(self.run_dir) if self.run_dir and not brief else ""
             except ValueError:
                 state["statement"] = ""
             graph = state["workflow"]
             # A typo in a live YAML edit must not break job pages or report a
             # completed action as failed. Launches still read the YAML strictly.
             try:
-                prompts = default_prompts()
+                prompts = None if brief else default_prompts()
                 signature = checkpoint_artifact_signature(self.run_dir)
                 if signature != self._checkpoint_cache_signature:
                     self._checkpoint_cache = (
@@ -4229,11 +4549,12 @@ class App:
             except (ValueError, KeyError) as exc:
                 prompts = dict(_last_default_prompts or graph["settings"].get("prompts", {}))
                 state["workflowWarning"] = f"The workflow YAML cannot be read: {exc}"
-            state["workflow"] = {
-                **graph, "settings": {**graph["settings"], "prompts": prompts, **model_menu_settings()},
-            }
-            # Run settings: where each role's model runs, from this response's catalog.
-            state["modelSources"] = role_model_sources(state, state["workflow"]["settings"]["model_catalog"])
+            if not brief:
+                state["workflow"] = {
+                    **graph, "settings": {**graph["settings"], "prompts": prompts, **model_menu_settings()},
+                }
+                # Run settings: where each role's model runs, from this response's catalog.
+                state["modelSources"] = role_model_sources(state, state["workflow"]["settings"]["model_catalog"])
             # The critic's checkpoint needs the critic stage; the Writing one continues in a new run, which a
             # web-cutoff run's policy forbids. A job that ran in coordinator mode continues from neither.
             historical = bool(state.get("retrievalPolicyPath") or state.get("retrievalMode") == "historical")
@@ -4245,55 +4566,61 @@ class App:
                     not historical if item.get("stage") == "writing" else critic_stage)
                 else dict(item, resumable=False)
                 for item in self._checkpoint_cache]
-            state["canDownloadTex"] = bool(
-                state["phase"] == "done" and not self.has_active_worker()
-                and self.run_dir and (self.run_dir / "final.tex").is_file()
-                and not (self.run_dir / "final.tex").is_symlink()
-            )
-            state["canDownloadPdf"] = bool(
-                state["canDownloadTex"] and (self.run_dir / "final.pdf").is_file()
-                and not (self.run_dir / "final.pdf").is_symlink()
-                and (self.run_dir / "final.pdf").stat().st_size > 0
-            )
-            # The approved proof and the working LaTeX source are results too,
-            # while the LaTeX stage runs or waits for TeX (I-013, I-068). A run
-            # without its writing stage returns the proof itself as its result.
-            state["canDownloadProof"] = bool(self.run_dir and state.get("finalInputReady")
-                                             and state.get("problemMode") != "latex"
-                                             and saved_workflow_stages(state)["writing"])
-            state["currentProof"] = current_proof_mark(self.run_dir, state)
-            # Whether this finished job can continue with a new goal now, and why not (set_new_goal()).
-            new_goal_problem = self._new_goal_problem_locked() if state["phase"] == "done" else ""
-            state["newGoal"] = {"available": state["phase"] == "done" and not new_goal_problem,
-                                "reason": new_goal_problem}
-            state["canDownloadSource"] = bool(
-                not state["canDownloadTex"] and self.run_dir
-                and (self.run_dir / "latex-source.tex").is_file()
-                and not (self.run_dir / "latex-source.tex").is_symlink()
-            )
-            trace, version = self.state["trace"], self.state["traceVersion"]
-            versions, counts = self._trace_index_locked()
-            # The window holds every record newer than the newest one it left out (``complete``): a full copy
-            # names that version, so the page can take the copy's newest records as the ones it has not seen.
-            oldest = versions[0] - 1 if versions else version
-            complete = version
-            for number in reversed(versions):
-                if number != complete:
-                    break
-                complete -= 1
-            if isinstance(after, int) and oldest <= after <= version:
-                state["trace"], state["traceFrom"] = list(trace[bisect.bisect_right(versions, after):]), after
+            if brief:
+                state["trace"], state["traceFrom"] = [], self.state["traceVersion"]
             else:
-                state["trace"], state["traceFrom"] = self.retained_trace(), complete
-            if version - len(trace) > 0:
-                # Older routine events left the live window: say so, and where the rest is.
-                state["traceTruncated"] = True
-                state["traceNotice"] = (
-                    (f"Showing {len(trace):,} of {version:,} events, with only the latest "
-                     f"{SUBAGENT_TRACE_LIMIT:,} of the subagents' own" if counts[1] >= SUBAGENT_TRACE_LIMIT
-                     else f"Showing the latest {len(trace):,} of {version:,} events")
-                    + "; every prompt, result and error stays listed. The complete history is in this job's "
-                      "transcript.jsonl.")
+                state["canDownloadTex"] = bool(
+                    state["phase"] == "done" and not self.has_active_worker()
+                    and self.run_dir and (self.run_dir / "final.tex").is_file()
+                    and not (self.run_dir / "final.tex").is_symlink()
+                )
+                state["canDownloadPdf"] = bool(
+                    state["canDownloadTex"] and (self.run_dir / "final.pdf").is_file()
+                    and not (self.run_dir / "final.pdf").is_symlink()
+                    and (self.run_dir / "final.pdf").stat().st_size > 0
+                )
+                # The approved proof and the working LaTeX source are results too,
+                # while the LaTeX stage runs or waits for TeX (I-013, I-068). A run
+                # without its writing stage returns the proof itself as its result.
+                state["canDownloadProof"] = bool(self.run_dir and state.get("finalInputReady")
+                                                 and state.get("problemMode") != "latex"
+                                                 and saved_workflow_stages(state)["writing"])
+                state["currentProof"] = current_proof_mark(self.run_dir, state)
+                # Whether this finished job can continue with a new goal now, and why not (set_new_goal()).
+                new_goal_problem = self._new_goal_problem_locked() if state["phase"] == "done" else ""
+                state["newGoal"] = {"available": state["phase"] == "done" and not new_goal_problem,
+                                    "reason": new_goal_problem}
+                state["canDownloadSource"] = bool(
+                    not state["canDownloadTex"] and self.run_dir
+                    and (self.run_dir / "latex-source.tex").is_file()
+                    and not (self.run_dir / "latex-source.tex").is_symlink()
+                )
+                with_trace = trace
+                trace, version = self.state["trace"], self.state["traceVersion"]
+                versions, counts = self._trace_index_locked()
+                # The window holds every record newer than the newest one it left out (``complete``): a full copy
+                # names that version, so the page can take the copy's newest records as the ones it has not seen.
+                oldest = versions[0] - 1 if versions else version
+                complete = version
+                for number in reversed(versions):
+                    if number != complete:
+                        break
+                    complete -= 1
+                if not with_trace:
+                    state["trace"], state["traceFrom"] = [], version
+                elif isinstance(after, int) and oldest <= after <= version:
+                    state["trace"], state["traceFrom"] = list(trace[bisect.bisect_right(versions, after):]), after
+                else:
+                    state["trace"], state["traceFrom"] = self.retained_trace(), complete
+                if version - len(trace) > 0:
+                    # Older routine events left the live window: say so, and where the rest is.
+                    state["traceTruncated"] = True
+                    state["traceNotice"] = (
+                        (f"Showing {len(trace):,} of {version:,} events, with only the latest "
+                         f"{SUBAGENT_TRACE_LIMIT:,} of the subagents' own" if counts[1] >= SUBAGENT_TRACE_LIMIT
+                         else f"Showing the latest {len(trace):,} of {version:,} events")
+                        + "; every prompt, result and error stays listed. The complete history is in this job's "
+                          "transcript.jsonl.")
         # Policy metadata can hash the pinned Codex binary: never hold the job
         # lock (and its transcript reader) meanwhile. A policy that no longer
         # loads still shows the cutoff saved with the job.
@@ -4305,6 +4632,8 @@ class App:
         if state["retrieval"]["mode"] == "historical":
             state["retrievalMode"] = "historical"
             state["retrievalCutoffUtc"] = state["retrieval"]["cutoffExclusiveUtc"]
+        if brief:
+            return state
         # Read from the manifests without the job lock (listing never raises). A work from the batch that the batch
         # no longer shares (removed there after this job kept its copy) is marked so.
         shares = related_works.store_shares(self.runs / CONTROLLER_FOLDER)
@@ -5046,11 +5375,14 @@ class App:
         except Exception as exc:  # noqa: BLE001 - the job goes on; the record says what failed.
             records.note_problem(record, f"The snapshot of the job could not be taken ({type(exc).__name__}: {exc}).")
 
-    def _spawn_runner_locked(self, workflows, stdin_text, options):
+    def _spawn_runner_locked(self, workflows, stdin_text, options, *, detached=True):
         """Start one workflow runner for this job and own it: (process, token).
 
         The runner works in the run folder, in its own process group, with this
         run's owner locks and retrieval environment, and reads ``stdin_text``.
+        ``detached`` (every workflow run): it writes its output to a log file of its own and outlives this server
+        (runner_process); a closed server leaves it working, and the next one reads on. A reply turn of the
+        author (``detached`` False) writes to a pipe and ends with the server, as before.
         Any failure leaves no runner and no token behind.
         """
 
@@ -5061,18 +5393,20 @@ class App:
         child_environment = self._retrieval_child_environment()
         self._stop_in_place = False
         token = self.active_token = object()
+        argv = [sys.executable, "-u", str(ROOT / "workflow_runner.py"), *map(str, paths), *options]
         try:
-            process = subprocess.Popen(
-                [
-                    sys.executable, "-u", str(ROOT / "workflow_runner.py"),
-                    *map(str, paths), *options,
-                ],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                errors="replace", bufsize=1, cwd=self.run_dir,
-                env=child_environment,
-                **isolated_process_options(), **runner_lock_options(locks),
-            )
+            if detached:
+                process = runner_process.start(argv, controller=self._controller_directory(), cwd=self.run_dir,
+                                               env=child_environment, stdin_text=stdin_text,
+                                               pass_fds=runner_lock_options(locks).get("pass_fds", ()))
+            else:
+                process = subprocess.Popen(
+                    argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                    errors="replace", bufsize=1, cwd=self.run_dir,
+                    env=child_environment,
+                    **isolated_process_options(), **runner_lock_options(locks),
+                )
         except BaseException:
             if self.active_token is token:
                 self.active_token = None
@@ -5101,6 +5435,105 @@ class App:
                 self.worker_token = None
             raise
         return process, token
+
+    def save_runner_offset(self):
+        """Record how far this job's runner log has been read (runner_process), every OFFSET_SAVE_SECONDS.
+
+        Only once every line read is in the transcript: lines kept in memory after a failed write are read
+        again by a server that starts after a crash.
+        """
+
+        process = self.process
+        if not isinstance(process, runner_process.RunnerProcess) or not self.run_dir or self._unsaved_trace:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_runner_offset_saved", 0.0) < runner_process.OFFSET_SAVE_SECONDS:
+            return
+        self._runner_offset_saved = now
+        try:
+            runner_process.save_offset(controller_directory(self.run_dir), process)
+        except OSError:
+            pass  # Saved at the next tick; a crash before then only rereads a little.
+
+    def detach_runner(self):
+        """This server closes: stop reading the job's runner after a line it has handled, and record how far it
+        read. The runner works on; the next server reads on from there (adopt_runner())."""
+
+        process = self.process
+        if not isinstance(process, runner_process.RunnerProcess):
+            return
+        process.stdout.detach()
+        reader = self._worker_thread
+        if reader is not None and reader[1] is not threading.current_thread():
+            reader[1].join(timeout=runner_process.DETACH_WAIT_SECONDS)
+        try:
+            self.flush_trace(force=True)
+        except Exception:  # noqa: BLE001 - the offset below still says what was saved.
+            pass
+        if self.run_dir and not self._unsaved_trace:
+            runner_process.release_reader(controller_directory(self.run_dir), process)
+
+    def adopt_runner(self, record):
+        """Read on a runner that an earlier server started and left working, or that ended while no server ran
+        (runner_process.adoptable()): the job shows as it was, running (or pausing), its log is read from where
+        the earlier server stopped, Pause and Stop reach the runner, and when it ends the job settles from its
+        files, as after a restart. Return the job."""
+
+        restore_saved_app(self, owned=False)  # Nothing is written until this server reads the runner.
+        process = runner_process.RunnerProcess.adopt(record)
+        try:
+            settings = json.loads(controlled_path(self.run_dir, JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            settings = {}
+        settings = settings if isinstance(settings, dict) else {}
+        controller = controller_directory(self.run_dir)
+        with self.lock:
+            checkpoint = read_pause_object(self.run_dir)
+            pausing = checkpoint.get("status") == "pausing"
+            # The run went on all along: its active time counts from the launch that started this runner.
+            self.state.update(phase="pausing" if pausing else "running", runningElsewhere="", autoResumeAt=0,
+                              error="", finishedAt="")
+            for key in ("resumedAt", "elapsedSeconds"):
+                if key in settings and saved_setting_problem(key, settings[key]) is None:
+                    self.state[key] = settings[key]
+            if pausing and checkpoint.get("node") and checkpoint.get("stage"):
+                self.state.update(activeNode=checkpoint["node"], stage=checkpoint["stage"])
+            try:
+                self._last_trace_time = datetime.fromisoformat(self.state["lastActivityAt"])
+            except (KeyError, TypeError, ValueError):
+                pass
+            token = self.active_token = object()
+            self.process = process
+        stage = self.state["stage"] or "solve"
+
+        def caught_up():
+            try:
+                self.add_trace({"kind": "status", "stage": stage, "node": self.state["activeNode"] or None,
+                                "label": "Runner found after a restart",
+                                "text": "TCS Prover was restarted while this job worked. Its runner kept working, "
+                                        "and everything it did meanwhile is in this log now."})
+            except OSError:
+                pass  # Only a note: the runner's own records are what matters.
+
+        if process.poll() is None:
+            process.stdout.on_caught_up = caught_up  # After what it did meanwhile, which keeps its own times.
+        else:
+            # It ended: the note goes before its last records, which then end the transcript as usual.
+            with self.lock:
+                last = getattr(self, "_last_trace_time", None)
+            try:
+                self.add_trace({"kind": "status", "stage": stage, "node": self.state["activeNode"] or None,
+                                "label": "Runner found after a restart",
+                                "text": "This job's runner ended while TCS Prover was not running. What it did "
+                                        "until then follows here."}, written_at=last.isoformat() if last else None)
+            except OSError:
+                pass
+        try:
+            runner_process.note_reader(controller, process)
+        except OSError:
+            pass
+        self._spawn_worker(self._read_output, (process, token), token)
+        return self
 
     def _launch_workflow_locked(self, workflows, source, options, stage, node, state=None):
         """Launch YAML graphs in this job, preserving worker ownership on errors."""
@@ -6611,7 +7044,7 @@ class App:
         """Read the finished LaTeX artifact for an authenticated download."""
 
         with self.lock:
-            if not self.snapshot()["canDownloadTex"]:
+            if not self.snapshot(trace=False)["canDownloadTex"]:
                 raise ValueError("A completed final.tex is not available for this job.")
             return (self.run_dir / "final.tex").read_bytes()
 
@@ -6619,7 +7052,7 @@ class App:
         """Read the compiled PDF for an authenticated download."""
 
         with self.lock:
-            if not self.snapshot()["canDownloadPdf"]:
+            if not self.snapshot(trace=False)["canDownloadPdf"]:
                 raise ValueError("A completed final.pdf is not available for this job.")
             return (self.run_dir / "final.pdf").read_bytes()
 
@@ -6645,7 +7078,7 @@ class App:
         """Read the proof handed to the LaTeX stage (critic-approved when the critic runs), for a download."""
 
         with self.lock:
-            if not self.snapshot()["canDownloadProof"]:
+            if not self.snapshot(trace=False)["canDownloadProof"]:
                 raise ValueError("No approved proof is saved for this job.")
             return (saved_final_input(self.run_dir)["solution"] + "\n").encode("utf-8")
 
@@ -6667,7 +7100,7 @@ class App:
         """Read the working LaTeX source, for an authenticated download before final.tex exists."""
 
         with self.lock:
-            if not self.snapshot()["canDownloadSource"]:
+            if not self.snapshot(trace=False)["canDownloadSource"]:
                 raise ValueError("No LaTeX source is saved for this job.")
             return (self.run_dir / "latex-source.tex").read_bytes()
 
@@ -7198,14 +7631,24 @@ class App:
         self._spawn_worker(self._read_output, (process, token), token)
 
     def _read_output(self, process, token=None):
-        """Read one runner to its end; nothing it prints, and no failed write, leaves the job unsettled."""
+        """Read one runner to its end; nothing it prints, and no failed write, leaves the job unsettled.
+
+        A runner with a log of its own (runner_process) is read until it ends, or until this server closes
+        (RunnerDetached): it then works on, and the next server reads on from where this one stopped.
+        """
 
         try:
-            self._read_records(process, token)
-        except Exception as exc:
-            self._read_after_failure(process, token, exc)
+            try:
+                self._read_records(process, token)
+            except Exception as exc:
+                self._read_after_failure(process, token, exc)
+        except runner_process.RunnerDetached:
+            return
         self._record_snapshot()
         self._settle_run_claim()
+        if isinstance(process, runner_process.RunnerProcess) and self.run_dir:
+            # Its whole output is in the transcript now.
+            runner_process.forget(controller_directory(self.run_dir), process.launch)
 
     def _read_after_failure(self, process, token, failure):
         """Keep saving a runner's output after handling it failed, then settle as a restart would."""
@@ -7223,6 +7666,7 @@ class App:
         try:
             for line in runner_lines(process.stdout):
                 record = self.parse_line(line, self.state["stage"] or "solve")
+                record.pop("emittedAt", None)
                 if record.get("kind") != "node_input":  # A step's input stays in memory only (see _read_records).
                     save(record)
         except Exception:
@@ -7320,12 +7764,16 @@ class App:
                         self.output_stream = None
                 # Untagged errors belong to the most recently active stage.
                 record = self.parse_line(line, self.state["stage"] or "solve")
+                # When the runner wrote it: a record read late (a runner that worked while no server read it) keeps
+                # that time in the transcript instead of the time it was read.
+                emitted = record.pop("emittedAt", None)
                 if record.get("kind") == "node_input":
                     # Kept in memory only, for this runner: it repeats the whole workflow state.
                     if isinstance(record.get("node"), str) and isinstance(record.get("state"), dict):
                         step_input = record
                     continue
-                entry = self.add_trace(record)
+                entry = self.add_trace(record, written_at=emitted if getattr(
+                    process.stdout, "catching_up", False) is True else None)
                 self._follow_model_retry(record)
                 self._follow_failures(record)
                 self._follow_author_question(record)
@@ -7536,6 +7984,10 @@ class App:
         except Exception as exc:
             # A record or a write that cannot be handled never stops a working runner.
             return self._read_after_failure(process, token, exc)
+        if isinstance(process, runner_process.RunnerProcess) and process.adopted:
+            # A runner an earlier server started (adopt_runner()): what it did before this server read it is in
+            # the transcript, not in this reader, so the job settles from its files, as after a restart.
+            return self._settle_from_saved_run(process, token)
         with self.lock:
             # A step stopped in place is rebuilt from its saved input, as after a restart.
             in_place = (self.state["phase"] == "stopping" and self._stop_in_place and not final
@@ -8596,6 +9048,68 @@ class App:
             raise ValueError("That file is no longer in the author's memory, or it is not a file that can be shown.")
         return found
 
+    def examiner_reports(self):
+        """The examiner's reports of this job as the job page lists them (GET /examiner-reports): {"reports":
+        [{"id", "seat", "number", "state" (running, finished, failed), "startedAt", "finishedAt", "deliveredAt": when
+        the author's conversation received it, "file", "bytes": the report's size, 0 while there is none}], oldest
+        first, "count"}. From the job's transcript, read on from where the previous request stopped (only lines
+        that name the examiner are parsed), outside the job lock."""
+
+        with self.lock:
+            if self.run_dir is None or not self.trace_file:
+                raise ValueError("This job has no run folder.")
+            trace_file, workspace = Path(self.trace_file), self._author_workspace()
+        with _examiner_scan_lock:
+            scan = getattr(self, "_examiner_scan", None)
+            if not isinstance(scan, dict) or scan.get("file") != str(trace_file):
+                scan = {"file": str(trace_file), "offset": 0, "entries": {}}
+            try:
+                size = trace_file.stat().st_size
+            except OSError:
+                size = 0
+            if size < scan["offset"]:  # The transcript was replaced: read it again.
+                scan = {"file": str(trace_file), "offset": 0, "entries": {}}
+            if size > scan["offset"]:
+                try:
+                    with open(trace_file, "rb") as stream:
+                        stream.seek(scan["offset"])
+                        data = stream.read(size - scan["offset"])
+                except OSError:
+                    data = b""
+                end = data.rfind(b"\n") + 1
+                for line in data[:end].splitlines():
+                    if any(marker in line for marker in EXAMINER_LINE_MARKERS):
+                        try:
+                            follow_examiner_report(scan["entries"], json.loads(line))
+                        except (ValueError, RecursionError):
+                            pass
+                scan["offset"] += end
+            self._examiner_scan = scan
+            entries = [dict(entry) for entry in scan["entries"].values()]
+        entries.sort(key=lambda entry: (entry["startedAt"] or entry["finishedAt"] or entry["deliveredAt"],
+                                        entry["seat"], entry["number"]))
+        for entry in entries:
+            try:
+                info = os.lstat(workspace / entry["file"])
+                entry["bytes"] = info.st_size if stat.S_ISREG(info.st_mode) else 0
+            except OSError:
+                entry["bytes"] = 0
+        return {"reports": entries, "count": len(entries)}
+
+    def examiner_report(self, identity):
+        """One report of the examiner as the job page shows it (GET /examiner-report?id=member-<seat>-<k>): as a
+        memory file (read_memory_file()) with "id". ValueError when there is no such report (yet)."""
+
+        found = EXAMINATION_ID.match(str(identity or ""))
+        if not found:
+            raise ValueError("Name one of the examiner's reports.")
+        workspace = self._memory_workspace()
+        report = read_memory_file(workspace, f"member-{found.group(1)}/{found.group(2)}-report.md",
+                                  EXAMINER_TEAM_FOLDER)
+        if report is None:
+            raise ValueError("That report is not there (yet): the examination may still be running.")
+        return {**report, "id": str(identity)}
+
     def open_memory_file(self, path):
         """One whole file of the author's memory, opened for a download: (binary stream, size, file name)."""
 
@@ -8916,8 +9430,9 @@ class App:
                                    f"It is tried again in {retry_interval_text()}.")
                 item["audited"] = True
             try:
+                # A reply turn writes to a pipe and ends with this server (detached False), as before.
                 process, token = self._spawn_runner_locked(["author_critic.yaml"], json.dumps(request),
-                                                           self._conversation_options_locked())
+                                                           self._conversation_options_locked(), detached=False)
             except (OSError, ValueError, RuntimeError) as exc:
                 return self._delay_conversation_locked(
                     item, now, f"Could not start the reply: {str(exc).rstrip('.') or type(exc).__name__}. "
@@ -9400,8 +9915,9 @@ def _run_records(run_dir):
     return list(_iter_run_records(run_dir))
 
 
-def _iter_run_records(run_dir):
-    """Stream public records so recovery need not retain a large transcript."""
+def _iter_run_records(run_dir, light=False):
+    """Stream public records so recovery need not retain a large transcript. With ``light``, a model event comes
+    without its event (light_codex_record()): for callers that read only its flat fields."""
 
     path = Path(run_dir) / "transcript.jsonl"
     try:
@@ -9409,12 +9925,14 @@ def _iter_run_records(run_dir):
         descriptor = open_run_log(path, os.O_RDONLY, private=False)
         if descriptor is None:
             return
-        with os.fdopen(descriptor, encoding="utf-8", errors="replace") as stream:
-            for line in stream:
-                try:
-                    value = json.loads(line)
-                except (ValueError, RecursionError):
-                    continue
+        with os.fdopen(descriptor, "rb") as stream:
+            for raw in stream:
+                value = light_codex_record(raw) if light else None
+                if value is None:
+                    try:
+                        value = json.loads(raw.decode("utf-8", errors="replace"))
+                    except (ValueError, RecursionError):
+                        continue
                 if readable_record(value):
                     yield value
     except OSError:
@@ -9512,7 +10030,7 @@ def saved_goal_thread_id(run_dir):
         if isinstance(identity, str) and identity.strip() and "\0" not in identity:
             return identity.strip()
     identity = ""
-    for record in _iter_run_records(run_dir):
+    for record in _iter_run_records(run_dir, light=True):
         identity = goal_thread_from_record(record) or identity
     return identity
 
@@ -10198,7 +10716,15 @@ def restore_saved_app(app, *, owned=True):
     # continuation) has launched the job since. Records the stopped runner wrote after the Stop never end
     # it; a stopped statement review keeps its own marker (see saved_manual_stop).
     stop_in_force = False
-    for record in _iter_run_records(run_dir):
+    # The pass depends only on the transcript and on what it starts from: a restart that finds both unchanged takes
+    # what it found from RESTORE_SCAN_FILE and reads no record.
+    start_values = {name: value for name, value in locals().items() if name in RESTORE_SCAN_NAMES}
+    start_state = _scan_json({key: value for key, value in state.items() if key != "trace"})
+    scan_key = restore_scan_key(run_dir, [json.loads(start_state), json.loads(_scan_json(start_values)),
+                                          sorted(persisted_settings)])
+    scanned = saved_restore_scan(run_dir, scan_key)
+    # Model events come light (light_codex_record()): this pass reads only their flat fields.
+    for record in (() if scanned is not None else _iter_run_records(run_dir, light=True)):
         follow_time_limit(state["timeLimitHistory"], record)
         if ran_as_coordinator(record):
             state["coordinatorJob"] = True
@@ -10322,6 +10848,22 @@ def restore_saved_app(app, *, owned=True):
         ):
             state["error"] = str(record["text"])[7:]
             ended_with_error = True
+    if scanned is not None:
+        state.update(scanned["state"])
+        found = scanned["values"]
+        (relevant, first_time, last_time, any_records, transcript_speed, post_review_request, last_work_node,
+         author_finished, submitted_since_resume, ended_with_error, delivered_steers, stop_in_force) = (
+            found["relevant"], found["first_time"], found["last_time"], found["any_records"],
+            found["transcript_speed"], found["post_review_request"], found["last_work_node"],
+            found["author_finished"], found["submitted_since_resume"], found["ended_with_error"],
+            found["delivered_steers"], found["stop_in_force"])
+        observed_role_settings, replaced_roles = set(found["observed_role_settings"]), set(found["replaced_roles"])
+    elif owned:
+        before = json.loads(start_state)
+        changed = {key: value for key, value in state.items()
+                   if key != "trace" and (key not in before or before[key] != json.loads(_scan_json(value)))}
+        save_restore_scan(run_dir, scan_key, changed,
+                          {name: value for name, value in locals().items() if name in RESTORE_SCAN_NAMES})
 
     if state["problemMode"] == "algorithmic":
         state["problemMode"] = "statement"
@@ -10616,8 +11158,8 @@ def restore_saved_app(app, *, owned=True):
     return app
 
 
-def restore_saved_jobs(runs):
-    """Load every historical run as an idle job after a Web UI restart."""
+def restore_saved_jobs(runs, *, adopt=False):
+    """Load every historical run as an idle job after a Web UI restart; ``adopt``: see restore_one_run()."""
 
     jobs = {}
     # A broken shared workflow file is not a damaged run: report it before
@@ -10637,28 +11179,36 @@ def restore_saved_jobs(runs):
             transcript.parent, runs
         ):
             continue
-        app = restore_one_run(transcript, runs)
+        app = restore_one_run(transcript, runs, adopt=adopt)
         jobs[app.state["runId"]] = app
     return jobs
 
 
-def restore_one_run(transcript, runs):
+def restore_one_run(transcript, runs, *, adopt=False):
     """Restore one saved run: owned here, shown as running elsewhere, or shown as damaged.
 
-    A run that another process still owns (a live terminal run, or a runner a
-    crashed server left behind) is restored without changing anything in it;
+    ``adopt`` (the launcher's server, the one owner of its runs folder): a workflow runner an earlier server
+    started and left working, or that ended while no server ran, is read on (App.adopt_runner()). A run that
+    another live process still owns (a terminal run) is restored without changing anything in it;
     Server._adopt_released_runs takes it over once it is free.
     """
 
     app = None
     try:
         app = App(transcript, runs)
+        record = runner_process.adoptable(controller_directory(app.run_dir)) if adopt else None
         try:
             app._claims.claim(app.run_dir)
         except ownership.OwnedElsewhere as exc:
+            if record is not None and runner_process.same_process(record.get("pid"), record.get("started")):
+                # The lock is the one this job's own runner inherited from the server that started it.
+                return app.adopt_runner(record)
             app = restore_saved_app(app, owned=False)
             app.state.update(phase="running", runningElsewhere=str(exc), autoResumeAt=0, error="", finishedAt="")
             return app
+        if record is not None:
+            # The runner ended while no server read it (or, on Windows, holds no lock): its log has the rest.
+            return app.adopt_runner(record)
         restore_saved_app(app)
         app._settle_run_claim()
         return app
@@ -10720,7 +11270,7 @@ def saved_statement(path):
         raise ValueError(f"The saved run does not exist: {run_dir}")
     checked_path = controlled_path(run_dir, "checked-statement.md")
     if checked_path.exists():
-        checked = read_utf8(checked_path, "saved checked statement")
+        checked = _unchanged_read(checked_path, lambda path: read_utf8(path, "saved checked statement"))
         reviewed_prefix = "# Checked statement"
         direct_prefix = "# Statement sent directly to the proof author"
         checked = checked.lstrip()
@@ -10741,6 +11291,105 @@ def saved_statement(path):
     if not statement:
         raise ValueError("The saved checked statement is empty.")
     return statement
+
+
+def _scan_json(value):
+    """``value`` as JSON text in one order (sets as sorted lists), for the restore scan's key and its saved file."""
+
+    return json.dumps(value, sort_keys=True, ensure_ascii=False,
+                      default=lambda item: sorted(item) if isinstance(item, (set, frozenset)) else str(item))
+
+
+def restore_scan_key(run_dir, start):
+    """The key of restore_saved_app()'s pass over ``run_dir``'s transcript from ``start`` (the state and variables it
+    starts from): this file's version, the transcript's identity, size and change time, and ``start``; None when
+    the transcript cannot be read."""
+
+    try:
+        info = os.stat(Path(run_dir) / "transcript.jsonl")
+    except OSError:
+        return None
+    return hashlib.sha256(_scan_json({"code": CODE_DIGEST, "transcript": [info.st_ino, info.st_size, info.st_mtime_ns],
+                                      "start": start}).encode("utf-8")).hexdigest()
+
+
+def saved_restore_scan(run_dir, key):
+    """What RESTORE_SCAN_FILE kept of the pass with ``key``: {"state": the state's keys it set, "values": its
+    variables}; else None."""
+
+    if key is None:
+        return None
+    path = controller_directory(run_dir) / RESTORE_SCAN_FILE
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return None
+    if (not isinstance(value, dict) or value.get("key") != key or not isinstance(value.get("state"), dict)
+            or not isinstance(value.get("values"), dict) or set(value["values"]) != set(RESTORE_SCAN_NAMES)):
+        return None
+    return value
+
+
+def save_restore_scan(run_dir, key, changed, values):
+    """Keep what the pass with ``key`` found (RESTORE_SCAN_FILE), when all of it is plain JSON; best effort."""
+
+    if key is None or not controller_directory(run_dir).is_dir():
+        return
+    try:
+        plain = {"key": key, "state": changed,
+                 "values": {name: sorted(value) if isinstance(value, set) else value for name, value in values.items()}}
+        text = json.dumps(plain, ensure_ascii=False)  # Anything that is not plain JSON stops it here.
+        # Only what reads back exactly as it was: anything else is found again by the next restart.
+        if json.loads(text) != plain:
+            return
+        runtime._private_atomic_write(controller_directory(run_dir) / RESTORE_SCAN_FILE, text)
+    except (OSError, ValueError, TypeError, RecursionError, runtime.Error):
+        pass
+
+
+def _trace_check(stream, end):
+    """A digest of the TRACE_INDEX_CHECK bytes of ``stream`` before ``end``."""
+
+    start = max(0, end - TRACE_INDEX_CHECK)
+    stream.seek(start)
+    return hashlib.sha256(stream.read(end - start)).hexdigest()
+
+
+def _saved_trace_index(path, stream):
+    """What TRACE_INDEX_FILE says of the transcript ``stream`` (App._load_trace()), when it still holds: {"end",
+    "total", "own", "theirs", "pinned"} with the window's entries as tuples; else None."""
+
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+        size = os.fstat(stream.fileno()).st_size
+        if (not isinstance(value, dict) or value.get("code") != CODE_DIGEST
+                or not isinstance(value.get("end"), int) or not 0 < value["end"] <= size
+                or _trace_check(stream, value["end"]) != value.get("check")):
+            return None
+        return {"end": value["end"], "total": int(value["total"]),
+                "own": [(int(n), int(start), int(size), kept) for n, start, size, kept in value["own"]],
+                "theirs": [(int(n), int(start), int(size), kept) for n, start, size, kept in value["theirs"]],
+                "pinned": [(int(start), int(size), kind, label) for start, size, kind, label in value["pinned"]]}
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError, RecursionError):
+        return None
+
+
+def _save_trace_index(path, stream, end, total, own, theirs, pinned):
+    """Keep what App._load_trace() found (TRACE_INDEX_FILE); best effort: a load that cannot save it scans again."""
+
+    if end <= 0 or not path.parent.is_dir():
+        return
+    try:
+        runtime._private_atomic_write(path, json.dumps({
+            "code": CODE_DIGEST, "end": end, "check": _trace_check(stream, end), "total": total,
+            "own": [list(entry) for entry in own], "theirs": [list(entry) for entry in theirs],
+            "pinned": [list(entry) for entry in pinned]}, ensure_ascii=False))
+    except (OSError, ValueError, TypeError, runtime.Error):
+        pass
 
 
 def archive_goal_files(run_dir, number):
@@ -11027,7 +11676,8 @@ class Server(ThreadingHTTPServer):
             if self.state_problem:
                 print(f"Warning: {self.state_problem} Claude models and API models cannot start until it is fixed.",
                       file=sys.stderr, flush=True)
-            self.jobs.update(restore_saved_jobs(self.runs))
+            # The launcher's server reads on the runners an earlier one left working (runner_process).
+            self.jobs.update(restore_saved_jobs(self.runs, adopt=self.instance is not None))
             prune_trash(self.runs)
             # Related-work uploads wait here until a job takes them (pruned after a day).
             self.upload_stage = staged_uploads(self.runs)
@@ -11411,6 +12061,7 @@ class Server(ThreadingHTTPServer):
             if slept:
                 app.exclude_sleep(slept)
             app.flush_trace()
+            app.save_runner_offset()
             app.close_stale_author_question()
             try:
                 app.collect_chat_answers()
@@ -11431,7 +12082,7 @@ class Server(ThreadingHTTPServer):
                 with app.lock:
                     app.state["runningElsewhere"] = ownership.describe(holder)
                 continue
-            adopted = restore_one_run(app.trace_file, self.runs)
+            adopted = restore_one_run(app.trace_file, self.runs, adopt=self.instance is not None)
             with self.jobs_lock:
                 if self.jobs.get(run_id) is app:
                     self.jobs[run_id] = adopted
@@ -13003,7 +13654,7 @@ class Server(ThreadingHTTPServer):
             # Another batch's jobs are left out before their state is read.
             if batch is not None and self.batch_of(app, ids) != batch:
                 continue
-            state = app.snapshot()
+            state = app.snapshot(brief=True)
             job = {
                 key: state[key] for key in (
                     "runId", "phase", "draft", "activeNode", "startedAt",
@@ -13399,12 +14050,15 @@ class Server(ThreadingHTTPServer):
         return result
 
     def stop_all(self, wait=SHUTDOWN_WAIT_SECONDS):
-        """Pause running authors and interrupt every other live child when the server closes.
+        """Close the server's side of every job: workflow runners keep working, everything else stops.
 
-        An author pauses with the cause 'restart', which the next start resumes
-        automatically. Review, critic and LaTeX runners are interrupted; the next
-        start continues them from their saved input. Whatever still runs after
-        `wait` seconds is stopped, so no runner keeps working unobserved.
+        A workflow runner (runner_process: its output goes to a log of its own) is left working: its reader
+        stops at a line it has handled and records how far it read, and the next server reads on from there
+        (detach_runner()). Any other live child (the statement review, a reply turn of the author, a runner of
+        an earlier version that writes to this server's pipe) is stopped as before: an author of an earlier
+        version pauses with the cause 'restart', which the next start resumes automatically, and review,
+        critic and LaTeX runners are interrupted and continued from their saved input. Whatever of those still
+        runs after `wait` seconds is stopped.
         """
 
         retry_stop = getattr(self, "_retry_stop", None)
@@ -13412,13 +14066,16 @@ class Server(ThreadingHTTPServer):
             retry_stop.set()  # No automatic resume starts while the server closes.
         with self.jobs_lock:
             apps = list({id(app): app for app in self.jobs.values()}.values())
-        live = []
+        live, detached = [], []
         for app in apps:
             with app.lock:
                 process = app.process
                 author = (app.state["phase"] == "running" and app.state["activeNode"] == "author"
                           and app.state["stage"] in {"solve", "repair"})
             if process is None:
+                continue
+            if isinstance(process, runner_process.RunnerProcess):
+                detached.append(app)  # It works on without this server.
                 continue
             live.append((app, process))
             # One job that cannot be stopped must not leave the others running.
@@ -13438,10 +14095,15 @@ class Server(ThreadingHTTPServer):
                     process.send_signal(signal.SIGINT)
             except (OSError, ValueError, subprocess.SubprocessError):
                 pass
+        readers = [threading.Thread(target=app.detach_runner, daemon=True) for app in detached]
+        for reader in readers:
+            reader.start()
         deadline = time.monotonic() + wait
         while time.monotonic() < deadline and any(
                 process.poll() is None or app.has_active_worker() for app, process in live):
             time.sleep(0.1)
+        for reader in readers:
+            reader.join(timeout=max(0.0, deadline - time.monotonic()) + runner_process.DETACH_WAIT_SECONDS)
         remaining = [process for _, process in live if process.poll() is None]
         workers = [threading.Thread(target=stop_process_tree, args=(process,), daemon=True) for process in remaining]
         for worker in workers:
@@ -13650,6 +14312,14 @@ class Handler(BaseHTTPRequestHandler):
                                  headers={"Content-Disposition": f'attachment; filename="critic-changes-{name}"'})
             except (ValueError, OSError) as exc:
                 return self.send({"error": str(exc)}, status=400)
+        if request.path == "/trace-record":
+            # One whole record of the job's window that the page received shortened (page_record()).
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            try:
+                return self.send(self.server.get_job(run_id).trace_record((query.get("id") or [""])[0]))
+            except ValueError as exc:
+                return self.send({"error": str(exc)}, status=400)
         if request.path == "/goal-file":
             # A file of an earlier goal (App.goal_file()): shown as text by the page, or downloaded.
             if not self.authorized():
@@ -13694,7 +14364,10 @@ class Handler(BaseHTTPRequestHandler):
                 values = query.get("after")
                 after = int(values[0]) if values else None
                 app = self.server.get_job(run_id)
-                return self.send({**app.snapshot(after), "batchId": self.server.batch_of(app)})
+                state = app.snapshot(after)
+                # Long texts and unseen model events go shortened; the page asks for a whole record on demand.
+                state["trace"] = [page_record(record) for record in state.get("trace") or []]
+                return self.send({**state, "batchId": self.server.batch_of(app)})
             except ValueError:
                 return self.send({"error": "Invalid job or transcript position."}, status=400)
         if request.path == "/jobs":
@@ -13737,6 +14410,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send({"error": str(exc), **exc.body}, status=exc.status)
             except Exception as exc:  # Setup prints nothing to the terminal: the page says what failed.
                 return self.send({"error": f"Setup failed ({type(exc).__name__})"}, status=500)
+        if request.path in {"/examiner-reports", "/examiner-report"}:
+            # The examiner's reports of one job: when each was made and reached the author (App.examiner_reports()),
+            # or one of them as text (App.examiner_report()).
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            try:
+                job = self.server.get_job(run_id)
+                if request.path == "/examiner-reports":
+                    return self.send(job.examiner_reports())
+                return self.send(job.examiner_report((query.get("id") or [""])[0]))
+            except (ValueError, OSError) as exc:
+                return self.send({"error": str(exc)}, status=400)
         if request.path in {"/memory-files", "/memory-file", "/memory-file/download"}:
             # The author's memory of one job: its files (App.memory_files()), one of them as text
             # (App.memory_file()), or one of them whole, as a download that no browser opens in place.
@@ -14084,7 +14769,10 @@ class Handler(BaseHTTPRequestHandler):
                 "/resume-critic", "/resume-checkpoint", "/continue-stopped", "/resume",
             }:
                 return self.send({"error": "Not found."}, status=404)
-            self.send({**app.snapshot(), "batchId": self.server.batch_of(app)})
+            state = app.snapshot()
+            # As /state sends it: long texts and unseen model events shortened (page_record()).
+            state["trace"] = [page_record(record) for record in state.get("trace") or []]
+            self.send({**state, "batchId": self.server.batch_of(app)})
         except (OSError, TypeError, ValueError, RuntimeError) as exc:
             # Includes runtime.Error and RetrievalPolicyError: their messages
             # are written for the user and reach only this authorized client.

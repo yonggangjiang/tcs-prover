@@ -972,8 +972,9 @@ def main():
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        _say(sys.stdout, "\nPausing the running authors and stopping TCS Prover; they resume when it "
-                         "starts again. Press Ctrl-C again to stop at once.")
+        _say(sys.stdout, "\nClosing TCS Prover. Running jobs keep working without it and show again when it "
+                         "starts; a statement review or a reply of an author is stopped and runs again then. Press "
+                         "Ctrl-C again to close at once.")
         try:
             server.stop_all()
         except KeyboardInterrupt:

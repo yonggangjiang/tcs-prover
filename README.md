@@ -30,8 +30,8 @@ does not work. **To open the page again**, run `python3 web_ui.py` again: while
 TCS Prover runs, this opens the same link instead of starting a second copy
 (`--no-browser` only prints it). Then open **Setup** (below), click **New
 problem**, paste your statement and click **Start workflow**. Ctrl-C stops TCS
-Prover; working authors pause and continue by themselves about a minute after
-the next start.
+Prover, not the jobs: running jobs keep working without it, and its next start
+shows them again with everything they did meanwhile.
 
 ## What you need for models
 

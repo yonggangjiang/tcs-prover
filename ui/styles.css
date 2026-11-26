@@ -2534,6 +2534,9 @@ kbd {
   background: var(--line-strong);
   content: "";
 }
+/* A long job's rows out of sight are not laid out or painted (its page opens with up to about 2,000 rows); the row with
+   the focus is always drawn whole, its focus ring included. */
+.timeline-entry:not(:focus-within) { content-visibility: auto; contain-intrinsic-size: auto 64px; }
 .timeline-entry:first-child::before { top: 16px; }
 .timeline-entry:last-child::before { bottom: calc(100% - 16px); }
 .timeline-entry:only-child::before { display: none; }
@@ -4379,6 +4382,9 @@ kbd {
 }
 .author-memory-list:empty { display: none; }
 .author-memory-list > li + li { border-top: 1px solid var(--line); }
+/* A memory folder can hold thousands of files: rows out of sight are not laid out or painted; the row with the focus is
+   always drawn whole. */
+.author-memory-list > li:not(:focus-within) { content-visibility: auto; contain-intrinsic-size: auto 34px; }
 .author-memory-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
@@ -4422,7 +4428,13 @@ kbd {
   overflow-wrap: anywhere;
 }
 :root[data-theme="ink"] .author-memory-row[aria-current="true"] { box-shadow: inset 2px 0 0 var(--ink); }
+/* The examiner's reports: a row's times are a short sentence, which may wrap; a report not written yet cannot open. */
+.examiner-reports-list .author-memory-row { grid-template-columns: max-content auto minmax(0, 1fr); }
+.examiner-reports-list .author-memory-time { white-space: normal; text-align: right; }
+.examiner-reports-list .author-memory-row:disabled { color: var(--ink-2); background: none; cursor: default; }
 @media (max-width: 599px) {
+  .examiner-reports-list .author-memory-row { grid-template-columns: max-content auto; }
+  .examiner-reports-list .author-memory-time { grid-column: 1 / -1; text-align: left; }
   .author-memory-row { grid-template-columns: minmax(0, 1fr) auto; padding: 6px 10px; font-size: var(--text-xs); }
   .author-memory-name { grid-column: 1 / -1; }
   .author-memory-size { text-align: left; }

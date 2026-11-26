@@ -81,6 +81,14 @@ author's turns, **Author cache usage** says how many of the turn's input tokens
 were cached, over all of the turn's model requests (*… in the turn's 23 model
 requests* for a Codex author), not only its last one.
 
+A long text in the activity log or in **Prompts and responses**, such as a
+prompt of more than 16,000 characters, shows its start; **Show the whole text**
+under it reads the rest. A
+long job's page opens with its newest events and every prompt, result and
+error; the complete history is in the job's `transcript.jsonl`. The first start
+of TCS Prover after an update takes longer (about a minute for a few GB of
+transcripts), as it reads each job's transcript again once.
+
 ### How jobs are counted
 
 | Shown as | Meaning |
@@ -143,6 +151,25 @@ status.md, 14:05*), so you can see what the author works on without opening it.
   meanwhile (you can open them there), and to restart TCS Prover when it suits
   you. A running job pauses at the restart and continues by itself about a
   minute later.
+
+## Examiner reports
+
+Each time the author's conversation is compacted, an examiner reads the whole
+run and sends the author a report (see [Workflow](workflow.md#the-examiner)).
+**Examiner reports**, under **Memory**, lists them once there is one, closed
+until you open it. Its line counts them and says when the latest reached the
+author (*Examiner reports · 4 reports · latest reached the author 23:43*).
+
+- **Each row** is one examination, oldest first: its report's size and when the
+  examination started, when its report was done and when it reached the author
+  (*started 20:28 · done 20:33 · reached the author 20:33*). An examination
+  still running says *examining…*, one that failed says so; neither can be
+  opened yet.
+- **Open a report** by clicking its row: it is shown rendered, its formulas
+  typeset, as the author received it; **Show source** shows its text as written.
+  Nothing in it is run.
+- The reports are also files: `team/member-1/1-report.md` and so on in the
+  author's working folder. A saved batch shows them too.
 
 ## Current proof
 
@@ -345,9 +372,14 @@ changing your Codex CLI or Claude Code login.
 - Failed model calls never pause a job; they are retried every minute (see
   [Retries and what needs you](retries.md)). A job that still pauses with an
   error resumes by itself after a minute: **Resume** retries at once, **Keep
-  paused** cancels the automatic resume. After a restart, an unfinished author
-  shows **Paused** and continues by itself about a minute later, with the same
-  choices.
+  paused** cancels the automatic resume.
+- **Closing or restarting TCS Prover does not pause a running job**: its runner
+  works on without the server, and the next start reads on from where the
+  closed server stopped, so its log shows everything it did meanwhile, at the
+  times it happened, after a note *Runner found after a restart*. Pause, Stop
+  and the chat reach it as before. An author whose runner ended without a
+  result (a crash, a reboot) shows **Paused** and continues by itself about a
+  minute after the next start, with the same choices.
 
 ## Stop and Continue
 

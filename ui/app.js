@@ -208,6 +208,12 @@ const ui = {
   authorMemoryFileMeta: $("authorMemoryFileMeta"), authorMemoryFileText: $("authorMemoryFileText"),
   authorMemoryFileDoc: $("authorMemoryFileDoc"), authorMemorySource: $("authorMemorySourceButton"),
   authorMemoryFileNote: $("authorMemoryFileNote"), authorMemoryOlder: $("authorMemoryOlder"),
+  examinerReports: $("examinerReports"), examinerReportsCount: $("examinerReportsCount"),
+  examinerReportsList: $("examinerReportsList"), examinerReportsNote: $("examinerReportsNote"),
+  examinerReport: $("examinerReport"), examinerReportName: $("examinerReportName"),
+  examinerReportSource: $("examinerReportSourceButton"), examinerReportClose: $("examinerReportCloseButton"),
+  examinerReportMeta: $("examinerReportMeta"), examinerReportDoc: $("examinerReportDoc"),
+  examinerReportText: $("examinerReportText"), examinerReportFileNote: $("examinerReportFileNote"),
   relatedWorksPanel: $("relatedWorksPanel"), relatedWorksHeading: $("relatedWorksHeading"),
   relatedWorksNote: $("relatedWorksNote"), relatedWorksList: $("relatedWorksList"),
   relatedWorksEmpty: $("relatedWorksEmpty"), relatedWorksActions: $("relatedWorksActions"),
@@ -330,6 +336,15 @@ function request(path, body) {
   const result = requests.then(run, run);
   requests = result.catch(() => {});
   return result;
+}
+
+// A read that changes nothing (the list of batches), sent at once beside the queued requests rather than after them:
+// its answer, or its refusal as request() gives it.
+async function readNow(path) {
+  const response = await fetch(path, { headers: { "X-TCS-Prover-Token": sessionToken } });
+  const data = await response.json();
+  if (!response.ok) throw Object.assign(new Error(data.error || "Request failed."), { status: response.status });
+  return data;
 }
 
 // Requests that create or start a job (a statement, a folder batch, LaTeX, an approved
@@ -2366,6 +2381,20 @@ function authorSubagentCard(entry) {
   return null;
 }
 
+// A record the server shortened (server.page_record(): a text cut at its limit, where it ends with "…") makes a row
+// that offers the whole text, read only when the reader asks for it (GET /trace-record), when the row shows a cut
+// text (a tool's row shows its command, not its cut output). A model event the page never shows keeps no text.
+function shortenedRow(card, entry) {
+  if (card && entry?.shortened?.id && !entry.shortened.omitted && String(card.text || "").includes("…")) {
+    card.shortened = entry.shortened.id;
+  }
+  return card;
+}
+
+function describeRecord(entry) {
+  return shortenedRow(describe(entry), entry);
+}
+
 function cardIcon(type) {
   return {
     reasoning: "R", agent: "A", tool: "T", prompt: "P",
@@ -2390,8 +2419,7 @@ function appendFormattedText(element, value) {
 function upsertTimeline(card) {
   if (!card || (!card.text && !card.checks?.length)) return;
   let row = timelineRows.get(card.key);
-  const nearBottom = ui.timeline.scrollHeight - ui.timeline.scrollTop
-    - ui.timeline.clientHeight < 70;
+  const nearBottom = timelineBatch ? timelineBatch.nearBottom : timelineNearBottom();
   if (!row) {
     row = document.createElement("li");
     row.className = `timeline-entry ${card.type}`;
@@ -2434,6 +2462,15 @@ function upsertTimeline(card) {
   copy.className = "entry-body";
   appendFormattedText(copy, card.text);
   body.append(copy);
+  if (card.shortened && !state.readOnly) {
+    // Shortened by the server: the whole text on request.
+    const whole = document.createElement("button");
+    whole.type = "button";
+    whole.className = "ghost compact entry-whole";
+    whole.textContent = "Show the whole text";
+    whole.onclick = () => showWholeRecord(whole, card);
+    body.append(whole);
+  }
   content.append(body);
 
   if (card.critic) {
@@ -2459,21 +2496,36 @@ function upsertTimeline(card) {
   }
   row.append(icon, content);
   row.hidden = activeFilter !== "all" && card.type !== activeFilter;
-
-  // Bound the routine rows, oldest first; pinned rows stay. Never evict the row just
-  // updated, or with 300 pinned rows every new event would vanish as it arrives.
-  if (ui.timeline.children.length > 300) {
-    const routine = [...ui.timeline.children].filter(
-      (item) => item.dataset.pinned !== "true" && item !== row
-    );
-    while (routine.length >= 300) {
-      const disposable = routine.shift();
-      timelineRows.delete(disposable.dataset.key);
-      disposable.remove();
-    }
+  if (timelineBatch) {
+    timelineBatch.last = row;
+    return;
   }
+  boundTimeline(row);
   if (nearBottom) ui.timeline.scrollTop = ui.timeline.scrollHeight;
 }
+
+// Whether the timeline is scrolled to (near) its end, where new rows keep it.
+function timelineNearBottom() {
+  return ui.timeline.scrollHeight - ui.timeline.scrollTop - ui.timeline.clientHeight < 70;
+}
+
+// Bound the routine rows, oldest first; pinned rows stay. Never evict ``keep`` (the row just
+// updated), or with 300 pinned rows every new event would vanish as it arrives.
+function boundTimeline(keep) {
+  if (ui.timeline.children.length <= 300) return;
+  const routine = [...ui.timeline.children].filter(
+    (item) => item.dataset.pinned !== "true" && item !== keep
+  );
+  while (routine.length >= 300) {
+    const disposable = routine.shift();
+    timelineRows.delete(disposable.dataset.key);
+    disposable.remove();
+  }
+}
+
+// While ingest() adds many rows, the timeline is measured once before them and bounded and scrolled once after:
+// measuring it at each row would lay the whole list out again each time. {nearBottom, last}, or null.
+let timelineBatch = null;
 
 // Keep only exact application prompts and root-model response text.
 function detailCard(entry) {
@@ -2536,6 +2588,33 @@ function upsertDetail(card) {
   const body = document.createElement("pre");
   body.textContent = row._text;
   row.replaceChildren(label, body);
+  if (card.shortened && !state.readOnly) {
+    // A prompt or a returned text the server cut: the whole of it on request, as in the activity log.
+    const whole = document.createElement("button");
+    whole.type = "button";
+    whole.className = "ghost compact entry-whole";
+    whole.textContent = "Show the whole text";
+    whole.onclick = () => showWholeRecord(whole, card, true);
+    row.append(whole);
+  }
+}
+
+// Read the whole of a shortened record and draw its row again: in the activity log, or (``detail``) in Prompts and
+// responses.
+async function showWholeRecord(button, card, detail = false) {
+  button.disabled = true;
+  button.textContent = "Reading the whole text…";
+  try {
+    const record = await request(jobPath("/trace-record", { id: card.shortened }));
+    const whole = detail ? detailCard(record) : describe(record);
+    if (whole && detail) upsertDetail({ ...whole, key: card.key, append: false });
+    else if (whole) upsertTimeline({ ...whole, key: card.key, append: false, replace: true, pinned: card.pinned });
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = "Show the whole text";
+    ui.notice.textContent = error.message;
+    show(ui.notice, true);
+  }
 }
 
 function ingest(entries, reset = false) {
@@ -2545,9 +2624,21 @@ function ingest(entries, reset = false) {
     ui.timeline.replaceChildren();
     ui.activityList.replaceChildren();
   }
-  for (const entry of entries) {
-    upsertTimeline(describe(entry));
-    upsertDetail(detailCard(entry));
+  // Many rows at once (a job's page opening): the timeline is measured, bounded and scrolled once.
+  const batch = timelineBatch === null && entries.length > 1;
+  if (batch) timelineBatch = { nearBottom: timelineNearBottom(), last: null };
+  try {
+    for (const entry of entries) {
+      upsertTimeline(describeRecord(entry));
+      upsertDetail(shortenedRow(detailCard(entry), entry));
+    }
+  } finally {
+    if (batch) {
+      const { nearBottom, last } = timelineBatch;
+      timelineBatch = null;
+      boundTimeline(last);
+      if (nearBottom) ui.timeline.scrollTop = ui.timeline.scrollHeight;
+    }
   }
 }
 
@@ -4445,7 +4536,7 @@ function render(next) {
       || entry.kind === "status" && /^Workflow step:/.test(entry.label || "")
       || entry.kind === "request" && ["critic", "final"].includes(entry.stage)))) {
     for (const round of criticReviewModel().rounds) {
-      if (round.result) upsertTimeline(describe(round.result));
+      if (round.result) upsertTimeline(describeRecord(round.result));
     }
   }
 
@@ -4661,6 +4752,7 @@ function render(next) {
   renderBatchNavigation();
   // After the overview is shown, so the chat can scroll to its newest text (it also places the author's question).
   renderAuthorMemory();
+  if (typeof renderExaminerReports === "function") renderExaminerReports();
   renderAuthorConversation();
   if (typeof renderNewGoal === "function") renderNewGoal();
   if (typeof renderEarlierGoals === "function") renderEarlierGoals();
@@ -5546,6 +5638,22 @@ function authorMemoryRow(file, open) {
   return row;
 }
 
+// The files the list shows, in its order, and what they are (``key``, to tell whether the rows must be built again):
+// worked out once for each list read, filter and order, not at each redraw, as a memory folder can hold thousands of
+// files. By name (folders and files in one order, as the server lists them), or the newest change first: what the
+// author works on now, the files of one moment by name.
+const authorMemoryShown = { listing: null, filter: "", sort: "", files: [], key: "" };
+function authorMemoryOrder(listing, files, filter, sort) {
+  const memo = authorMemoryShown;
+  if (memo.listing === listing && memo.filter === filter && memo.sort === sort) return memo;
+  const shown = files.filter((file) => !filter || file.path.toLowerCase().includes(filter));
+  const byName = (one, other) => (one.path < other.path ? -1 : one.path > other.path ? 1 : 0);
+  const changed = new Map(shown.map((file) => [file, Date.parse(file.updatedAt) || 0]));
+  shown.sort(sort === "name" ? byName : (one, other) => changed.get(other) - changed.get(one) || byName(one, other));
+  return Object.assign(memo, { listing, filter, sort, files: shown,
+    key: JSON.stringify(shown.map((file) => [file.path, file.bytes, file.updatedAt])) });
+}
+
 function renderAuthorMemory() {
   const author = state.workflowStages?.author !== false && Boolean(state.runId);
   if (!author) {
@@ -5560,6 +5668,7 @@ function renderAuthorMemory() {
       fileError: "", fileAsked: "", signature: "", opened: false, source: false, rendered: "" });
     ui.authorMemory.open = false;
     ui.authorMemoryFilter.value = "";
+    ui.authorMemoryList.replaceChildren();
   }
   if (authorMemory.loading !== job && Date.now() - authorMemory.loadedAt >= (ui.authorMemory.open ? 10000 : 60000)) {
     loadAuthorMemory(job);
@@ -5586,20 +5695,15 @@ function renderAuthorMemory() {
     + (newest ? ` · latest: ${newest.path}${authorMemoryTime(newest.updatedAt) ? `, ${authorMemoryTime(newest.updatedAt)}` : ""}` : "");
   if (ui.authorMemoryCount.textContent !== count) ui.authorMemoryCount.textContent = count;
   const filter = ui.authorMemoryFilter.value.trim().toLowerCase();
-  // By name (folders and files in one order, as the server lists them), or the newest change first: what the author
-  // works on now, the files of one moment by name.
-  const shown = files.filter((file) => !filter || file.path.toLowerCase().includes(filter));
-  const byName = (one, other) => (one.path < other.path ? -1 : one.path > other.path ? 1 : 0);
-  shown.sort(ui.authorMemorySort.value === "name" ? byName
-    : (one, other) => (Date.parse(other.updatedAt) || 0) - (Date.parse(one.updatedAt) || 0) || byName(one, other));
+  const { files: shown, key } = authorMemoryOrder(listing, files, filter, ui.authorMemorySort.value);
   const note = [filter ? (shown.length ? `${shown.length.toLocaleString("en-US")} of ${files.length.toLocaleString("en-US")} `
       + "files match." : "No file's name matches.") : "",
   listing.truncated ? `The folder holds more than is listed here; all of it is in ${listing.folder || "the memory folder"}.`
     : ""].filter(Boolean).join(" ");
   if (ui.authorMemoryNote.textContent !== note) ui.authorMemoryNote.textContent = note;
-  const signature = JSON.stringify([shown.map((file) => [file.path, file.bytes, file.updatedAt]), authorMemory.path,
-    new Date().toDateString()]);
-  if (signature !== authorMemory.signature) {
+  const signature = `${key}\n${authorMemory.path}\n${new Date().toDateString()}`;
+  // The rows are built while the section is open: a memory folder can hold thousands of files. Opening it builds them.
+  if (ui.authorMemory.open && signature !== authorMemory.signature) {
     authorMemory.signature = signature;
     const list = ui.authorMemoryList;
     // A row that has the focus keeps it, and the list its place.
@@ -5754,6 +5858,217 @@ ui.authorMemoryClose.onclick = () => {
   [...(ui.authorMemoryList.children || [])].find((row) => row.children?.[0]?.dataset?.memoryPath === path)
     ?.children[0].focus?.({ preventScroll: true });
 };
+
+// The examiner's reports, for every job with the Author stage: GET /examiner-reports lists them ({reports: [{id,
+// seat, number, state: running | finished | failed, startedAt, finishedAt, deliveredAt, file, bytes}], count}), oldest
+// first: read when the job page opens, then every 10 seconds while the section is open, every minute while it is
+// closed and the job works, and every 10 minutes otherwise. The section shows once there is a report, closed; its line
+// counts them and says when the latest reached the author. The report you open comes from GET /examiner-report (as
+// a memory file) and is rendered like a memory note (TCSMarkdown: the model's raw HTML is shown as text, never run),
+// with "Show source" for its text as written. A server older than this page has no such route: the section stays
+// hidden.
+const examinerReports = { job: "", run: "", listing: null, loadedAt: 0, loading: "", id: "", report: null,
+  reportError: "", reportLoading: "", reportAsked: "", signature: "", source: false, rendered: "" };
+
+function examinerReportTitle(entry) {
+  return `Report ${entry.number}` + (entry.seat > 1 ? ` (examiner seat ${entry.seat})` : "");
+}
+
+// When an examination started, was done and reached the author, in words; a day other than today is named once.
+function examinerReportTimes(entry) {
+  const first = timeText(entry.startedAt || entry.finishedAt || entry.deliveredAt || "");
+  const day = (text) => (text.includes(" ") ? text.slice(0, text.lastIndexOf(" ")) : "");
+  const time = (value) => {
+    const text = timeText(value ?? "");
+    return value !== (entry.startedAt || entry.finishedAt || entry.deliveredAt) && day(text) && day(text) === day(first)
+      ? text.slice(text.lastIndexOf(" ") + 1) : text;
+  };
+  return [entry.startedAt ? `started ${time(entry.startedAt)}` : "",
+    entry.state === "failed" ? (entry.finishedAt ? `failed ${time(entry.finishedAt)}` : "failed")
+      : entry.finishedAt ? `done ${time(entry.finishedAt)}` : "examining…",
+    entry.deliveredAt ? `reached the author ${time(entry.deliveredAt)}`
+      : entry.state === "finished" ? "not received by the author yet" : ""].filter(Boolean).join(" · ");
+}
+
+// What the list says of a report now, to read it again when it changed.
+function examinerReportMark(entry) {
+  return entry ? `${entry.bytes}|${entry.finishedAt}` : "";
+}
+
+function examinerReportRow(entry, open) {
+  const row = document.createElement("li"), button = document.createElement("button");
+  const name = document.createElement("span"), size = document.createElement("span");
+  const time = document.createElement("span");
+  button.type = "button";
+  button.className = "author-memory-row";
+  button.dataset.examinerReport = entry.id;
+  if (open) button.setAttribute("aria-current", "true");
+  name.className = "author-memory-name";
+  name.textContent = examinerReportTitle(entry);
+  size.className = "author-memory-size";
+  size.textContent = entry.bytes ? chatSizeText(entry.bytes) : "";
+  time.className = "author-memory-time";
+  time.textContent = examinerReportTimes(entry);
+  button.append(name, size, time);
+  // A report that is not written yet (the examination runs, or it failed) cannot be opened.
+  button.disabled = !entry.bytes;
+  button.onclick = () => openExaminerReport(entry.id);
+  row.append(button);
+  return row;
+}
+
+function renderExaminerReports() {
+  if (!ui.examinerReports) return;
+  const author = state.workflowStages?.author !== false && Boolean(state.runId);
+  if (!author) {
+    show(ui.examinerReports, false);
+    return;
+  }
+  const job = `${state.batchId || ""}:${state.runId}`;
+  if (examinerReports.job !== job) {
+    // Another job: its own reports, the section closed and no report open.
+    Object.assign(examinerReports, { job, run: state.runId, listing: null, loadedAt: 0, id: "", report: null,
+      reportError: "", reportAsked: "", signature: "", source: false, rendered: "" });
+    ui.examinerReports.open = false;
+    ui.examinerReportsList.replaceChildren();
+  }
+  const live = ["running", "pausing", "stopping"].includes(state.phase);
+  const every = ui.examinerReports.open ? 10000 : live ? 60000 : 600000;
+  if (examinerReports.loading !== job && Date.now() - examinerReports.loadedAt >= every) loadExaminerReports(job);
+  const reports = Array.isArray(examinerReports.listing?.reports) ? examinerReports.listing.reports : [];
+  show(ui.examinerReports, reports.length > 0);
+  if (!reports.length) return;
+  const latest = reports.filter((entry) => entry.deliveredAt).at(-1);
+  const count = `${reports.length.toLocaleString("en-US")} report${reports.length === 1 ? "" : "s"}`
+    + (latest ? ` · latest reached the author ${timeText(latest.deliveredAt)}` : "")
+    + (reports.some((entry) => entry.state === "running") ? " · examining now" : "");
+  if (ui.examinerReportsCount.textContent !== count) ui.examinerReportsCount.textContent = count;
+  const signature = `${JSON.stringify(reports)}\n${examinerReports.id}\n${new Date().toDateString()}`;
+  if (signature !== examinerReports.signature) {
+    examinerReports.signature = signature;
+    // A row that has the focus keeps it.
+    const active = typeof document !== "undefined" ? document.activeElement : null;
+    const focused = ui.examinerReportsList.contains?.(active) ? active.dataset?.examinerReport : "";
+    const rows = reports.map((entry) => examinerReportRow(entry, entry.id === examinerReports.id));
+    ui.examinerReportsList.replaceChildren(...rows);
+    if (focused) {
+      rows.find((row) => row.children[0].dataset.examinerReport === focused)?.children[0].focus({ preventScroll: true });
+    }
+  }
+  renderExaminerReport(reports);
+}
+
+// The report you opened, under the list: its number, its times and size, then its text.
+function renderExaminerReport(reports) {
+  const id = examinerReports.id;
+  show(ui.examinerReport, Boolean(id));
+  if (!id) return;
+  const entry = reports.find((item) => item.id === id) || null;
+  const report = examinerReports.report?.id === id ? examinerReports.report : null;
+  // Changed since it was asked for (a report written meanwhile): read again, the text on screen kept meanwhile.
+  if (report && entry && examinerReportMark(entry) !== examinerReports.reportAsked && examinerReports.reportLoading !== id) {
+    loadExaminerReport(examinerReports.job, id, examinerReportMark(entry));
+  }
+  const title = entry ? examinerReportTitle(entry) : "Report";
+  if (ui.examinerReportName.textContent !== title) ui.examinerReportName.textContent = title;
+  const meta = entry ? [examinerReportTimes(entry), entry.bytes ? chatSizeText(entry.bytes) : ""].filter(Boolean)
+    .join(" · ") : "";
+  if (ui.examinerReportMeta.textContent !== meta) ui.examinerReportMeta.textContent = meta;
+  const text = report && !report.binary ? report.text || "" : "";
+  const markdown = typeof TCSMarkdown !== "undefined";
+  const rendered = Boolean(text) && markdown && !examinerReports.source;
+  const box = ui.examinerReportText, doc = ui.examinerReportDoc;
+  show(box, Boolean(text) && !rendered);
+  show(doc, rendered);
+  if (!rendered && box.textContent !== text) box.textContent = text;
+  if (rendered && examinerReports.rendered !== `${id}\n${text}`) {
+    // Rendered again only when the report changed; one that cannot be rendered is shown as written.
+    try {
+      TCSMarkdown.render(text, doc);
+      examinerReports.rendered = `${id}\n${text}`;
+    } catch (_) {
+      examinerReports.source = true;
+      return renderExaminerReport(reports);
+    }
+  }
+  if (!rendered && examinerReports.rendered) {
+    if (markdown) TCSMarkdown.clear(doc);
+    examinerReports.rendered = "";
+  }
+  show(ui.examinerReportSource, Boolean(text) && markdown);
+  ui.examinerReportSource.textContent = examinerReports.source ? "Show rendered" : "Show source";
+  ui.examinerReportSource.setAttribute("aria-pressed", String(examinerReports.source));
+  const status = examinerReports.reportError ? examinerReports.reportError
+    : !report ? "Reading the report…"
+    : report.truncated ? `Showing the first ${(report.chars || text.length).toLocaleString("en-US")} characters of `
+      + `${chatSizeText(report.bytes)}; the whole report is ${entry?.file || "in the team folder"} in the author's `
+      + "working folder."
+    : text ? "" : "This report is empty.";
+  if (ui.examinerReportFileNote.textContent !== status) ui.examinerReportFileNote.textContent = status;
+}
+
+// Read the list of ``job`` (the job on screen), then draw it. A read that fails leaves what is listed.
+async function loadExaminerReports(job) {
+  examinerReports.loading = job;
+  try {
+    const listing = await request(jobPath("/examiner-reports", {}, examinerReports.run));
+    if (examinerReports.job === job) examinerReports.listing = listing;
+  } catch (_) {
+    // Nothing new to show; a server from before this list has no such route.
+  } finally {
+    if (examinerReports.loading === job) examinerReports.loading = "";
+    if (examinerReports.job === job) examinerReports.loadedAt = Date.now();
+  }
+  if (examinerReports.job === job && job === `${state.batchId || ""}:${state.runId}`) renderExaminerReports();
+}
+
+// Read the report ``id`` of ``job``, which the list gave the size and time ``mark``, then draw it.
+async function loadExaminerReport(job, id, mark) {
+  const open = () => examinerReports.job === job && examinerReports.id === id;
+  examinerReports.reportLoading = id;
+  examinerReports.reportAsked = mark;
+  try {
+    const report = await request(jobPath("/examiner-report", { id }, examinerReports.run));
+    if (open()) Object.assign(examinerReports, { report, reportError: "" });
+  } catch (error) {
+    if (open()) examinerReports.reportError = error.message;
+  } finally {
+    if (examinerReports.reportLoading === id) examinerReports.reportLoading = "";
+  }
+  if (open()) renderExaminerReports();
+}
+
+function openExaminerReport(id) {
+  const entry = examinerReports.listing?.reports?.find((item) => item.id === id);
+  Object.assign(examinerReports, { id, report: null, reportError: "", signature: "", source: false });
+  loadExaminerReport(examinerReports.job, id, examinerReportMark(entry));
+  renderExaminerReports();
+  // The report opens at its start, in view, and is announced by its title.
+  ui.examinerReportText.scrollTop = 0;
+  ui.examinerReportDoc.scrollTop = 0;
+  ui.examinerReport.scrollIntoView?.({ block: "nearest" });
+  ui.examinerReportName.focus?.({ preventScroll: true });
+}
+
+if (ui.examinerReports) {
+  // Opening the section reads the list at once when it is older than 2 seconds.
+  ui.examinerReports.ontoggle = () => {
+    if (ui.examinerReports.open && Date.now() - examinerReports.loadedAt > 2000) examinerReports.loadedAt = 0;
+    renderExaminerReports();
+  };
+  ui.examinerReportSource.onclick = () => {
+    examinerReports.source = !examinerReports.source;
+    renderExaminerReports();
+  };
+  ui.examinerReportClose.onclick = () => {
+    const id = examinerReports.id;
+    Object.assign(examinerReports, { id: "", report: null, reportError: "", reportAsked: "", signature: "" });
+    renderExaminerReports();
+    // Back to the row it was opened from.
+    [...(ui.examinerReportsList.children || [])].find((row) => row.children?.[0]?.dataset?.examinerReport === id)
+      ?.children[0].focus?.({ preventScroll: true });
+  };
+}
 
 // The running author's open question (state.authorQuestion; the server closes it by its rules), in its row
 // of the chat: each question with its options, the first preselected, and a field whose text replaces the
@@ -6079,19 +6394,28 @@ async function refresh() {
     return;
   }
   try {
-    // A job page and the New problem page name their batch: read the batches first.
-    if ((job || composingProblem) && (!batchCatalog.length || (batch && !selectedBatch()))) {
-      const catalog = await request("/batches");
+    // A job page and the New problem page name their batch: the batches are read beside the state, and taken
+    // first. An answer older than one the page took meanwhile (New batch, say) is left.
+    const adopted = batchOptions().adopted;
+    const catalogRead = (job || composingProblem) && (!batchCatalog.length || (batch && !selectedBatch()))
+      ? readNow("/batches") : null;
+    const stateRead = request(jobPath("/state", {
+      after: state.traceVersion || 0,
+    }));
+    // Its refusal is reported below, once the batches are in.
+    stateRead.catch(() => {});
+    if (catalogRead) {
+      const catalog = await catalogRead;
       if (job !== currentJob || batch !== currentBatch) return;
-      batchCatalog = adoptBatchCatalog(catalog);
-      renderBatchNavigation();
+      if (batchOptions().adopted === adopted) {
+        batchCatalog = adoptBatchCatalog(catalog);
+        renderBatchNavigation();
+      }
     }
     // A fresh New problem form opens with Default settings: read them with its state (a failed read leaves
     // TCS Prover's original settings and says why; see loadPresets).
     const presets = job ? null : loadPresets();
-    const next = await request(jobPath("/state", {
-      after: state.traceVersion || 0,
-    }));
+    const next = await stateRead;
     if (presets) await presets;
     if (job !== currentJob || batch !== currentBatch) return;
     // A link without its batch, or naming a batch no longer listed, takes the batch the server shows the job in.

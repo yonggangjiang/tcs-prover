@@ -205,12 +205,20 @@ incomplete (a CLI that is not installed is no such setting: the resume goes
 ahead, and the model call that needs it says so and is retried every minute).
 Saved work and the time budget are kept.
 
-**Restarts.** Work that a restart, crash or reboot interrupted continues about a
+**Restarts.** Closing TCS Prover (Ctrl-C, its terminal closing, a crash) does not
+stop the jobs that run: each workflow runner works in a process of its own and
+writes its events to a log of its own, which it never waits on. The next start
+finds each runner by its process ID and start time, reads its log on from where
+the closed server stopped (the events keep the times the runner wrote them) and
+controls it as before; a runner that ended meanwhile is read to its end and its
+job settles as if the server had been there. A statement review or a reply of
+the author is stopped when TCS Prover closes and runs again after the next
+start. Work that a crash or reboot of the computer interrupted continues about a
 minute after the next start: an author resumes its saved conversation, and a
 critic or LaTeX step starts again from its exact saved input (`latex-source.tex`
-is compiled again). A run that another TCS Prover process still owns (a terminal
-run, or a runner left by a crashed server) shows as running elsewhere until that
-process ends; then this server takes it over. A run whose saved checkpoint or
+is compiled again). A run that another live TCS Prover process owns (a terminal
+run) shows as running elsewhere until that process ends; then this server takes
+it over. A run whose saved checkpoint or
 settings are damaged stays listed with a warning: its checkpoint is rebuilt from
 the transcript, and unusable settings fall back to the defaults.
 

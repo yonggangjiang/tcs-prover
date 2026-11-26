@@ -945,6 +945,48 @@ def _read_manifest(manifest_dir, strict=True):
         return None, []
 
 
+# What the display reads (listing(), count(), shared_names()) last found in each manifest, by folder: (mark, entries).
+# A job's page and the job list show every job's related works at each read, and opening a file costs a round trip
+# on a network home folder, so a manifest whose folder and file are unchanged is not read again. Every write
+# replaces the manifest (a new file), and decisions read it themselves (strict).
+_DISPLAY_READS = {}
+_DISPLAY_LOCK = threading.Lock()
+
+
+def _display_mark(manifest_dir):
+    """What identifies the manifest's folder and file as they are now, or None when the folder is not there."""
+
+    try:
+        folder = os.lstat(manifest_dir)
+    except OSError:
+        return None
+    try:
+        info = os.lstat(os.path.join(manifest_dir, MANIFEST_NAME))
+        file = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode)
+    except OSError:
+        file = None
+    return folder.st_dev, folder.st_ino, folder.st_mtime_ns, folder.st_mode, file
+
+
+def _display_entries(manifest_dir):
+    """The valid entries of the manifest in ``manifest_dir``, for display (never raises; not to be changed)."""
+
+    key = str(manifest_dir)
+    mark = _display_mark(manifest_dir)
+    if mark is None:
+        return []
+    with _DISPLAY_LOCK:
+        known = _DISPLAY_READS.get(key)
+    if known is not None and known[0] == mark:
+        return known[1]
+    entries = _read_manifest(manifest_dir, strict=False)[1]
+    # Kept only when nothing changed during the read, so a manifest replaced meanwhile is read again next time.
+    if _display_mark(manifest_dir) == mark:
+        with _DISPLAY_LOCK:
+            _DISPLAY_READS[key] = (mark, entries)
+    return entries
+
+
 def _active(entries):
     """The entries of works still held: a batch store keeps a removed work's entry (``removedAt``) for its name."""
 
@@ -1440,7 +1482,7 @@ def listing(workspace, manifest_dir, shares=None):
              "addedAt": entry.get("addedAt", ""), "batch": entry.get("batch", ""),
              "sharedFrom": shared_from(entry.get("batch", "")),
              **({"noLongerShared": True} if no_longer_shared(entry) else {})}
-            for entry in _active(_read_manifest(manifest_dir, strict=False)[1])]
+            for entry in _active(_display_entries(manifest_dir))]
 
 
 def store_shares(controller_root):
@@ -1459,13 +1501,13 @@ def store_shares(controller_root):
 def count(workspace, manifest_dir):
     """How many related works a workspace (or batch store) holds; never raises."""
 
-    return len(_active(_read_manifest(manifest_dir, strict=False)[1]))
+    return len(_active(_display_entries(manifest_dir)))
 
 
 def shared_names(manifest_dir, store_id):
     """The names in store ``store_id`` of the works a workspace has from that store; never raises."""
 
-    return {entry.get("batchName", "") for entry in _read_manifest(manifest_dir, strict=False)[1]
+    return {entry.get("batchName", "") for entry in _display_entries(manifest_dir)
             if entry.get("batch") == store_id} - {""}
 
 

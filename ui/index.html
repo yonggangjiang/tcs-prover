@@ -982,6 +982,31 @@
                   <p id="authorMemoryFileNote" class="help" role="status"></p>
                 </section>
               </details>
+              <!-- The examiner's reports (GET /examiner-reports): one row per examination, oldest first, with when it
+                   started, when its report was done and when the author's conversation received it. The report you
+                   open (GET /examiner-report) is rendered for reading like a memory note, with its source a click
+                   away. app.js renderExaminerReports draws it and reads the list again while the job runs. -->
+              <details id="examinerReports" class="author-memory examiner-reports" hidden>
+                <summary><span class="author-memory-title">Examiner reports</span><span id="examinerReportsCount" class="author-memory-count"></span></summary>
+                <p class="help">Each time the author's conversation is compacted, an examiner reads the whole run and
+                  sends the author a report. Each row says when the examination started, when its report was done and
+                  when it reached the author. Open one to read it.</p>
+                <ol id="examinerReportsList" class="author-memory-list examiner-reports-list" aria-label="The examiner's reports"></ol>
+                <p id="examinerReportsNote" class="help" role="status"></p>
+                <section id="examinerReport" class="author-memory-file" aria-labelledby="examinerReportName" hidden>
+                  <div class="author-memory-file-head">
+                    <h4 id="examinerReportName" tabindex="-1"></h4>
+                    <button id="examinerReportSourceButton" class="ghost compact" type="button" aria-pressed="false" hidden>Show source</button>
+                    <button id="examinerReportCloseButton" class="ghost compact" type="button">Close</button>
+                  </div>
+                  <p id="examinerReportMeta" class="author-memory-meta"></p>
+                  <div id="examinerReportDoc" class="author-memory-doc" role="region" aria-labelledby="examinerReportName"
+                    tabindex="0" hidden></div>
+                  <pre id="examinerReportText" class="author-memory-text" role="region" aria-labelledby="examinerReportName"
+                    tabindex="0" hidden></pre>
+                  <p id="examinerReportFileNote" class="help" role="status"></p>
+                </section>
+              </details>
               <!-- In place of the section when this server is older than the page: it has no /memory-files route.
                    app.js says where the folder is, and what a restart does to a running job. -->
               <p id="authorMemoryOlder" class="help author-memory-older" hidden></p>

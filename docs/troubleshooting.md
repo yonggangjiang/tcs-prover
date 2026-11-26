@@ -134,7 +134,9 @@ in about a minute. Codex used outside TCS Prover keeps using `~/.codex`.
 A write to the run folder can hang on a network file system that stopped answering. Since 24 Nov 2026
 TCS Prover keeps reading the runner's events while a save hangs, so the run itself goes on and the job
 page catches up once the write returns. A server started before that version freezes the job instead:
-restart TCS Prover, which pauses and resumes its jobs.
+restart TCS Prover, which pauses and resumes its jobs. Since 27 Nov 2026 a runner writes its events to a
+log of its own, so a hung save in the server never reaches it at all, and restarting TCS Prover leaves
+running jobs working.
 
 ## Jobs
 

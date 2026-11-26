@@ -1484,9 +1484,12 @@ def emit(kind, stage, **fields):
     or a model message may echo a key the runner handed to a CLI.
     """
 
-    record = json.dumps(
-        {"kind": kind, "stage": stage, **redacted(fields)}, ensure_ascii=False,
-    )
+    fields = redacted(fields)
+    if "TCS_PROVER_RUNNER_EXIT" in os.environ:
+        # A runner started by the server writes its output to a log that the server may read later (after a
+        # restart): the time it wrote each record lets the server date what it reads late (ui/runner_process.py).
+        fields["emittedAt"] = datetime.now(timezone.utc).isoformat()
+    record = json.dumps({"kind": kind, "stage": stage, **fields}, ensure_ascii=False)
     with EMIT_LOCK:
         print(record, flush=True)
 
@@ -7296,6 +7299,10 @@ def load_workflow(path):
 # of the bundled files beside the private state also serves a fresh start.
 _LAST_GOOD_WORKFLOWS = {}
 _WORKFLOW_WARNINGS = {}
+# The last parse of each editable YAML file, by (its path, the parser): (the text it was parsed from, the value).
+# A file is read at every use (an edit shows at once) but parsed again only when its text changed: the job list and
+# every job's state read the workflow's prompts, and parsing the YAML costs some 40 ms each time.
+_PARSED_YAML = {}
 
 
 def _last_good_copy(path):
@@ -7321,7 +7328,12 @@ def read_editable_yaml(path, parse):
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
             raise ValueError(f"Cannot read workflow {path}: {exc}") from exc
-        value = parse(path)
+        parsed = _PARSED_YAML.get((key, parse))
+        if parsed is not None and parsed[0] == text:
+            value = _copy.deepcopy(parsed[1])
+        else:
+            value = parse(path)
+            _PARSED_YAML[(key, parse)] = (text, _copy.deepcopy(value))
     except ValueError as exc:
         remembered = _LAST_GOOD_WORKFLOWS.get(key)
         if remembered is None and saved is not None and saved.is_file():
@@ -9645,7 +9657,38 @@ def _interrupt(signum, frame):
     raise KeyboardInterrupt
 
 
+# The environment variable naming the file in which a runner started by TCS Prover's server writes its exit code
+# (ui/runner_process.py): a server started after the runner ended learns from it how the runner ended.
+RUNNER_EXIT_ENV = "TCS_PROVER_RUNNER_EXIT"
+
+
+def write_runner_exit(code):
+    """Write the exit code where the server asked, atomically, as the runner's last act (a failure is ignored)."""
+
+    path = os.environ.get(RUNNER_EXIT_ENV)
+    if not path or not isinstance(code, int):
+        return
+    temporary = f"{path}.{os.getpid()}.tmp"
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps({"code": code, "endedAt": datetime.now(timezone.utc).isoformat()}) + "\n")
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+
+
 if __name__ == "__main__":
     # SIGTERM unwinds like Ctrl-C, so cleanup still removes private settings.
     signal.signal(signal.SIGTERM, _interrupt)
-    raise SystemExit(main())
+    _code = 1
+    try:
+        _code = main()
+    except KeyboardInterrupt:
+        _code = 130
+    finally:
+        write_runner_exit(_code if isinstance(_code, int) else 1)
+    raise SystemExit(_code)

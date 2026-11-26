@@ -86,6 +86,39 @@ _STREAMS = _ReadCache()  # Claude stream path -> its lines
 _EVENTS = _ReadCache()  # stored bundle folder -> its trace events
 
 
+# The records the routes opened last, kept for the next request (the least recently used goes first): a record's
+# object index and call log are then read on from where the last request left them, not again from their start (the
+# index of a long job has some 100,000 lines, read in about a second). A record folder, object index or call log
+# that is not the one opened (deleted and made again, or cut shorter) is opened afresh.
+OPEN_RECORDS_KEPT = 2
+_OPEN_RECORDS = collections.OrderedDict()  # folder -> (identity, Record)
+_OPEN_RECORDS_LOCK = threading.Lock()
+
+
+def _open_identity(folder):
+    marks = []
+    for path in (folder, folder / "items" / "index.jsonl", folder / "calls.jsonl"):
+        try:
+            info = os.lstat(path)
+            marks.append((info.st_dev, info.st_ino))
+        except OSError:
+            marks.append(None)
+    return tuple(marks)
+
+
+def _still_whole(record):
+    """Whether the files the kept record read so far are still as long: they only grow, unless made again."""
+
+    for path, read in ((record.objects.index_path, record.objects._index_size), (record.calls.path, record.calls._size)):
+        try:
+            if os.lstat(path).st_size < read:
+                return False
+        except OSError:
+            if read:
+                return False
+    return True
+
+
 def _record(name):
     try:
         folder = records.record_folder(name)
@@ -93,7 +126,19 @@ def _record(name):
         raise NotFound("Unknown record.") from exc
     if not folder.is_dir():
         raise NotFound("This job has no record.")
-    return records.Record(folder)
+    key, identity = str(folder), _open_identity(folder)
+    with _OPEN_RECORDS_LOCK:
+        kept = _OPEN_RECORDS.get(key)
+        if kept is not None and kept[0] == identity and _still_whole(kept[1]):
+            _OPEN_RECORDS.move_to_end(key)
+            return kept[1]
+    record = records.Record(folder)
+    with _OPEN_RECORDS_LOCK:
+        _OPEN_RECORDS[key] = (identity, record)
+        _OPEN_RECORDS.move_to_end(key)
+        while len(_OPEN_RECORDS) > OPEN_RECORDS_KEPT:
+            _OPEN_RECORDS.popitem(last=False)
+    return record
 
 
 def _labels(record):
@@ -309,6 +354,45 @@ def _rows(record, summaries=False, lines=False):
     return rows
 
 
+# The rows of the last records listed (_cached_rows()), by record name: (what they were built from, the rows). A
+# long run has tens of thousands of calls; a page of the list shows 50, and paging through it builds them once.
+_ROWS_CACHE = collections.OrderedDict()
+_ROWS_CACHE_SIZE = 8
+_rows_lock = threading.Lock()
+
+
+def _rows_signature(record):
+    """What the list's rows are built from: the call log, the transcript snapshot and the process folders."""
+
+    marks = []
+    for path in (record.folder, record.folder / "calls.jsonl", record.folder / "transcript", record.folder / "codex",
+                 record.folder / "claude"):
+        try:
+            info = os.stat(path)
+            marks.append((info.st_size, info.st_mtime_ns))
+        except OSError:
+            marks.append(None)
+    return tuple(marks)
+
+
+def _cached_rows(record):
+    """_rows(record, lines=True), built again only when its sources changed; the caller copies a row it changes."""
+
+    signature = _rows_signature(record)
+    with _rows_lock:
+        known = _ROWS_CACHE.get(record.folder.name)
+        if known is not None and known[0] == signature:
+            _ROWS_CACHE.move_to_end(record.folder.name)
+            return known[1]
+    rows = _rows(record, lines=True)
+    with _rows_lock:
+        _ROWS_CACHE[record.folder.name] = (signature, rows)
+        _ROWS_CACHE.move_to_end(record.folder.name)
+        while len(_ROWS_CACHE) > _ROWS_CACHE_SIZE:
+            _ROWS_CACHE.popitem(last=False)
+    return rows
+
+
 def call_list(name, offset=0, limit=DEFAULT_LIMIT):
     """GET /jobs/<id>/model-calls."""
 
@@ -319,8 +403,8 @@ def call_list(name, offset=0, limit=DEFAULT_LIMIT):
         raise ValueError("offset and limit must be whole numbers.") from exc
     if offset < 0 or not 1 <= limit <= MAX_LIMIT:
         raise ValueError(f"offset must be 0 or more and limit 1 to {MAX_LIMIT}.")
-    rows = _rows(record, lines=True)
-    page = rows[offset:offset + limit]
+    rows = _cached_rows(record)
+    page = [dict(row) for row in rows[offset:offset + limit]]
     for row in page:
         line = row.pop("_line", None)
         if line is not None:
@@ -788,6 +872,30 @@ def call_raw(name, call_id):
 
 # --- The Records list ------------------------------------------------------------------------------------------------
 
+# The size of each record as the Records list shows it, kept between requests and restarts in RECORD_SIZES_FILE
+# (beside the records folder): a record's files are counted again only when its call log, its manifest, its
+# transcript snapshot or its folder changed (a job that works adds calls), so the list does not walk every file of
+# every record each time.
+RECORD_SIZES_FILE = "record-sizes.json"
+_record_sizes = {"loaded": False, "values": {}}
+_record_sizes_lock = threading.Lock()
+
+
+def _record_signature(folder):
+    """What changes when a record grows: its folder's, call log's, manifest's and transcript snapshot's change times,
+    the files' sizes."""
+
+    marks = []
+    for path, sized in ((folder, False), (folder / "calls.jsonl", True), (folder / "manifest.json", True),
+                        (folder / "transcript" / "transcript.jsonl.gz", True)):
+        try:
+            info = os.stat(path)
+            marks.append([info.st_size if sized else 0, info.st_mtime_ns])
+        except OSError:
+            marks.append([0, 0])
+    return marks
+
+
 def record_list(job_exists):
     """GET /records: every record, newest first; ``job_exists(name)`` says whether its job is still listed."""
 
@@ -797,11 +905,33 @@ def record_list(job_exists):
         folders = [path for path in root.iterdir() if path.is_dir() and records.valid_name(path.name)]
     except OSError:
         folders = []
-    for folder in folders:
-        manifest = records.Record(folder).manifest()
-        rows.append({"runFolder": folder.name, "title": manifest.get("title") or "",
-                     "created": manifest.get("created") or "", "sizeBytes": records.folder_size(folder),
-                     "jobExists": bool(job_exists(folder.name))})
+    sizes_path = root.parent / RECORD_SIZES_FILE
+    with _record_sizes_lock:
+        if not _record_sizes["loaded"]:
+            saved = records.read_json(sizes_path, {})
+            _record_sizes.update(loaded=True, values=saved if isinstance(saved, dict) else {})
+        sizes, changed = _record_sizes["values"], False
+        for folder in folders:
+            # Opening the record brings an older one up to date, once per process (records.Record), before its size.
+            manifest = records.Record(folder).manifest()
+            signature = _record_signature(folder)
+            known = sizes.get(folder.name)
+            if isinstance(known, dict) and known.get("signature") == signature and isinstance(known.get("bytes"), int):
+                size = known["bytes"]
+            else:
+                size = records.folder_size(folder)
+                sizes[folder.name], changed = {"signature": signature, "bytes": size}, True
+            rows.append({"runFolder": folder.name, "title": manifest.get("title") or "",
+                         "created": manifest.get("created") or "", "sizeBytes": size,
+                         "jobExists": bool(job_exists(folder.name))})
+        for name in set(sizes) - {folder.name for folder in folders}:
+            del sizes[name]
+            changed = True
+        if changed:
+            try:
+                records.write_atomic(sizes_path, json.dumps(sizes).encode("utf-8"))
+            except (OSError, records.RecordError):
+                pass  # Counted again at the next request.
     rows.sort(key=lambda row: (row["created"], row["runFolder"]), reverse=True)
     return rows
 
@@ -810,6 +940,8 @@ def delete_record(name):
     """DELETE /records/<runFolder> (the caller checks that no process of the job runs)."""
 
     record = _record(name)
+    with _OPEN_RECORDS_LOCK:
+        _OPEN_RECORDS.pop(str(record.folder), None)
     shutil.rmtree(record.folder)
     if record.folder.exists():
         raise OSError(f"The record {name} could not be removed completely.")

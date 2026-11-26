@@ -51,8 +51,12 @@ GET_ROUTES = {'/batches': set(), '/jobs': set(), '/state': {'job', 'after'},
               '/transcript': {'job'}, '/download-proof': {'job'}, '/download-source': {'job'},
               '/download-tex': {'job'}, '/download-pdf': {'job'}, '/download-critic-diff': {'job', 'file'},
               '/chat-answer': {'job', 'id'}, '/current-proof': {'job'}, '/goal-file': {'job', 'goal', 'name'},
+              # A record the job page received shortened, whole (server.page_record()).
+              '/trace-record': {'job', 'id'},
               # The author's memory: its files, one as text, one whole (a saved batch offers no download).
-              '/memory-files': {'job'}, '/memory-file': {'job', 'path'}, '/memory-file/download': {'job', 'path'}}
+              '/memory-files': {'job'}, '/memory-file': {'job', 'path'}, '/memory-file/download': {'job', 'path'},
+              # The examiner's reports: when each was made and reached the author, and one as text.
+              '/examiner-reports': {'job'}, '/examiner-report': {'job', 'id'}}
 CREATE_ROUTES = {'/review', '/direct', '/direct-batch', '/finalize', '/start-workflow'}
 CONTROL_ROUTES = {'/delete-job', '/resume', '/resume-critic',
                   '/resume-checkpoint', '/continue-stopped', '/approve', '/solve',

@@ -13,6 +13,7 @@ api_model_secret(); every other view is safe to send to the browser or to log.
 from datetime import datetime, timezone
 import hashlib
 import ipaddress
+import copy
 import json
 import os
 from pathlib import Path
@@ -713,6 +714,10 @@ def _last_test(value):
     }
 
 
+# The store as last read (_load_store()): [the file's identity, size, change time and mode, its rows].
+_STORE_READ = [None, []]
+
+
 def _load_store():
     """Read the store strictly: one [stored item, valid entry or None, problem] row per entry.
 
@@ -724,6 +729,16 @@ def _load_store():
     """
 
     path = store_path()
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        info = None
+    # The store is read for every job's state and every menu: parsed again only when the file changed.
+    mark = (str(path), info.st_ino, info.st_size, info.st_mtime_ns, info.st_mode) if info is not None else None
+    if mark is not None and _STORE_READ[0] == mark:
+        return copy.deepcopy(_STORE_READ[1])
     try:
         if path.is_symlink():
             raise StoreUnavailable(f"The API model store {path} is a symbolic link; replace it with the file itself.")
@@ -755,8 +770,10 @@ def _load_store():
         try:
             if path.stat().st_mode & 0o077:
                 os.chmod(path, 0o600)
+                mark = None  # Its mode changed: read again next time.
         except OSError:
             pass
+    _STORE_READ[:] = [mark, copy.deepcopy(rows)]
     return rows
 
 

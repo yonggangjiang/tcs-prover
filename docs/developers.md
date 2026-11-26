@@ -34,6 +34,7 @@ ui/
   related_works.py          Related works given to the proof author
   retrieval.py              Web search cutoff setup for the page
   ownership.py              One owner per run, one server per runs folder
+  runner_process.py         Workflow runners that outlive their server: log files, finding them again after a restart
   local_host.py             The addresses the page opens at: loopback, any port (forwarded)
   current_run.py            The current-run selection
   live_gateway.py           New page assets beside an existing controller
@@ -69,8 +70,12 @@ working folder.
 - `runs/<run>/`: the job's workspace, `transcript.jsonl` and outputs.
 - `runs/.controller/<run>/`: TCS Prover's own copies of the job's
   `job-settings.json`, `pause.json`, role prompts and checked statement, which
-  it relies on (the run folder's copies are for the author to read), and the
-  author's private temp folder `tmp/`.
+  it relies on (the run folder's copies are for the author to read), the
+  author's private temp folder `tmp/`, and what makes a restart quick:
+  `trace-index.json` (the job page's window and where the last read of
+  `transcript.jsonl` ended) and `restore-scan.json` (what restoring the job
+  found in its transcript); see *Long jobs and many jobs* in
+  [The proof author](#the-proof-author).
 - `runs/.controller/batches.json`: the names of batches made with New batch
   (owner-only).
 - `runs/.controller/.batches/<ID>/`: the related works a folder run (`b_…`) or a
@@ -84,7 +89,8 @@ working folder.
   Setup's own output is kept in memory only.
 - `.tcs-prover/records/<run>/`: the job's record of every model call (see
   [Job records](#job-records)), kept apart from the run folder: deleting or
-  trashing the job never removes it.
+  trashing the job never removes it. `.tcs-prover/record-sizes.json` keeps the
+  size the Records list shows of each record.
 - Private per-call folders are pruned once they are a day old, beyond the newest
   50 critic snapshots and historical critic sessions and 200 historical
   discovery runs.
@@ -370,6 +376,52 @@ server add:
   holds, and a full copy's `traceFrom` is the version after which none is
   missing. The author subagent records are pinned, as the critic's progress is.
   `transcript.jsonl` keeps every record.
+- **Long jobs and many jobs.** What a page
+  waits for must not grow with a job's history or with the number of jobs:
+  - The job page receives each record as `page_record()` gives it: a text longer
+    than `PAGE_TEXT_LIMIT` (16,000 characters) is cut there, and a model event
+    of a kind the page never shows (anything but `PAGE_EVENT_NAMES`: Codex's
+    whole-turn diffs, token and rate-limit updates, ...) keeps only its name and
+    conversation ids. Such a record carries `"shortened": {"id"}`
+    (`record_token()`: where the record is in memory, and a check of what it
+    is). A row that shows a cut text (it ends with "…"; a tool's row shows its
+    command, not its output), in the activity log or in Prompts and responses,
+    offers **Show the whole text**, which reads the record from `GET
+    /trace-record?job=…&id=…` (`App.trace_record()`) while it is in the window.
+    A critic's report is never cut. The window itself keeps a never-shown event
+    without its payload (`window_record()`).
+  - A restart reads a transcript whole once, then only what was added since
+    (`App._load_trace()`, `trace-index.json`, checked against the bytes before
+    where it ended): a model event's line is read without its event
+    (`light_codex_record()`; a line laid out otherwise is parsed whole), and
+    only the window's other lines and the pinned ones are parsed whole.
+    Restoring a job takes what its pass over the transcript found from
+    `restore-scan.json` when the transcript and the state the pass starts from
+    are unchanged. Both files name the version of `ui/server.py` that made them
+    (`CODE_DIGEST`): the first start after an update reads every transcript
+    again (about a minute for 5 GB of transcripts).
+  - The job list (`/jobs`, and `/batches` for its counts, which the pages read
+    every few seconds) reads a brief copy of each job (`App.snapshot(brief=True)`),
+    without what only its page shows: its statement, prompts and model menus,
+    downloads, current proof, chat items and related works.
+  - Small files every job's state reads are read again only when their
+    `lstat()` marks changed (each is replaced whole when written): `pause.json`
+    and the checked statement (`_unchanged_read()`), the related-works manifests
+    shown (`related_works._display_entries()`; what decides reads them itself),
+    the API model store, and each workflow YAML's parse (the file is read at each
+    use and parsed again when its text changed). On a network home folder each
+    open is a round trip to the file server.
+  - The Records list counts a record's files again only when its folder, call
+    log, manifest or transcript snapshot changed (`record-sizes.json`); it
+    still opens every record once per process, which brings an older one up to
+    date. The record routes keep the `OPEN_RECORDS_KEPT` (2) records they opened
+    last, so a record's object index and call log are read on from where the
+    last request left them; a record made again is opened afresh.
+  - The page: while it adds many rows at once (a job's page opening), the
+    timeline is measured, bounded and scrolled once (`ingest()`); rows out of
+    sight are not laid out (`content-visibility`); the memory list builds its
+    rows only while it is open, and sorts them once per read; a job's page reads
+    the list of batches beside its state (`readNow()`), not before it.
 - **The author's memory.** The job page of every job with the Author stage lists
   the author's memory folder (`memory/` in the author's working folder,
   `goalWorkspace` or the run folder), on request only: nothing of it is in
@@ -402,6 +454,21 @@ server add:
   read-only batches list and show the same (`BatchCatalog.memory_files()`,
   `memory_file()`), without the download; the live gateway forwards the three
   routes.
+- **The examiner's reports.** `GET /examiner-reports?job=…`
+  (`App.examiner_reports()`) returns `{reports: [{id, seat, number, state,
+  startedAt, finishedAt, deliveredAt, file, bytes}], count}`, oldest first: one
+  entry per examination (`member-<seat>-<k>`), from the examiner seat's
+  "Author subagent started/finished/failed" records and the author's "Examiner
+  report delivered" (`follow_examiner_report()`). Only transcript lines that
+  name the examiner (`EXAMINER_LINE_MARKERS`) are parsed, and each request
+  reads on from where the previous one stopped. `GET
+  /examiner-report?job=…&id=member-1-3` returns the report
+  (`team/member-1/3-report.md` in the author's working folder) as
+  `/memory-file` returns a file: the same readers, below `team/` instead of
+  `memory/`, so nothing is read through a link. Saved batches answer both
+  (`BatchCatalog.examiner_reports()`, `examiner_report()`) and the gateway
+  forwards them. The page reads the list every 10 s while its section is open,
+  every minute while the job works and every 10 minutes otherwise.
 - **Rendered Markdown.** The page renders a Markdown note of the memory, the
   current proof, a proof in the final answer and an earlier goal's proof with
   `ui/markdown.js` (`TCSMarkdown.render(text, element)`), on markdown-it 14.1.0
@@ -1140,6 +1207,53 @@ folder too.
   existing controller's retrieval-state folder to share host pacing across old
   and new historical jobs.
 
+### Jobs keep running without the server
+
+The server is a window onto the jobs and a remote control for them, never a
+part of them (the design of the meta-harness on the same machine;
+`ui/runner_process.py`). A workflow runner
+
+- runs in a session of its own (a detached process on Windows), so the
+  server's Ctrl-C, its terminal closing or the server being killed never reach
+  it;
+- reads nothing once it has started: its input is written to its standard
+  input, which is then closed;
+- writes its output to a log of its own, never to a pipe, in
+  `runs/.controller/<run>/runner/<launch>.log`, and its exit code to
+  `<launch>.exit` (`TCS_PROVER_RUNNER_EXIT`, written as the runner's last act;
+  `workflow_runner.write_runner_exit()`). Under the server each of its records
+  carries `emittedAt`, the time the runner wrote it.
+
+`runner/current.json` records the launch: the runner's process ID and start time
+(`/proc/<pid>/stat` on Linux, `ps -o lstart` elsewhere on POSIX, the creation
+time on Windows), its log and exit file, the server that reads it, and how far
+it has read (`consumed`, saved every 2 s and when the server closes). The
+server follows the log (`LogFollower`, which `runner_lines()` reads without its
+read-ahead) and handles each record as before; the transcript is still written
+only by the server.
+
+- **Closing** (`Server.stop_all()`): each reader stops after a line it has
+  handled (`App.detach_runner()`, `RunnerDetached`) and records how far it read;
+  the runner works on. A statement review, a reply turn of the author (both
+  still on a pipe) and a runner of an earlier version are paused or stopped as
+  before.
+- **Starting** (`restore_one_run(adopt=True)`, the launcher's server only): a
+  run whose `current.json` names a launch that no live process reads is read on
+  (`App.adopt_runner()`). The run's owner lock is held by the runner itself
+  (it inherited the closed server's), so that is no "running elsewhere". The
+  job shows as it was (running, or pausing), its log is read from `consumed`,
+  and records read late keep the time the runner wrote them
+  (`App.add_trace(written_at=)`, never before the previous record or after
+  now). Once it has caught up, *Runner found after a restart* says so (before
+  the late records when the runner had already ended). Pause and Stop reach the
+  runner by its process ID; when it ends, the job settles from its files
+  (`_settle_from_saved_run()`), as after a restart, because what happened
+  before this server read it is in the transcript, not in this reader.
+- A runner killed before it wrote its exit code has none (-1). Once a log is
+  read to its end, the log, the exit file and `current.json` are removed.
+- A server that crashed rereads at most 2 s of output, which its transcript
+  then holds twice.
+
 ### The current-run selection
 
 When `.experiment-control/current-run.json` selects a current batch,
@@ -1188,5 +1302,5 @@ restarted original controller is found again through its launch status file.
 - The gateway does not forward the Setup page: `/?setup=1` loads, its `/setup`
   routes answer 404, and the page says to open TCS Prover from its own launch
   link (a step's jobs protection sees only one controller's jobs).
-- Closing the gateway (Ctrl-C or SIGTERM) pauses the new controller's jobs as
-  closing the server does.
+- Closing the gateway (Ctrl-C or SIGTERM) closes the new controller as closing
+  the server does: its workflow runners keep working.

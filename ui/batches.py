@@ -140,6 +140,8 @@ class BatchCatalog:
         self.current_root = Path(current_root).resolve() if current_root is not None else None
         self._trace_cache = OrderedDict()
         self._cache_lock = threading.Lock()
+        # Whether a folder is a run, by folder (_is_run()): (the folder's identity, change time and mode, the answer).
+        self._run_marks = {}
 
     def _directory(self, path):
         try:
@@ -227,7 +229,22 @@ class BatchCatalog:
             return []
 
     def _is_run(self, directory):
-        return any(self._info(directory, name) is not None for name in RUN_MARKERS)
+        # Asked of every folder at every listing: kept per folder until the folder itself changes (a run marker that
+        # appears or goes changes its folder's change time).
+        try:
+            info = os.lstat(directory)
+            mark = (info.st_ino, info.st_mtime_ns, info.st_mode)
+        except OSError:
+            mark = None
+        with self._cache_lock:
+            known = self._run_marks.get(str(directory))
+        if mark is not None and known is not None and known[0] == mark:
+            return known[1]
+        found = any(self._info(directory, name) is not None for name in RUN_MARKERS)
+        if mark is not None:
+            with self._cache_lock:
+                self._run_marks[str(directory)] = (mark, found)
+        return found
 
     def _runs(self, directory):
         return [entry for entry in self._children(directory) if self._is_run(entry)]
@@ -610,7 +627,9 @@ class BatchCatalog:
         state['canDownloadPdf'] = bool(pdf and pdf.st_size)
         state['traceVersion'] = version
         state['traceFrom'] = after if after == version else 0
-        state['trace'] = [] if after == version else list(records)
+        # As the live job page gets them (server.page_record()); a saved batch offers no whole record.
+        from .server import page_record
+        state['trace'] = [] if after == version else [page_record(record) for record in records]
         state['traceTruncated'] = truncated
         state['traceNotice'] = ("Showing recent saved events. The complete history is in this job's "
                                 'transcript.jsonl in its run folder.' if truncated else '')
@@ -662,6 +681,46 @@ class BatchCatalog:
             raise ValueError('That file is not in the author\'s memory, or it is not a file that can be shown.')
         return found
 
+    def examiner_reports(self, batch_id, run_id):
+        """A saved job's examiner reports as GET /examiner-reports gives them (server.App.examiner_reports())."""
+        from .server import EXAMINER_LINE_MARKERS, follow_examiner_report
+
+        directory = self._run(batch_id, run_id)
+        entries = {}
+        try:
+            with self._open(directory, 'transcript.jsonl') as stream:
+                for line in stream:
+                    if any(marker in line for marker in EXAMINER_LINE_MARKERS):
+                        try:
+                            follow_examiner_report(entries, json.loads(line))
+                        except (ValueError, RecursionError):
+                            pass
+        except (OSError, ValueError):
+            pass
+        workspace = self._memory_workspace(batch_id, run_id)
+        reports = sorted((dict(entry) for entry in entries.values()), key=lambda entry: (
+            entry['startedAt'] or entry['finishedAt'] or entry['deliveredAt'], entry['seat'], entry['number']))
+        for entry in reports:
+            try:
+                info = os.lstat(workspace / entry['file'])
+                entry['bytes'] = info.st_size if stat.S_ISREG(info.st_mode) else 0
+            except OSError:
+                entry['bytes'] = 0
+        return {'reports': reports, 'count': len(reports)}
+
+    def examiner_report(self, batch_id, run_id, identity):
+        """One report of a saved job's examiner as GET /examiner-report gives it (server.App.examiner_report())."""
+        from .server import EXAMINATION_ID, EXAMINER_TEAM_FOLDER, read_memory_file
+
+        found = EXAMINATION_ID.match(str(identity or ''))
+        if not found:
+            raise ValueError('Name one of the examiner\'s reports.')
+        report = read_memory_file(self._memory_workspace(batch_id, run_id),
+                                  f'member-{found.group(1)}/{found.group(2)}-report.md', EXAMINER_TEAM_FOLDER)
+        if report is None:
+            raise ValueError('That report is not there.')
+        return {**report, 'id': str(identity)}
+
     def response(self, path, batch, job='', query=None):
         """Return a JSON value or a validated download path for a GET route.
 
@@ -683,6 +742,10 @@ class BatchCatalog:
             body = self.memory_files(batch, job)
         elif path == '/memory-file':
             body = self.memory_file(batch, job, query.get('path', ''))
+        elif path == '/examiner-reports':
+            body = self.examiner_reports(batch, job)
+        elif path == '/examiner-report':
+            body = self.examiner_report(batch, job, query.get('id', ''))
         elif path in {'/transcript', '/download-tex', '/download-pdf'}:
             name = {'/transcript': 'transcript.jsonl', '/download-tex': 'final.tex',
                     '/download-pdf': 'final.pdf'}[path]
