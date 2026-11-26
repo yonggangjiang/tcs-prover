@@ -137,13 +137,12 @@ stages and the current model and prompt settings. Statement review is skipped.
 with the folder run: they are saved once, in a store of that folder run kept
 outside every job's folder, and every job finds them in its own `related-works/`
 folder as hard links to that one copy (no extra disk space; where a hard link is
-impossible, that job gets its own copy and its activity log says so). While the
-run's jobs can still take related works, the batch page lists the run under
-**Shared with a folder run**: **Add files…** and **Add a note** there add works to
-every job of the run, queued ones included, and each running or paused author is
-told about them. A job of the run can still add works of its own on its page.
-Every job of the run also gets what its batch [shares](#shared-related-works)
-with every problem.
+impossible, that job gets its own copy and its activity log says so). Every job
+of the run also gets what its batch [shares](#shared-related-works) with every
+problem. To give every job of the run more works once it has started, add them
+there, on the batch page: every unfinished problem in the batch gets them,
+queued ones included, and each running or paused author is told. A job of the
+run can still add works of its own on its page.
 
 To run a folder from the terminal, see [Terminal runs](terminal.md#folders).
 

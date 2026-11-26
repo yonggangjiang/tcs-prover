@@ -1,29 +1,23 @@
-"""TCS Prover's MCP server "tcs" (its service in the runner) and the author coordinator's team.
+"""TCS Prover's MCP server "tcs" (its service in the runner) and the author's examiner.
 
-The author or coordinator of a run reaches TCS Prover through one MCP server, named SERVER_NAME. Codex starts it as
-a stdio process (runner/tcs_mcp.py, a thin bridge), which forwards each request over a local channel to the Service
+A Codex author under TCS Prover's goal loop reaches TCS Prover through one MCP server, named SERVER_NAME. Codex starts it
+as a stdio process (runner/tcs_mcp.py, a thin bridge), which forwards each request over a local channel to the Service
 of the runner process that started the CLI: a TCP listener on 127.0.0.1 with a random port, which answers only
 requests that carry the random token the bridge received in its environment (from the CLI's settings for that
-server, never from argv). Claude Code reaches the same Service without a bridge: the runner answers the server's
-messages itself on the CLI's stream-json control channel (Service.claude_config(), Service.answer()). The service
-holds the tools:
-- update_goal (GoalTool): how a Codex author or coordinator under TCS Prover's goal loop ends its goal
-  (workflow_runner.goal_session());
-- the team tools (Team): team_members, team_assign, team_wait, team_followup and team_stop of the author
-  coordinator, whose subagents are TCS Prover team members, each running a model of its own (the Subagent models
-  setting: job setting authorSubagentModels, runner option --author-subagent-models).
-Every tool's description and argument descriptions are texts of the workflow's prompts (workflow_runner.HARNESS_TEXTS),
-so the user can edit them like every other prompt.
+server, never from argv). Its tool is update_goal (GoalTool), with which such an author ends its goal
+(workflow_runner.goal_session()). The tool's description and argument descriptions are texts of the workflow's prompts
+(workflow_runner.HARNESS_TEXTS), so the user can edit them like every other prompt.
 
-A member's assignment is a one-shot run of its model (`codex exec --json` or `claude -p`) in the author's working
-folder, with the author's sandbox, network rule and environment filtering (workflow_runner.member_attempt()); its
-final reply is its report, saved to team/member-<n>/<k>-report.md there. Member processes are children of the runner:
-Pause, Stop, the time limit and a restart stop them with the coordinator (Team.close()); only their files remain.
+The author's examiner (Team, see workflow_runner.start_team()) is a seat beside the author whose only task is to
+examine the whole run, in a fresh conversation each time. An examination is a one-shot run of the author's model
+(`codex exec --json` or `claude -p`) in the author's working folder, with the author's sandbox, network rule and
+environment filtering (workflow_runner.member_attempt()); its final reply is its report, saved to
+team/member-<n>/<k>-report.md there. Its process is a child of the runner: Pause, Stop, the time limit and a restart
+stop it with the author (Team.close()); only its files remain.
 """
 
 from collections import deque
 import contextlib
-from dataclasses import dataclass
 import hmac
 import json
 import os
@@ -36,148 +30,64 @@ import sys
 import threading
 import time
 
-from runner import providers, tcs_mcp
+from runner import providers
 
 SERVER_NAME = "tcs"
 BRIDGE = Path(__file__).resolve().with_name("tcs_mcp.py")
-# How Claude Code (2.1.289) names a tool of this MCP server to the model. Codex (0.160) gives the model each tool
-# under its own name in the namespace mcp__tcs (Service.codex_server()).
-TOOL_PREFIX = f"mcp__{SERVER_NAME}__"
 GOAL_TOOL = "update_goal"
-TEAM_TOOLS = ("team_members", "team_assign", "team_wait", "team_followup", "team_stop")
 # update_goal's statuses: Codex's own three. Only "complete" ends the goal; TCS Prover records "blocked" and "paused"
 # and goes on (the owner's rule: TCS Prover never stops a run for the model; the user pauses it from the job page).
 GOAL_STATUSES = ("complete", "blocked", "paused")
 GOAL_STATUS_LABEL = "Goal status"
-# The longest team_wait, and its default (team-models-spec): 30 minutes, as Codex's coordinator hint asks.
-WAIT_MINUTES = 30
-# The most report text one team_wait answer carries: a report alone up to this many characters, reports that come
-# back together share it (report_shares()); a longer one is cut, with a note naming its saved file. Codex 0.160 cuts
-# a tool's answer longer than its models' output budget (10,000 tokens, counted as about 4 bytes each) out of the
-# middle, which dropped whole report headers and file paths when several long reports came back at once (captured
-# with the real Codex against a scripted model server).
-REPORT_CHARS = 20_000
-# The CLIs' time limit for one call of this server's tools (Codex: tool_timeout_sec; Claude Code: the server's
-# timeout in ms): longer than the longest team_wait, so a wait always returns before the CLI gives up on it.
+# Codex's time limit for one call of this server's tools (tool_timeout_sec).
 TOOL_TIMEOUT_SECONDS = 40 * 60
 # How the bridge finds the service: its address and token, in the bridge's environment only.
 ADDRESS_ENV = "TCS_MCP_ADDRESS"
 TOKEN_ENV = "TCS_MCP_TOKEN"
-# The largest request or answer the channel carries (a team_assign holds the coordinator's assignment).
+# The largest request or answer the channel carries.
 MESSAGE_LIMIT = 16 * 1024 * 1024
-# The member records (the author subagent records of workflow_runner.AuthorSubagents, with the member's number
+# The examiner's records (the author subagent records of workflow_runner.AuthorSubagents, with the seat's number
 # and model).
 MEMBER_LABELS = {"started": "Author subagent started", "finished": "Author subagent finished",
                  "failed": "Author subagent failed"}
-TASK_CHARS = 200
 TEAM_FOLDER = "team"
-# The examiner (Team's ``examiner``): a seat beside the authors whose only task is to examine the whole run, in a
-# fresh conversation each time, with the team_examiner text as its whole instruction. TCS Prover starts an
-# examination itself, never the coordinator: when the coordinator assigns work or waits, an author is working, the
-# examiner is idle, some author has reported before, and the last examination began at least this long ago. A lone
-# author's examiner has no clock: goal_session starts an examination each time the author's conversation is compacted.
-EXAMINATION_SECONDS = 60 * 60
+# The examiner (Team's ``examiner``): a seat beside the author whose only task is to examine the whole run, in a
+# fresh conversation each time, with the author_examiner text as its whole instruction. goal_session starts an
+# examination each time the author's conversation is compacted (examine()), unless the last one is still running.
 EXAMINER_TASK = "Examination of the whole run"
-# The list of assignments and reports with their times, which the examiner reads: team/timeline.md.
+# The list of examinations with their times, which the examiner reads: team/timeline.md.
 TIMELINE_FILE = "timeline.md"
-# A report's file name in its member's folder (team/member-<n>/<k>-report.md): k is the assignment's number.
+# A report's file name in its seat's folder (team/member-<n>/<k>-report.md): k is the examination's number.
 REPORT_FILE = re.compile(r"([0-9]+)-report\.md")
 # A Windows reparse point whose tag has this bit names another file: a symlink, a junction or a similar link, which
 # lstat does not follow and Path.is_symlink() does not report for a junction (as ui/related_works.py tests links).
 NAME_SURROGATE_TAG = 0x20000000
-# The start of the report of a stopped assignment; {reason} says who stopped it.
+# The start of the report of a stopped examination; {reason} says who stopped it.
 STOPPED_REPORT = "This assignment was stopped. {reason}"
-# What the coordinator's next team_wait says of an assignment that a pause (the user's, or a restart of TCS Prover)
-# stopped, after the run resumes (Team.restore()): the member's files stay, and its conversation can be continued.
-INTERRUPTED_REPORT = ("The run was paused or TCS Prover restarted while this assignment was working, so it was "
-                      "stopped. The files it wrote stay in the working directory, and team_followup continues its "
-                      "conversation with everything it did there.")
-INTERRUPTED_FRESH_REPORT = ("The run was paused or TCS Prover restarted while this assignment was working, so it was "
-                            "stopped before it started a conversation. Any files it wrote stay in the working "
-                            "directory; give the assignment again with team_assign.")
-# The key of the workflow state under which a paused run keeps its teams (Team.carry()), by node name.
-TEAM_CARRY = "carried_teams"
-# The report of an assignment whose member's API connection refused the request (a Refusal): {member} is the member's
-# number, {reason} the service's own words (the owner's wording, 14 Nov 2026). Such a refusal can pass (a proxy that
-# refuses requests while its own login refreshes) as well as come from a wrong setting, so the report asks the
-# coordinator to keep the work going, never to give the member up.
-REFUSED_REPORT = ("Member {member}'s assignment failed: its API connection refused the request ({reason}). This may "
-                  "be a temporary problem of the service or a wrong setting. Keep the work going: give this "
-                  "assignment to another member, or give it to member {member} again later.")
-# How long after an attention (Team.attention()) a team_wait that starts still ends at once: the coordinator may
-# have called it just before TCS Prover sent its instruction, which then waits for the call to end.
-ATTENTION_SECONDS = 10
-# The answer of a team_wait that Team.release_waits() ended: its caller's attempt is over (the CLI that called it
-# stopped), so it takes nothing, and the next attempt's team_wait gets the reports.
-RELEASED_WAIT = ("This wait ended because the coordinator's session restarted after a failed model call; no report "
-                 "was taken. Call team_wait again for the reports.")
 
 
 class TeamError(ValueError):
     """A refused tool call: its text is the tool's answer."""
 
 
-@dataclass(frozen=True)
-class Refusal:
-    """A failed attempt whose member's API connection refused the request, as Team's ``configuration`` names it.
-
-    ``text`` is the failure in its own words, which the member's record keeps; ``reason`` is the service's own words,
-    which the report to the coordinator quotes (REFUSED_REPORT).
-    """
-
-    text: str
-    reason: str
-
-
 def assignment_id(number, count):
-    """The id of member ``number``'s ``count``-th assignment (a follow-up counts as one): "member-<n>-<k>".
+    """The id of seat ``number``'s ``count``-th assignment (an examination): "member-<n>-<k>".
 
     Every record of that assignment carries it as subagentId: its status records, its events and its retry notes.
     Each assignment is a run of its own whose item ids start again (`codex exec --json` numbers them item_0, ...),
-    so the page keeps its rows apart by this id, and a later assignment of the member never replaces them.
+    so the page keeps its rows apart by this id, and a later assignment never replaces them.
     """
 
     return f"member-{number}-{count}"
-
-
-def validated_team(value, count=None, check_models=False):
-    """The Subagent models setting ``value`` as a list of {"model", "effort"} (copies), or None.
-
-    None is "Same as the coordinator": every member runs the coordinator's model. A list needs exactly ``count``
-    entries (the job's Author subagents; None: any number of 1 or more), each with a model id and a reasoning
-    effort of the shared menu (a retired one is kept; it runs as its replacement). With ``check_models`` each
-    model must be one the catalog knows (built-in or a configured API model), else ValueError; the runner leaves
-    that to the member's run, which reports a model it cannot use to the coordinator. A ValueError says what is
-    wrong in the form's words; providers.StoreUnavailable means the API model store cannot be read right now.
-    """
-
-    if value is None:
-        return None
-    if not isinstance(value, list) or not value:
-        raise ValueError("Subagent models must be Same as the coordinator or a model for each author subagent.")
-    if count is not None and len(value) != count:
-        raise ValueError(f"Choose a model for each of the {count} author subagent{'s' if count != 1 else ''} "
-                         f"({len(value)} chosen).")
-    members = []
-    for number, entry in enumerate(value, 1):
-        if not isinstance(entry, dict) or set(entry) != {"model", "effort"}:
-            raise ValueError(f"Author subagent {number} needs a model and a reasoning effort.")
-        model, effort = entry["model"], entry["effort"]
-        if not isinstance(model, str) or not model or (check_models and not providers.is_known(model)):
-            raise ValueError(f"Choose an available model for author subagent {number}.")
-        if effort not in providers.CODEX_EFFORTS and effort not in providers.RETIRED_EFFORTS:
-            raise ValueError(f"Choose a valid reasoning effort for author subagent {number}.")
-        members.append({"model": model, "effort": effort})
-    return members
 
 
 def member_description(model):
     """How the team names one member's model: {"modelLabel", "program", "connection"}.
 
     ``program`` is the CLI that runs a built-in model ("Codex CLI", "Claude Code"), or for an API model
-    'API connection "<its connection's label>"'; ``connection`` is that label (None for a built-in model). The team
-    note, team_members and the job's authorTeam use these words. A model the catalog does not know is named by its
-    id, with the program "unknown model" (its run then fails as a configuration problem).
+    'API connection "<its connection's label>"'; ``connection`` is that label (None for a built-in model). A model
+    the catalog does not know is named by its id, with the program "unknown model" (its run then fails as a
+    configuration problem).
     """
 
     try:
@@ -192,38 +102,21 @@ def member_description(model):
     return {"modelLabel": row["label"], "program": row["providerLabel"], "connection": None}
 
 
-def team_members(models, coordinator_model, coordinator_effort, count):
-    """The team of ``count`` members: [{"member", "model", "effort", "modelLabel", "program", "connection"}].
+def team_members(models, model, effort, count):
+    """``count`` seats: [{"member", "model", "effort", "modelLabel", "program", "connection"}], numbered from 1.
 
-    ``models`` is the Subagent models setting (validated_team()); None gives every member the coordinator's model
-    and reasoning effort.
+    ``models`` is a list of {"model", "effort"}, one per seat, or None: every seat runs ``model`` with ``effort``
+    (the examiner's seat runs the author's).
     """
 
-    chosen = models if models is not None else [{"model": coordinator_model, "effort": coordinator_effort}] * count
+    chosen = models if models is not None else [{"model": model, "effort": effort}] * count
     return [{"member": number, "model": entry["model"], "effort": entry["effort"], **member_description(entry["model"])}
             for number, entry in enumerate(chosen, 1)]
 
 
-def team_note(template, members, render):
-    """The team note (the team_note text with {members}, one line per member) for the coordinator's first prompt."""
-
-    lines = "\n".join(f"- member {item['member']}: {item['modelLabel']} ({item['program']})" for item in members)
-    return render(template, {"members": lines})
-
-
-_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-
-
-def _uuid(value):
-    """Whether ``value`` is a canonical UUID (a CLI session id)."""
-
-    return isinstance(value, str) and bool(_UUID.fullmatch(value))
-
-
 def _excerpt(text, limit=600):
     """``text`` on one line, cut to about ``limit`` characters keeping its start and its end: a CLI's error often
-    begins with harmless warnings and names its cause last (20 Nov 2026: a coordinator shown only the first 300
-    characters saw a configuration warning and guessed the wrong cause of a failed follow-up)."""
+    begins with harmless warnings and names its cause last."""
 
     text = " / ".join(line.strip() for line in str(text).strip().splitlines() if line.strip())
     if len(text) <= limit:
@@ -232,40 +125,15 @@ def _excerpt(text, limit=600):
     return f"{text[:head].rstrip()} … {text[-(limit - head):].lstrip()}"
 
 
-def _task_line(text):
-    line = next((line.strip() for line in str(text or "").splitlines() if line.strip()), "")
-    return line if len(line) <= TASK_CHARS else line[:TASK_CHARS - 1].rstrip() + "…"
-
-
-def _clock(seconds):
-    """A wall-clock time for team_members: "14:05 UTC"."""
-
-    return time.strftime("%H:%M UTC", time.gmtime(seconds))
-
-
 def _text_result(text, error=False):
     return {"content": [{"type": "text", "text": str(text)}], "isError": bool(error)}
-
-
-def report_shares(lengths, budget=REPORT_CHARS):
-    """How many characters of each report (``lengths``) one team_wait answer shows: all of them within ``budget``.
-
-    Every report gets an equal share; the room a shorter report leaves goes to the longer ones.
-    """
-
-    shares, left = [0] * len(lengths), budget
-    order = sorted(range(len(lengths)), key=lambda index: lengths[index])
-    for position, index in enumerate(order):
-        shares[index] = min(lengths[index], left // (len(order) - position))
-        left -= shares[index]
-    return shares
 
 
 class Service:
     """The runner's end of TCS Prover's MCP server: a local listener that runs the tools the bridge forwards.
 
-    Providers (GoalTool, Team) register their tools with add(); a tool name is served by the provider that added
-    it last, and remove() takes a provider's tools away again (a later attempt of the author registers anew). Each
+    Providers (GoalTool) register their tools with add(); a tool name is served by the provider that added it
+    last, and remove() takes a provider's tools away again (a later attempt of the author registers anew). Each
     connection carries one request line {"token", "method": "tools/list" | "tools/call", "params"} and gets one
     answer line: {"result": ...} or {"error": text}. A request without the token is refused and closed.
     """
@@ -359,12 +227,10 @@ class Service:
         Its tools are direct tools of every model: never deferred and never inside code mode (omit_tools_from
         "deferred" and "code_mode"). Codex 0.160 defers every MCP tool of a model that supports tool search (GPT 6.1
         Sol and GPT 5.5 among them): the model then sees neither the tools nor their descriptions up front, only a
-        code-mode model's hint to search ALL_TOOLS, or a direct model's tool_search tool. A code-mode model (GPT
-        6.x) would call them from a script of its exec tool (tools.mcp__tcs__<name>), whose cell yields after 30 s,
-        so a running team_wait took a model call of Codex's wait tool every few seconds (16 for a wait of 200 s).
-        Omitted from both, every model gets the namespace mcp__tcs, each tool under its own name (update_goal,
-        team_wait, ...), and calls a tool directly, one model call however long the tool runs (captured with the
-        real Codex against a scripted model server).
+        code-mode model's hint to search ALL_TOOLS, or a direct model's tool_search tool; a code-mode model (GPT
+        6.x) would call them from a script of its exec tool (tools.mcp__tcs__<name>). Omitted from both, every model
+        gets the namespace mcp__tcs, each tool under its own name (update_goal), and calls a tool directly (captured
+        with the real Codex against a scripted model server).
         """
 
         names = self.names()
@@ -372,56 +238,6 @@ class Service:
                 "required": True, "tool_timeout_sec": TOOL_TIMEOUT_SECONDS, "enabled_tools": names,
                 "omit_tools_from": ["deferred", "code_mode"],
                 "tools": {name: {"approval_mode": "approve"} for name in names}}
-
-    def claude_config(self):
-        """The --mcp-config of a Claude Code CLI with this server: an "sdk" server, which the runner answers itself.
-
-        Claude Code 2.1.289 drops every --mcp-config server but an "sdk" one under --safe-mode, which every Claude
-        process gets (claude_cli.command_arguments()), so a stdio server (the bridge) would never start. For an
-        "sdk" server the CLI writes each MCP message as a control request {"subtype": "mcp_message", "server_name",
-        "message"} on its stream-json output and takes the answer from a control response {"mcp_response": ...}
-        on its input (claude_cli.goal_session() answers them with answer()). "timeout" is the CLI's limit for one
-        tool call, in ms (the CLI then cancels the call); the CLI has no idle limit for such a server. "alwaysLoad"
-        keeps its tools in every request, never deferred behind Claude Code's tool search (whose own tool the
-        coordinator does not get). All verified against the 2.1.289 binary.
-        """
-
-        return {"mcpServers": {SERVER_NAME: {"type": "sdk", "name": SERVER_NAME,
-                                             "timeout": TOOL_TIMEOUT_SECONDS * 1000, "alwaysLoad": True}}}
-
-    def answer(self, message):
-        """The JSON-RPC answer to one MCP message of a Claude Code CLI (claude_config()), or None for a notification.
-
-        As the bridge (runner/tcs_mcp.py) answers Codex: initialize and ping here, tools/list and tools/call from the
-        tools of this service. A tools/call runs the tool here and may take as long as it does (a team_wait), so the
-        caller answers each one on a thread of its own. The initialize answer carries no "instructions": Claude Code
-        shows a server's instructions to the model in its context (2.1.289), and every text the model reads from this
-        server is an editable tool or argument description.
-        """
-
-        if not isinstance(message, dict) or not isinstance(message.get("method"), str):
-            if isinstance(message, dict) and "id" in message:
-                return {"jsonrpc": "2.0", "id": message.get("id"),
-                        "error": {"code": -32600, "message": "Invalid request."}}
-            return None
-        if "id" not in message:
-            return None  # A notification (initialized, cancelled): nothing to answer.
-        request_id, method = message["id"], message["method"]
-        params = message.get("params") if isinstance(message.get("params"), dict) else {}
-        if method == "initialize":
-            requested = params.get("protocolVersion")
-            return {"jsonrpc": "2.0", "id": request_id, "result": {
-                "protocolVersion": requested if requested in tcs_mcp.VERSIONS else tcs_mcp.VERSIONS[-1],
-                "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": SERVER_NAME, "version": "1.0.0"}}}
-        if method == "ping":
-            return {"jsonrpc": "2.0", "id": request_id, "result": {}}
-        if method == "tools/list":
-            return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": self.definitions()}}
-        if method == "tools/call":
-            return {"jsonrpc": "2.0", "id": request_id,
-                    "result": self.call(params.get("name"), params.get("arguments") or {})}
-        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Method not found."}}
 
     def close(self):
         self._closed.set()
@@ -437,7 +253,7 @@ class Service:
 
 
 class GoalTool:
-    """update_goal of a Codex author or coordinator under TCS Prover's goal loop (workflow_runner.goal_session()).
+    """update_goal of a Codex author under TCS Prover's goal loop (workflow_runner.goal_session()).
 
     ``prompts`` holds its descriptions (goal_tool_update_goal and its arguments'), ``emit(kind, **fields)`` records,
     ``objective()`` and ``elapsed()`` give what its answer reports. take() returns and clears the status of the
@@ -487,41 +303,35 @@ class _Member:
         self.assignment = None
         self.thread, self.cancel, self.process = None, threading.Event(), None
         self.stop_reason = None
-        # The member's last conversation, which team_followup continues: {"session", "harness"}, or None.
+        # The seat's last conversation: {"session", "harness"}, or None.
         self.conversation = None
 
 
 class Team:
-    """The author coordinator's team members and its tools (TEAM_TOOLS).
+    """The author's examiner: its seat, its examinations and their reports.
 
-    ``members`` is team_members(); ``attempt(member, prompt, conversation, process)`` runs one attempt of an
-    assignment and returns the member's final reply (workflow_runner.member_attempt(); ``conversation`` is a
-    MemberConversation, ``process(popen)`` registers the CLI so that a stop can end it). A failed attempt is retried
-    every ``retry_seconds`` without limit, continuing the member's conversation when the attempt worked in it,
-    unless ``configuration(error, member)`` names a failure that ends the assignment at once (a setting the member
-    cannot work with, as text, or a Refusal): it is reported to the coordinator and the member becomes idle. The
-    report says "The assignment failed: <the text>", or for a Refusal (the member's API connection refused the
-    request) REFUSED_REPORT, which quotes the service's words and asks the coordinator to keep the work going.
-    ``emit(kind, **fields)`` records (each record of an assignment with its id, assignment_id(), which ``attempt``
-    finds as ``member.assignment``; a failed attempt's note carries the failure in plain words and the provider's
-    own, ``describe(error)``, and when it is retried); ``directory`` is the shared working folder, where reports are
-    saved. close() stops every member (each record says why) and ends every wait.
+    ``members`` is empty and ``lone`` true (a lone author's examiner, start_team(lone=True)): the author has no
+    other seats. ``examiner`` is the seat (team_members()); without the team_examiner text of ``prompts`` (the
+    author_examiner text, which start_team() passes under that name) there is none. ``attempt(member, prompt,
+    conversation, process)`` runs one attempt of an examination and returns the examiner's final reply
+    (workflow_runner.member_attempt(); ``conversation`` is a MemberConversation, ``process(popen)`` registers the
+    CLI so that a stop can end it). A failed attempt is retried every ``retry_seconds`` without limit, continuing its
+    conversation when the attempt worked in it, unless ``configuration(error, member)`` names a failure that ends the
+    examination at once (a setting the examiner cannot work with, as text): its report then says "The assignment
+    failed: <the text>". ``emit(kind, **fields)`` records (each record of an examination with its id,
+    assignment_id(), which ``attempt`` finds as ``member.assignment``; a failed attempt's note carries the failure in
+    plain words and the provider's own, ``describe(error)``, and when it is retried); ``directory`` is the author's
+    working folder, where reports are saved. examine() starts an examination, take_reports() collects the reports
+    that finished, close() stops the examiner (its record says why).
     """
 
     def __init__(self, members, *, prompts, directory, attempt, configuration, emit, render, retry_note,
                  retry_seconds=60, stop_process=None, conversation=None, discard=None, unavailable=None,
-                 describe=None, examiner=None, lone=False):
+                 describe=None, examiner=None, lone=True):
         self.members = {entry["member"]: _Member(entry) for entry in members}
-        # The examiner's seat (an entry like a member's, numbered after the members), or None: without the
-        # team_examiner text there is none. The coordinator's tools cannot address it.
         self.examiner = (_Member(examiner) if examiner and str(prompts.get("team_examiner") or "").strip()
                          and examiner["member"] not in self.members else None)
-        # A lone author's examiner (no members, no coordinator): examine() starts an examination whenever it is called
-        # (goal_session calls it when the author's conversation is compacted) and the last one has ended, whatever is
-        # reported; take_reports() collects their reports.
         self.lone = lone
-        self.examined = 0.0   # time.time() as the last examination began
-        self.reported = False  # an author of this team has finished an assignment
         self.prompts, self.directory = prompts, Path(directory)
         self.attempt, self.configuration, self.emit, self.render = attempt, configuration, emit, render
         self.retry_note, self.retry_seconds = retry_note, retry_seconds
@@ -531,99 +341,15 @@ class Team:
         # Whether a failure says that the conversation the attempt continued is gone.
         self.unavailable = unavailable or (lambda error: False)
         # A failed attempt in plain words and the provider's own line (workflow_runner.describe_failure()): the server
-        # lists a member whose model calls keep failing the same way under Needs your attention (ui/server.py
+        # lists an examiner whose model calls keep failing the same way under Needs your attention (ui/server.py
         # App._follow_failures()).
         self.describe = describe or (lambda error: ((str(error).strip().splitlines() or [type(error).__name__])[0], ""))
         self.cond = threading.Condition()
         self.done = deque()
-        self.attention_reason = None  # (reason, time.monotonic()) of the latest attention
-        # Raised by release_waits(): a team_wait that began before ends without taking a report or an attention.
-        self.wait_generation = 0
         self.closed = None
-        # The authors close() stopped mid-assignment: {member, task, report}; carried over by carry().
-        self.interrupted = []
-
-    # The tools, as the coordinator's CLI lists them.
-    def tools(self):
-        p = self.prompts
-
-        def member(name):
-            return {"type": "integer", "minimum": 1, "maximum": len(self.members), "description": p[name]}
-
-        def schema(properties, required):
-            return {"type": "object", "additionalProperties": False, "required": required, "properties": properties}
-
-        return [
-            {"name": "team_members", "description": p["team_tool_members"], "inputSchema": schema({}, [])},
-            {"name": "team_assign", "description": p["team_tool_assign"], "inputSchema": schema({
-                "member": member("team_tool_assign_member"),
-                "assignment": {"type": "string", "description": p["team_tool_assign_assignment"]}},
-                ["member", "assignment"])},
-            {"name": "team_wait", "description": p["team_tool_wait"] + (
-                " " + p["team_examiner_note"].strip()
-                if self.examiner is not None and str(p.get("team_examiner_note") or "").strip() else ""),
-             "inputSchema": schema({
-                "timeout_minutes": {"type": "integer", "minimum": 1, "maximum": WAIT_MINUTES,
-                                    "description": p["team_tool_wait_timeout_minutes"]}}, [])},
-            {"name": "team_followup", "description": p["team_tool_followup"], "inputSchema": schema({
-                "member": member("team_tool_followup_member"),
-                "message": {"type": "string", "description": p["team_tool_followup_message"]}},
-                ["member", "message"])},
-            {"name": "team_stop", "description": p["team_tool_stop"], "inputSchema": schema({
-                "member": member("team_tool_stop_member")}, ["member"])},
-        ]
-
-    def call(self, name, arguments):
-        if name == "team_members":
-            return self.listing()
-        if name == "team_assign":
-            return self.assign(self._number(arguments.get("member")), arguments.get("assignment"))
-        if name == "team_wait":
-            return self.wait(arguments.get("timeout_minutes", WAIT_MINUTES))
-        if name == "team_followup":
-            return self.followup(self._number(arguments.get("member")), arguments.get("message"))
-        if name == "team_stop":
-            return self.stop(self._number(arguments.get("member")))
-        raise TeamError(f"Unknown tool {str(name)[:80]!r}.")
-
-    def _number(self, value):
-        if isinstance(value, str) and value.strip().isdigit():
-            value = int(value.strip())
-        if isinstance(value, bool) or not isinstance(value, int) or value not in self.members:
-            raise TeamError(f"There is no member {str(value)[:20]}; the members are 1 to {len(self.members)}.")
-        return value
-
-    def _state_line(self, member):
-        if member.state == "idle":
-            state = "idle"
-        elif member.state == "stopping":
-            state = "stopping"
-        else:
-            state = f'working on "{member.task}" since {_clock(member.since)}'
-        return f"member {member.number}: {member.label} ({member.program}): {state}"
-
-    def listing(self):
-        with self.cond:
-            lines = [self._state_line(member) for member in self.members.values()]
-            if self.examiner is not None:
-                seat = self.examiner
-                state = ("idle" if seat.state == "idle" else "stopping" if seat.state == "stopping"
-                         else f"examining the run since {_clock(seat.since)}")
-                lines.append(f"examiner: {seat.label} ({seat.program}): {state}")
-            return "\n".join(lines)
 
     def running(self):
         return sum(1 for member in self.members.values() if member.state != "idle")
-
-    def busy(self):
-        """Members working on an assignment plus reports finished and not yet collected with team_wait.
-
-        The coordinator's "without a team call" warning reads it (workflow_runner.CoordinatorWatch): a report that
-        waits for team_wait is work of the team the coordinator should collect, not work it does alone.
-        """
-
-        with self.cond:
-            return self.running() + len(self.done)
 
     def _record(self, member, state, text, **fields):
         self.emit("status", label=MEMBER_LABELS[state], authorSubagent=True,
@@ -632,54 +358,14 @@ class Team:
                   subagentModel=member.label, text=text,
                   **({"subagentExaminer": True} if member is self.examiner else {}), **fields)
 
-    def assign(self, number, assignment, fork_from=None, kind="assignment"):
-        if not isinstance(assignment, str) or not assignment.strip():
-            raise TeamError(f"The {kind} is empty; write what member {number} should do.")
-        with self.cond:
-            if self.closed is not None:
-                raise TeamError(f"The team has stopped: {self.closed}")
-            member = self.members[number]
-            if member.state != "idle":
-                raise TeamError(f"Member {number} is {'stopping' if member.state == 'stopping' else 'working'}"
-                                f" on \"{member.task}\"; wait for its report, or stop it with team_stop first.")
-            member.state, member.task, member.since = "working", _task_line(assignment), time.time()
-            # Numbered after every report of the member in the working folder: each runner of a job (after a pause
-            # and resume, a restart, a resume after the time limit) has a team of its own, whose assignments must
-            # never take an earlier one's numbers, its report files and its rows on the job page.
-            member.count = max(member.count, highest_report(self.directory, number)) + 1
-            # Fixed until this assignment's report: a new one starts only when the member is idle again.
-            member.assignment = assignment_id(number, member.count)
-            try:
-                # Its report file, empty until the report: the number stays taken if the runner ends first.
-                reserve_report(self.directory, number, member.count)
-            except (OSError, ValueError):
-                pass  # The report is saved, or why it could not be, when the assignment ends.
-            member.cancel, member.stop_reason, member.process = threading.Event(), None, None
-            prompt = self.render(self.prompts["team_member"], {"assignment": assignment})
-            member.thread = threading.Thread(target=self._run, args=(member, member.count, prompt, fork_from),
-                                             name=f"team-member-{number}", daemon=True)
-            self._record(member, "started", member.task)
-            member.thread.start()
-            self._timeline(f"member {number}: {kind} {member.assignment} starts", assignment)
-            self._examine()
-        return (f"Member {number} started the {kind} \"{member.task}\" at {_clock(member.since)}. Collect its report "
-                "with team_wait.")
-
     def _examine(self):
-        """Start an examination when one is due: a team's EXAMINATION_SECONDS after the last one began, a lone
-        author's whenever examine() asks; called with the lock held. True when one started."""
+        """Start an examination unless one is running or the examiner has stopped; called with the lock held. True
+        when one started."""
 
         seat = self.examiner
         if seat is None or self.closed is not None or seat.state != "idle":
             return False
-        if not self.lone:
-            if time.time() - self.examined < EXAMINATION_SECONDS or not self.running():
-                return False
-            if not self.reported and not any(reported(self.directory, number) for number in self.members):
-                return False  # Nothing to examine yet: no author has reported.
-            self.reported = True
         seat.state, seat.task, seat.since = "working", EXAMINER_TASK, time.time()
-        self.examined = seat.since
         seat.count = max(seat.count, highest_report(self.directory, seat.number)) + 1
         seat.assignment = assignment_id(seat.number, seat.count)
         try:
@@ -695,7 +381,7 @@ class Team:
         return True
 
     def _timeline(self, head, body=""):
-        """Add an entry to team/timeline.md, which the examiner reads (only with an examiner; best effort)."""
+        """Add an entry to team/timeline.md, which the examiner reads (best effort)."""
 
         if self.examiner is None:
             return
@@ -705,103 +391,24 @@ class Team:
         except (OSError, ValueError):
             pass
 
-    def followup(self, number, message):
-        with self.cond:
-            member = self.members[number]
-            if member.state != "idle":
-                raise TeamError(f"Member {number} is working on \"{member.task}\"; wait for its report, or stop it "
-                                "with team_stop first.")
-            conversation = member.conversation
-        if not conversation or not conversation.get("session"):
-            raise TeamError(f"Member {number} has no conversation that can be continued (it has had no assignment, "
-                            "or its last one did not start a conversation); give it a new assignment with "
-                            "team_assign.")
-        return self.assign(number, message, fork_from=conversation, kind="follow-up")
-
-    def stop(self, number):
-        with self.cond:
-            member = self.members[number]
-            if member.state == "idle":
-                raise TeamError(f"Member {number} is idle; there is nothing to stop.")
-            member.state, member.stop_reason = "stopping", "The coordinator stopped it with team_stop."
-            member.cancel.set()
-            process = member.process
-        if process is not None:
-            self.stop_process(process)
-        return f"Member {number} is stopping; its report, which says it was stopped, comes with team_wait."
-
-    def wait(self, minutes):
-        if isinstance(minutes, str) and minutes.strip().isdigit():
-            minutes = int(minutes.strip())
-        if isinstance(minutes, bool) or not isinstance(minutes, (int, float)) or not 1 <= minutes <= WAIT_MINUTES:
-            raise TeamError(f"timeout_minutes must be 1 to {WAIT_MINUTES}.")
-        deadline = time.monotonic() + minutes * 60
-        with self.cond:
-            self._examine()
-            generation = self.wait_generation
-            if self.attention_reason is not None and time.monotonic() - self.attention_reason[1] > ATTENTION_SECONDS:
-                self.attention_reason = None  # It reached the coordinator before this wait began.
-            while True:
-                if self.wait_generation != generation:
-                    # Its caller's attempt ended (release_waits()): what it would take is the next attempt's.
-                    return RELEASED_WAIT
-                if self.done:
-                    reports = list(self.done)
-                    self.done.clear()
-                    shares = report_shares([len(report["text"]) for report in reports])
-                    return "\n\n".join(_report_text(report, share) for report, share in zip(reports, shares))
-                if self.closed is not None:
-                    return f"The team has stopped: {self.closed}"
-                if self.attention_reason is not None:
-                    reason, self.attention_reason = self.attention_reason[0], None
-                    return (f"The wait ended early: TCS Prover sent you {reason}, which follows this result.\n"
-                            + self.listing())
-                if not self.running():
-                    return ("No member is working and no report is waiting; give a member an assignment with "
-                            "team_assign.\n" + self.listing())
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    return f"No assignment finished within {minutes:g} minutes.\n" + self.listing()
-                self.cond.wait(min(left, 5))
-
     def examine(self):
-        """Start an examination now, unless the last one is still running or the team has stopped (a lone author's
-        examiner, see ``lone``: goal_session calls it when the author's conversation is compacted). True when one
-        started."""
+        """Start an examination now, unless the last one is still running or the examiner has stopped (goal_session
+        calls it when the author's conversation is compacted). True when one started."""
 
         with self.cond:
             return self._examine()
 
     def take_reports(self):
-        """The reports that finished since the last call, each once: {head, where, text, file} (a lone author's
-        examiner, whose reports reach the author instead of a team_wait)."""
+        """The reports that finished since the last call, each once: {head, where, text, file}; they reach the
+        author as author_examiner_report."""
 
         with self.cond:
             reports = list(self.done)
             self.done.clear()
         return reports
 
-    def release_waits(self):
-        """End every running team_wait without taking a report or an attention, and leave the team working.
-
-        The coordinator's attempt that called them ended in a failed model call, its CLI with it; the next attempt
-        of the same coordinator collects the reports with a team_wait of its own (goal_session's cleanup calls this
-        when it keeps the team for that attempt).
-        """
-
-        with self.cond:
-            self.wait_generation += 1
-            self.cond.notify_all()
-
-    def attention(self, reason):
-        """End a running team_wait early: TCS Prover sends the coordinator ``reason`` (a live instruction, ...)."""
-
-        with self.cond:
-            self.attention_reason = (reason, time.monotonic())
-            self.cond.notify_all()
-
     def close(self, reason):
-        """Stop every member (each one's record says ``reason``) and end every wait; the team takes no more work."""
+        """Stop the examiner (its record says ``reason``); it takes no more work."""
 
         with self.cond:
             if self.closed is not None:
@@ -809,9 +416,6 @@ class Team:
             self.closed = reason
             working = [member for member in (*self.members.values(), *filter(None, [self.examiner]))
                        if member.state != "idle"]
-            self.interrupted = [{"member": member.number, "task": member.task,
-                                 "report": f"{TEAM_FOLDER}/member-{member.number}/{report_name(member.count)}"}
-                                for member in working if member is not self.examiner]
             for member in working:
                 member.state, member.stop_reason = "stopping", reason
                 member.cancel.set()
@@ -823,56 +427,6 @@ class Team:
             if member.thread is not None:
                 member.thread.join(timeout=10)
         self.discard()
-
-    def carry(self):
-        """What a paused run keeps of this team for its next runner (TEAM_CARRY in the workflow state, which TCS Prover
-        saves with the pause and gives back on resume): each author's last conversation, so that team_followup
-        continues it after a pause or a restart of TCS Prover, and the assignments close() stopped. None when there
-        is nothing to keep."""
-
-        with self.cond:
-            conversations = {str(member.number): {**member.conversation, "program": member.program}
-                             for member in self.members.values()
-                             if member.conversation and member.conversation.get("session")}
-            interrupted = list(self.interrupted)
-        if not conversations and not interrupted:
-            return None
-        return {"conversations": conversations, "interrupted": interrupted}
-
-    def restore(self, saved):
-        """Take over what carry() kept of the previous runner's team: each author's last conversation (for the same
-        member number and program), and a note for the next team_wait on each assignment that the pause stopped
-        (INTERRUPTED_REPORT)."""
-
-        if not isinstance(saved, dict):
-            return
-        conversations = saved.get("conversations") if isinstance(saved.get("conversations"), dict) else {}
-        interrupted = saved.get("interrupted") if isinstance(saved.get("interrupted"), list) else []
-        with self.cond:
-            for key, value in conversations.items():
-                member = self.members.get(int(key)) if str(key).isdigit() else None
-                if (member is None or not isinstance(value, dict) or not _uuid(value.get("session"))
-                        or value.get("program") != member.program or member.conversation):
-                    continue
-                member.conversation = {"session": value["session"].lower(), "harness": value.get("harness")}
-            for entry in interrupted:
-                member = (self.members.get(entry.get("member")) if isinstance(entry, dict)
-                          and isinstance(entry.get("member"), int) else None)
-                if member is None:
-                    continue
-                task = str(entry.get("task") or "")[:300]
-                report = str(entry.get("report") or "")
-                if not re.fullmatch(rf"{TEAM_FOLDER}/member-{member.number}/[0-9]+-report\.md", report):
-                    report = ""
-                resumable = bool(member.conversation)
-                self.done.append({
-                    "head": f"Member {member.number} ({member.label}) was stopped on the assignment \"{task}\" when "
-                            "the run paused.",
-                    "where": f"Report file: {report}" if report else "No report file was saved.",
-                    "text": INTERRUPTED_REPORT if resumable else INTERRUPTED_FRESH_REPORT,
-                    "file": report or None,
-                })
-            self.cond.notify_all()
 
     def _register(self, member, cancel):
         def process(popen):
@@ -898,7 +452,7 @@ class Team:
                 reply = self.attempt(member, instruction, conversation, self._register(member, cancel))
                 if not cancel.is_set():
                     break
-            except Exception as exc:  # noqa: BLE001 - every failure is the member's, reported or retried.
+            except Exception as exc:  # noqa: BLE001 - every failure is the examiner's, reported or retried.
                 if not cancel.is_set() and self.unavailable(exc) and base is not fork_from:
                     # The conversation a retry continued is gone: the assignment runs again from its start.
                     base, instruction = fork_from, prompt
@@ -956,9 +510,6 @@ class Team:
             reason = member.stop_reason or "It was stopped."
             text = STOPPED_REPORT.format(reason=reason) + (f"\n\n{reply}" if reply else "")
             state, failure = "failed", reason
-        elif isinstance(failure, Refusal):
-            text, state = REFUSED_REPORT.format(member=member.number, reason=failure.reason), "failed"
-            failure = failure.text  # The member's record keeps the failure's own words.
         elif failure:
             text, state = f"The assignment failed: {failure}", "failed"
         else:
@@ -969,18 +520,13 @@ class Team:
             member.state, member.process, member.thread = "idle", None, None
             closing = self.closed is not None
             outcome = "stopped" if stopped else "failed" if state == "failed" else "finished"
-            if member is self.examiner:
-                head = (f"The examiner ({member.label}) {outcome} its examination of the whole run."
-                        if state == "finished" else f"The examiner's ({member.label}) examination {outcome}.")
-            else:
-                head = f"Member {member.number} ({member.label}) {outcome} the assignment \"{member.task}\"."
-                self.reported = self.reported or state == "finished"
-            self._timeline((f"examiner: examination {member.assignment}" if member is self.examiner
-                            else f"member {member.number}: {member.assignment}")
-                           + f" {outcome}" + (f"; report: {relative}" if path else ""))
+            head = (f"The examiner ({member.label}) {outcome} its examination of the whole run."
+                    if state == "finished" else f"The examiner's ({member.label}) examination {outcome}.")
+            self._timeline(f"examiner: examination {member.assignment} {outcome}"
+                           + (f"; report: {relative}" if path else ""))
             where = f"Report file: {relative}" if path else f"The report could not be saved ({problem})."
             if not closing:
-                # Shown by the next team_wait, cut to its share of the answer (report_shares()).
+                # Collected by take_reports(), for the author.
                 self.done.append({"head": head, "where": where, "text": text, "file": relative if path else None})
             self._record(member, state, (failure if state == "failed" else member.task)[:2000] or member.task,
                          **({"subagentReport": relative} if path else {}))
@@ -993,16 +539,6 @@ class Team:
             return save_report(self.directory, number, count, text), ""
         except (OSError, ValueError) as exc:
             return None, str(exc)
-
-
-def _report_text(report, share):
-    """One report of a team_wait answer: what it is, where it is saved, and its text cut at ``share`` characters."""
-
-    text = report["text"]
-    if len(text) > share:
-        where = f"the whole report is in {report['file']}" if report["file"] else "it could not be saved"
-        text = text[:share] + f"\n[The report is cut here at {share:,} characters; {where}.]"
-    return f"{report['head']}\n{report['where']}\nREPORT:\n{text}"
 
 
 def report_name(count):
@@ -1101,21 +637,6 @@ def highest_report(directory, number):
     except (OSError, ValueError):
         return 0
     return max((int(found.group(1)) for found in map(REPORT_FILE.fullmatch, names) if found), default=0)
-
-
-def reported(directory, number):
-    """Whether member ``number`` has a report file with text under ``directory`` (a reservation is empty)."""
-
-    folder = Path(directory, TEAM_FOLDER, f"member-{number}")
-    try:
-        for name in os.listdir(folder):
-            if REPORT_FILE.fullmatch(name):
-                info = os.lstat(folder / name)
-                if stat.S_ISREG(info.st_mode) and info.st_size > 0:
-                    return True
-    except OSError:
-        pass
-    return False
 
 
 def append_timeline(directory, text):

@@ -19,6 +19,7 @@ import shutil
 import threading
 from urllib.parse import parse_qs, urlencode, urlsplit
 
+from . import page_files
 from .local_host import same_origin, trusted_host
 
 
@@ -37,21 +38,21 @@ MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 BATCH_WORKS_ROUTES = {'/batch-related-works', '/batch-related-works/add'}
 # Actions the earlier controller does not have.
 UPDATED_CONTROL_ROUTES = {'/related-works/add', '/ask-author', '/author-summary', '/stop-author-reply',
-                          '/answer-author-question', '/dismiss-author-question', '/chat'}
+                          '/answer-author-question', '/dismiss-author-question', '/chat', '/new-goal'}
 LEGACY_UNSUPPORTED = 'This job belongs to the earlier controller, which does not support this action.'
 MAX_DISCARDED_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_RESPONSE_BYTES = 128 * 1024 * 1024
 GET_TIMEOUT_SECONDS = 15
 POST_TIMEOUT_SECONDS = 600
 BATCH_TIMEOUT_SECONDS = 1800
-STATIC = {'/': ('index.html', 'text/html; charset=utf-8'),
-          '/app.js': ('app.js', 'text/javascript; charset=utf-8'),
-          '/styles.css': ('styles.css', 'text/css; charset=utf-8'),
-          '/favicon.svg': ('favicon.svg', 'image/svg+xml')}
+# The page's files, as the controller sends them (ui/page_files.py).
+STATIC = page_files.PAGE_FILES
 GET_ROUTES = {'/batches': set(), '/jobs': set(), '/state': {'job', 'after'},
               '/transcript': {'job'}, '/download-proof': {'job'}, '/download-source': {'job'},
               '/download-tex': {'job'}, '/download-pdf': {'job'}, '/download-critic-diff': {'job', 'file'},
-              '/chat-answer': {'job', 'id'}, '/progress-log': {'job'}}
+              '/chat-answer': {'job', 'id'}, '/current-proof': {'job'}, '/goal-file': {'job', 'goal', 'name'},
+              # The author's memory: its files, one as text, one whole (a saved batch offers no download).
+              '/memory-files': {'job'}, '/memory-file': {'job', 'path'}, '/memory-file/download': {'job', 'path'}}
 CREATE_ROUTES = {'/review', '/direct', '/direct-batch', '/finalize', '/start-workflow'}
 CONTROL_ROUTES = {'/delete-job', '/resume', '/resume-critic',
                   '/resume-checkpoint', '/continue-stopped', '/approve', '/solve',

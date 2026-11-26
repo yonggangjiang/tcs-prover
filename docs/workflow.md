@@ -54,30 +54,28 @@ role's model and reasoning (see [Models and API connections](models.md)) and:
 Jobs run in parallel, each in its own folder under `runs/`.
 
 **Prompts.** Every text the workflow sends its models can be edited for the
-next job: the role prompts, the author's and the coordinator's lifecycle
-prompts, the [goal loop](#the-goal-loop)'s texts and the
-[team](#the-authors-team)'s texts and tool descriptions. They live in
-`workflows/author_critic.yaml` (the LaTeX editor's in `workflows/clean_up.yaml`,
-the statement reviewer's in TCS Prover), each with a comment saying when it is
-used and its placeholders. New jobs read them when they start, so an edit of the
-file applies to the next job without a restart. An edit that cannot be read
-leaves the last readable version in use, with a warning on the job page, until
-the file is fixed.
+next job: the role prompts, the author's lifecycle prompts, the
+[examiner](#the-examiner)'s texts and the [goal loop](#the-goal-loop)'s texts
+and tool descriptions. They live in `workflows/author_critic.yaml` (the LaTeX
+editor's in `workflows/clean_up.yaml`, the statement reviewer's in TCS Prover),
+each with a comment saying when it is used and its placeholders. New jobs read
+them when they start, so an edit of the file applies to the next job without a
+restart. An edit that cannot be read leaves the last readable version in use,
+with a warning on the job page, until the file is fixed.
 
 - **Edit prompts** (also **Prompts** in the sidebar) lists every text, grouped
-  by where it is used: Statement review, Author, Coordinator, Goal loop, Team,
-  Team tools, Critic and Writer. **Search texts** finds a text by its name, its
-  use or its wording; groups open and close, and the arrow keys move through the
-  list. Each text shows when it is used, its placeholders (such as
+  by where it is used: Statement review, Author, Goal loop, Critic and Writer.
+  **Search texts** finds a text by its name, its use or its wording; groups open
+  and close, and the arrow keys move through the list. Each text shows when it is used, its placeholders (such as
   `{objective}`, or `[STATEMENT]` where the statement goes) and its default; an
   edited one is marked **edited**, and its group says how many are.
 - **Apply to the next job** checks every edited text as TCS Prover checks it
   when a job starts, and shows a problem on its text: a text with placeholders
   may use only those, with any other brace written twice (`{{` and `}}`); a text
   with `[STATEMENT]` keeps exactly one; no text may be empty except the Codex
-  compaction summary, whose empty default leaves Codex's own. The progress
-  summaries (**Progress summary**, **Coordinator progress summary**) have no
-  placeholders but are filled in like the others, so a brace is written twice
+  compaction summary, whose empty default leaves Codex's own, and the examiner
+  instructions (empty: no examiner). The **Progress summary** has no
+  placeholders but is filled in like the others, so a brace is written twice
   there too, and **Reply to a message** has only `{message}`; any other text
   without placeholders (a tool description, **Related works**) is sent as
   written, braces included. The
@@ -136,21 +134,18 @@ with one fewer: the author's own subagents, 0 to 10):
   conversation is compacted from time to time, and what is not written down is
   lost). Its goal, continuation, reopen, resume and repair prompts only say to
   keep working on the same statement and, where they ask for the proof, how to
-  hand it in.
+  hand it in. The goal names "your current task", since a finished job can
+  continue with a new goal: then the `new_goal` prompt reopens the author's
+  conversation with the new task in full (see
+  [New goal](job-page.md#new-goal)).
 - **2 or more:** the same author, with the same prompt, may also hand parts of
   the work to subagents of its own: its program's subagent tool (Codex's or
   Claude Code's), limited to one fewer than the number at a time, as Codex's
   Ultra mode delegates. The `subagents` text tells it how many it may start.
   The subagents run the author's model.
 
-The earlier team design, the [author coordinator](#the-author-coordinator), is
-no longer what a new job gets: a job runs it only when it asks for it (in the
-terminal, `-teamCoordinator`; in a start request, `authorMode`), and a
-job that started with a coordinator keeps it when it is resumed or continued.
-
-The number, and with it the mode (an author, or the earlier coordinator), is saved when the
-job starts, shown in **Run settings**, and kept by resumes, continuations and
-folder runs. With 2 or more parallel agents the `author` prompt ends with the
+The number is saved when the job starts, shown in **Run settings**, and kept by
+resumes, continuations and folder runs. With 2 or more parallel agents the `author` prompt ends with the
 `subagents` text: "You may start up to N independent subagents at a time, for
 example to explore other approaches or to check calculations; you do not need to
 ask the user." A job saved without the number (from before the setting) runs one
@@ -188,7 +183,7 @@ author without an examiner and without the note.
 
 ### The goal loop
 
-The author, or the author coordinator, works toward one goal, a checked proof of
+The author works toward one goal, a checked proof of
 the statement, in turns. Every new job from the New problem page runs them in
 TCS Prover's goal loop; the form has no setting for it (the
 [terminal](terminal.md)'s `-goalLoop codex` still chooses Codex's own goal
@@ -197,7 +192,7 @@ mode):
 - TCS Prover starts every turn of a Codex CLI author itself (the Codex CLI's
   own goal mode is off). After a turn
   that did not end the goal it sends the next one, the `goal_continuation` text:
-  `{continuation}` is the role's continuation prompt (placed first),
+  `{continuation}` is the author's continuation prompt (placed first),
   `{objective}` the goal, `{elapsed}` the working time and `{limit}` the time
   limit and what is left of it. Its default is the Codex CLI's own continuation
   text (version 0.160), with the working time and the time limit in place of its
@@ -207,8 +202,7 @@ mode):
   `goal_tool_update_goal_status` and `goal_tool_update_goal_note`; their
   defaults are the Codex CLI's). Status *complete* hands the turn's final
   reply on as the answer when the turn ends, as before; a turn without a final
-  reply, and a coordinator's reply that names no proof file (kept as a report),
-  get the continuation instead. *Blocked* or *paused* is recorded
+  reply gets the continuation instead. *Blocked* or *paused* is recorded
   and TCS Prover sends the continuation: it never stops a run for them. Each
   call is a **Goal status** line in the activity log, such as **Goal status ·
   blocked**, with the author's note and what TCS Prover does next.
@@ -225,205 +219,10 @@ mode):
   jobs from before TCS Prover's goal loop and jobs started with it while the
   form still offered the choice: their **Run settings** say *Codex built-in*.
 - A job the form continues (its statement review sent back to the form, revised
-  in place) keeps the goal loop it recorded, never another one. A job from
-  before TCS Prover's goal loop also keeps, for a coordinator, the program's own
-  subagents with the coordinator's model: the form shows **Same as the
-  coordinator** fixed, with a note saying so.
+  in place) keeps the goal loop it recorded, never another one.
 - Anything that starts a new job runs TCS Prover's goal loop, also **Rerun with
   suggested statement** on a job that ran **Codex built-in** and settings saved
-  with it before: a rerun of a job from before TCS Prover's team gets TCS
-  Prover's team, as any new job does.
-
-### The author coordinator
-
-This is the earlier team design, which a job runs only when it asks for it (see
-[the proof author](#the-author)). The coordinator does not try to prove
-the statement itself. Its prompt asks it
-to run the team of author subagents and check the team's health, so that
-progress on the problem grows steadily with the time spent, until the team has
-a complete proof. The authors do the mathematics: it gives them the original
-exact statement and does not decide what each author should solve. How it
-organizes the team and its memory is its own choice, and it uses the
-examiner's reports and the authors' to judge whether to change that.
-
-- **Prompts.** Its first prompt is the per-job `coordinator` prompt, in place of
-  the `author` prompt (**Coordinator prompt** in **Edit prompts → Coordinator**;
-  `{author_subagents}` is the number of author subagents). Its goal, continuation, reopen,
-  compaction, resume, repair and summary prompts are `coordinator_goal`,
-  `coordinator_continuation`, `coordinator_reopen`, `coordinator_compaction`,
-  `coordinator_resume`, `coordinator_repair` and `coordinator_summary`. The goal and the continuation point
-  back to the coordinator prompt in one line (Codex repeats the goal in each of
-  its automatic turns); reopen, compaction, resume and repair repeat the whole
-  first prompt under `ORIGINAL COORDINATOR PROMPT`. `coordinator_report`
-  answers a reply that is not a hand-in (below). The chat prompts, the note on a
-  refused submission and the note on related works are the same as one
-  author's.
-- **Author subagents.** They are [TCS Prover's team](#the-authors-team): N
-  members, each running the model **Subagent models** gives it, to whom the
-  coordinator hands assignments with TCS Prover's team tools. The activity log
-  shows each assignment as **Author subagent started** (with the member's number
-  and model, such as *Author subagent 2 (Claude Opus 5.5) started*, and the
-  first line of the assignment), then **Author subagent finished** or **Author
-  subagent failed** (with the reason when it is known, and the file of its
-  report), with how many run then. These lines stay listed while the members'
-  own events (*Subagent 2 reasoning*, *Subagent 2 tool*) leave the live window.
-  With a web cutoff, and in coordinator jobs from before the team, the
-  subagents are the program's own instead (see
-  [the author's team](#the-authors-team)).
-- **Memory.** When a coordinator run starts, TCS Prover creates a `memory/`
-  folder in the author's working folder, with owner-only permissions where the
-  system has them; what it already holds is never removed or overwritten.
-  The coordinator keeps the team's memory there as it sees fit; its prompt asks
-  it to keep a log of the team's progress in `memory/progress.md`, which the job
-  page shows as the [progress log](job-page.md#progress-log).
-- **Nothing on a schedule.** TCS Prover sends a working coordinator no message
-  of its own at fixed times. What it examines, and when, is for its prompt to
-  say. (Until 15 November 2026 it got an hourly time check with the elapsed
-  time; the activity log of a job from then still shows those lines as
-  **Author coordinator time check**.) The one thing TCS Prover starts by itself
-  is the team's [examiner](#the-authors-team), whose report the coordinator
-  collects like an author's.
-- **Handing in.** A final reply that names no proof file (no `PROOF_FILE`
-  pointer, see below) is not handed to the critic: the activity log shows the
-  reply as the coordinator's own line, then an **Author coordinator report** line
-  that says why it was not handed on (kept listed), and the coordinator gets
-  `coordinator_report`: its reply was kept as a progress report, and a hand-in
-  is the line `PROOF_FILE: proof.md` alone. Where
-  TCS Prover cannot read a proof file (on Windows), the coordinator hands in the
-  proof in its reply, as one author does.
-- **No subagent tool.** With the program's own subagents (a web-cutoff run, or
-  a coordinator job from before the team) and a model that gets no subagent
-  tool (GPT 5.6 Luna, or an Anthropic-format API model in bare mode, see
-  [API connections](models.md#api-connections)), the author of a coordinator
-  job works alone with the `author` prompt instead of coordinating (its progress
-  summaries too), and the activity log, **Run settings** and the place of the
-  progress log say so.
-- **Claude Code**, with its own subagents (a coordinator job from before the
-  team), runs the subagents in the foreground: a live instruction or a chat
-  message reaches a Claude coordinator when its running subagents report. With
-  TCS Prover's team, `team_wait` returns as soon as one arrives.
-- **Progress summaries** (at the time limit, or with **Summarize progress**) use
-  `coordinator_summary`: from the team's memory, what has been verified, what
-  remains open and why, and the most promising next steps. Like every reply of
-  the paused author, the summary is read-only and starts no subagents.
-
-### The author's team
-
-An author coordinator works with a team of N members (N = **Author
-subagents**), run by TCS Prover itself, rather than with the Codex CLI's or
-Claude Code's own subagents.
-
-- **Models.** **Subagent models** (in the Proof author's settings, shown with 1
-  or more author subagents) is **Same as the coordinator** (the default: every
-  member runs the coordinator's model and reasoning) or **Choose for each**: one
-  row per member, *Subagent 1* to *Subagent N*, each with the roles' **Source**,
-  **Model** and **Reasoning** menus (the Codex CLI, Claude Code or any API
-  connection), so one team can mix models. Changing the number of subagents
-  keeps the rows that remain and adds rows set to the coordinator's model. The
-  program of each member's model counts on the [Setup page](models.md#the-setup-page)
-  as a role's does.
-- **Tools.** The coordinator works the team with TCS Prover's tools (its MCP
-  server `tcs`): `team_members` (each member's model and what it is doing),
-  `team_assign` (an assignment for an idle member, returning at once),
-  `team_wait` (the next reports, waiting up to 30 minutes at a time; it returns
-  early for a live instruction or a chat message),
-  `team_followup` (continues a member's last assignment in the same
-  conversation) and `team_stop`. Their descriptions, and their arguments', are
-  the `team_tool_*` texts in **Edit prompts → Team tools**.
-- **Waiting.** The Codex CLI's own instructions ask its model for a commentary
-  update at least every 60 seconds and for no wait longer than 60 seconds. A
-  coordinator that follows them wakes every minute while its team works, and
-  each time its whole conversation goes to the model again. A Codex coordinator
-  therefore also gets a short note after those instructions
-  (`codex_coordinator_note` in **Edit prompts → Coordinator**), which says
-  that neither applies to an unattended run; how long it waits is then its own
-  choice. An empty note sends nothing. Claude Code coordinators, and
-  coordinators without TCS Prover's team, get no note.
-- **The examiner.** A coordinator in a long run was found to hold only part of
-  what the same model finds when examining the run is its only task. The team
-  therefore has one more seat, the examiner, which TCS Prover starts itself:
-  when the coordinator assigns work or waits while an author is working, the
-  examiner is idle, some author has reported before, and the last examination
-  began at least an hour ago. Each examination is a fresh run of the
-  coordinator's model, one turn long, in the same working folder; its whole
-  instruction is `team_examiner` (**Edit prompts → Team**: examine the whole
-  trajectory; judge whether progress towards a complete proof grows steadily
-  with the time spent, what is still missing, and how that has changed since
-  several hours ago and since its own earlier reports; examine the
-  coordination and say what should change in how the team is run, leaving the
-  mathematics to the authors; check whether earlier changes helped). The
-  coordinator's prompt leaves the examination of the whole run to these
-  reports. Its
-  final reply is its report, saved as `team/member-<N+1>/<k>-report.md`, and
-  `team_wait` returns it like an author's report, usually while the author is
-  still working. The coordinator cannot assign or stop the examiner;
-  `team_members` lists it last, and the description of `team_wait` says that it
-  exists (`team_examiner_note`). For the examiner the team keeps
-  `team/timeline.md`: every assignment with its text and every report, with
-  their times. An empty `team_examiner` runs the team without an examiner. A job
-  started before the examiner existed has no text of its own for it, so it
-  takes the workflow file's when it is next resumed, and its timeline starts
-  then. The activity log shows an examination as author subagent N+1 with the
-  task *Examination of the whole run*.
-- **Assignments.** Each is a fresh run of the member's model, one turn long, in
-  the author's working folder (the folder the coordinator works in, with the
-  author's sandbox, network rule and credentials), with no subagents of its own.
-  The member receives the assignment wrapped in `team_member` (by default the
-  assignment, then "Your final reply is your report to the coordinator."), and
-  its final reply is its report, saved as `team/member-<n>/<k>-report.md` in
-  that folder. A failed model call is retried every minute without limit; a
-  setting that cannot work (a program not installed, no sign-in, an unknown
-  model) comes back to the coordinator as a failed assignment with the reason.
-  So does a request that a member's API connection refuses (its endpoint calls
-  the request invalid, says that the model does not exist or that its key
-  cannot use it, or refuses its key), with the service's words; as such a
-  refusal can also be temporary, the report tells the coordinator that it may
-  be a temporary problem of the service or a wrong setting, and to keep the
-  work going by giving the assignment to another member, or to the same member
-  again later. The member's line in the activity log says what failed and ends
-  with the service's words.
-  Pause, Stop, the time limit and a restart stop the members with the
-  coordinator; their files stay. A paused run also keeps each author's last
-  conversation with its saved state (in `pause.json`, which no model can
-  write): when it resumes, the coordinator's next `team_wait` names each
-  assignment that the pause or restart stopped, and `team_followup` continues
-  that member's conversation with everything it did there.
-- **When the coordinator cannot use its team, or does not wait for it.** The
-  job is listed under **Needs your attention** while the work goes on, and the
-  activity log keeps the warning, when the coordinator makes 10 model calls, or
-  works 20 minutes (not counting a team tool that runs, such as a long
-  `team_wait`), without calling any team tool (**Coordinator works without its
-  team**: its requests may reach the model without the team tools, for example
-  through a proxy that drops them; once one of its team tool calls has worked,
-  answered by the team without an error, also before a failed model call
-  restarted its session, its tools reach the model, and the same warning says
-  what it does: while a member works on an assignment, it reads **Coordinator
-  keeps checking on its team instead of waiting**: the coordinator checks on
-  its members between team calls, for example by sleeping and reading their
-  files, instead of waiting with `team_wait`, each check sending its whole
-  conversation to the model again; while no member works, it keeps the title
-  **Coordinator works without its team** and says that the coordinator is doing
-  the work itself instead of giving it to a member); when Codex refuses one of
-  its team tool calls ("unsupported call", **Team tool call refused**); and
-  when a coordinator under TCS Prover's goal loop ends 3 turns with a reply
-  that names its proof file without marking its goal complete (**Proof not
-  handed in**: without `update_goal`'s "complete" the reply is not handed in).
-  Each warning ends by itself, with a **Coordinator warning cleared** line: at
-  the coordinator's next team call, its next team call that reaches the team,
-  its next hand-in, also after a failed model call restarted the coordinator's
-  session. A coordinator without TCS Prover's team (one using its program's own
-  subagents) gets only the **Proof not handed in** warning.
-- **The team note.** `team_note` is added to the coordinator's first prompt,
-  after the related works; `{members}` lists the members, one line each (such as
-  "- member 1: GPT 6.1 Sol (Codex CLI)").
-- **Web cutoff.** A run with a web cutoff keeps the program's own subagents,
-  which run the coordinator's model inside the same cutoff: **Subagent models**
-  stays *Same as the coordinator*, and the form says *With a web cutoff, author
-  subagents use the coordinator's model.* With Codex, the coordinator's
-  delegation hint then asks it to start each subagent fresh with a
-  self-contained assignment, to wait up to 30 minutes at a time and to close
-  finished ones where it can. Coordinator jobs from before the team keep the
-  program's own subagents too.
+  with it before.
 
 ### Handing in a proof
 
@@ -524,29 +323,17 @@ reads them and makes the one decision.
 
 ### Subagents: what the program enforces
 
-Only the critic and, with **Parallel agents** 2 or more, the author (or an
-author coordinator) have subagents; the statement reviewer, the LaTeX writer and the paused author's
-replies have none.
-
-An author coordinator with [TCS Prover's team](#the-authors-team) has exactly
-N members, each working on one assignment at a time (`team_assign` refuses a
-busy member), so at most N assignments run at once; members get no subagent
-tool. The rest of this section is about the programs' own subagents: the
-critic's, and an author's in a web-cutoff run or a job from before the team.
-Checked with Codex 0.160 against a local stand-in for the model API:
+Only the critic and, with **Parallel agents** 2 or more, the author have
+subagents; the statement reviewer, the LaTeX writer, the examiner and the paused
+author's replies have none. These are the programs' own subagents. Checked with
+Codex 0.160 against a local stand-in for the model API:
 
 | Codex setting | What it enforces |
 | --- | --- |
 | `features.multi_agent_v2.max_concurrent_threads_per_session` = N + 1 | Version-2 models (GPT 6.x, GPT 5.6 Sol and Terra): at most N subagents at once, counting subagents of subagents ("agent thread limit reached"). A call without subagents gets N = 0: with `multi_agent` off Codex still lists its collaboration tools to these models, unless `agents.enabled` is false (below). |
 | `agents.max_concurrent_threads_per_session` = N, `agents.max_depth` = 1 | Version-1 models (API models and others): at most N subagents at once, and subagents get no subagent tool. |
-| `features.multi_agent_v2.multi_agent_mode_hint_text` | Replaces Codex's "Do not spawn sub-agents unless the user … explicitly ask …" hint with one that allows up to N subagents without asking; the author coordinator's hint also says that delegating is its task, that waiting for its subagents is part of its work, and that each starts fresh. |
-| `agents.enabled` = false | A Codex process that starts no subagent of Codex: the statement reviewer, the LaTeX writer and its repair (a `-c` flag), and the thread of an author that works alone or with TCS Prover's team. Its model is offered none of Codex's collaboration tools. |
-
-On version-2 models the author coordinator also gets
-`features.multi_agent_v2.default_wait_timeout_ms` = 1800000, so its waits for
-its subagents default to 30 minutes. A web-cutoff run leaves this setting out
-(its isolation check compares every agent setting, and whether Codex reports
-this one has not been checked); there only the hint asks for long waits.
+| `features.multi_agent_v2.multi_agent_mode_hint_text` | Replaces Codex's "Do not spawn sub-agents unless the user … explicitly ask …" hint with one that allows up to N subagents without asking. |
+| `agents.enabled` = false | A Codex process that starts no subagent of Codex: the statement reviewer, the LaTeX writer and its repair (a `-c` flag), and the thread of an author that works alone. Its model is offered none of Codex's collaboration tools. |
 
 So the program limits how many subagents run at once, not how many in total.
 Only the prompt says that the critic starts exactly that many, and (on version
@@ -556,10 +343,10 @@ with subagents: at most N subagents at once, none of their own, no copies of the
 calling conversation, and subagents in the foreground. These are undocumented
 settings of Claude Code, found in its version 2.1.289 (see
 [Developers and operators](developers.md)). GPT 5.6 Luna (older) gets no
-subagent tool, so with it the critic reviews alone and the author of a
-coordinator job works alone; the activity log says "No subagents with this
-model". In a web-cutoff run these limits are session flags of each Codex
-process, and the isolation check refuses any other agent setting.
+subagent tool, so with it the critic reviews alone and the author works
+without subagents; the activity log says "No subagents with this model". In a
+web-cutoff run these limits are session flags of each Codex process, and the
+isolation check refuses any other agent setting.
 
 ### Critics of web-cutoff runs
 

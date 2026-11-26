@@ -1,10 +1,10 @@
 """TCS Prover's MCP server "tcs": a thin stdio bridge to the service of the runner that started this CLI.
 
-The author's (or coordinator's) CLI starts this program as an MCP server over stdio (newline-delimited JSON-RPC).
-It answers initialize and ping itself and forwards tools/list and tools/call, one connection each, to the runner's
-service (runner/team.py Service) at the address of TCS_MCP_ADDRESS, with the token of TCS_MCP_TOKEN; both come from
-the CLI's settings for this server, never from argv. Calls run concurrently (a team_wait may wait up to 30 minutes
-while other tools answer). Standard library only: it runs with `python -I`, outside the checkout's import path.
+A Codex author's CLI starts this program as an MCP server over stdio (newline-delimited JSON-RPC). It answers
+initialize and ping itself and forwards tools/list and tools/call, one connection each, to the runner's service
+(runner/team.py Service) at the address of TCS_MCP_ADDRESS, with the token of TCS_MCP_TOKEN; both come from the CLI's
+settings for this server, never from argv. Calls run concurrently, each on a thread of its own. Standard library
+only: it runs with `python -I`, outside the checkout's import path.
 """
 
 import json
@@ -19,8 +19,7 @@ VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
 MESSAGE_LIMIT = 16 * 1024 * 1024
 # The initialize answer gives no server instructions: Codex 0.160 shows them to the model as the description of
 # this server's tools (in the exec tool's description, beside each tool in ALL_TOOLS, as the namespace's
-# description), and Claude Code adds them to its system prompt, while every text the model reads from TCS Prover
-# is one of the workflow's editable texts.
+# description), while every text the model reads from TCS Prover is one of the workflow's editable texts.
 
 _output_lock = threading.Lock()
 

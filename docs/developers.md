@@ -94,8 +94,8 @@ working folder.
   when it ends (`codex delete --force`, which also removes subagent threads, or
   the Claude transcript files), newest first; a job with a record copies each
   session into it first, and a session whose copy does not read back the same
-  is kept (see [Job records](#job-records)). Team members' sessions go the same
-  way when the team ends, newest first and twice over (Codex refuses to delete a
+  is kept (see [Job records](#job-records)). The examiner's sessions go the
+  same way when it ends, newest first and twice over (Codex refuses to delete a
   session that a later fork still references). Until then Codex keeps it under
   `$CODEX_HOME/sessions` and its state database (an OpenAI-format API model's
   private Codex home), and Claude under `projects/` in its configuration folder
@@ -139,8 +139,7 @@ the entry point.
   [The workflow](workflow.md#subagents-what-the-program-enforces)), and a
   structured node's instructions read it as `{count}`. The author's `subagents`
   prompt reads it as `{author_subagents}` and is added to the first prompt of an
-  author that works alone with 1 or more (see
-  [The author coordinator](#the-author-coordinator)).
+  author with 1 or more (see [The proof author](#the-proof-author)).
 - Every structured call of Codex runs without Codex's goals feature
   (`--disable goals`, `structured_tool_arguments()`): the statement reviewer,
   the critic with its independent critics, and the LaTeX editor and repair. Codex 0.160's `codex exec` otherwise offers the call and
@@ -178,7 +177,8 @@ while the author works, with `{message}` and `{answer_file}`), `related_works`
 (the block about the related-works folder), `handoff_refused` (sent, after any
 critic feedback, to an author resumed after its last submission was refused; it
 gets the reason as `{reason}`, which the state keeps as `handoff_refused` until
-the author submits again) and `subagents`. `--set related_works=true` appends
+the author submits again), `subagents` and `examiner_note` (added to the first
+prompt while the examiner is on). `--set related_works=true` appends
 the `related_works` prompt to the first prompt, which `resume` restates, and
 `--set goal_reanchor=true` sends a reopened author the full `resume` prompt
 instead of `reopen`; the server sets both when they apply. Where the author's
@@ -188,29 +188,6 @@ from `workflow_runner.py` after the first prompt (which `{original_prompt}`
 carries into `resume` and `compaction`), after the `continuation` and `repair`
 prompts and after the recovery prompt; the YAML never names an operating
 system.
-
-**The coordinator binding.** A goal node with `subagents` may also have
-`coordinator: {prompt, lifecycle}`: the first prompt of the author coordinator
-(exactly one `[STATEMENT]`; it may name `{author_subagents}`) and the lifecycle
-prompts that replace the author's of the same key (a mapping, or a list of keys
-that name prompts of their own names). It may bind `goal`, `continuation`,
-`compaction`, `repair`, `resume`, `reopen`, `summary`, `conversation`,
-`related_works`, `handoff_refused` and `report`, the answer to a reply that is
-not a hand-in, which only this binding has (it may name what `continuation`
-may); every other prompt
-may name exactly what its author counterpart may, and the prompts it does not
-bind stay the author's (the bundled one leaves `conversation`, `chat`,
-`related_works` and `handoff_refused` shared). The run's `author_mode` option
-(`--author-mode`) chooses: `coordinator` runs the binding and needs it and 1 or
-more subagents (else the run stops with a settings error before any model starts,
-also when the workflow file was edited to drop the binding; a reply turn of the
-paused author fails at once), `author` runs the author alone
-(with its `subagents` note), and `auto`, the default, runs the coordinator when
-the number is 1 or more. Its prompts are
-checked only when it runs. The recovery prompt is the binding's prompt for the
-lifecycle key the node's recovery prompt is bound to (`repair` gives
-`coordinator_repair`), and `INLINE_PROOF_NOTE` follows the coordinator's
-`continuation` and `repair` too.
 
 A complete custom workflow can be as small as this `summarize.yaml`:
 
@@ -246,16 +223,11 @@ Keep custom definitions outside the bundled `workflows/` folder.
 The first runs proof search, criticism and LaTeX; the second LaTeX alone. Both
 skip statement review. `.venv/bin/python workflow_runner.py --help` lists the
 model, reasoning, time-limit, critic-round, critic-count and prompt options.
-`--author-subagents N` (the workflow's default, 0) and `--author-mode
-{auto,coordinator,author}` (default `auto`, an author; `coordinator` asks for
-the earlier team design and needs N 1 or more) choose how the author works, and `--coordinator-prompt-file` gives the
-coordinator's first prompt, as `--author-prompt-file` gives the author's. The
-server always passes the mode the job recorded. `--goal-loop {tcs,codex}` (default
-`tcs`), `--author-team {tcs,builtin}` (default `tcs`), `--author-subagent-models
-JSON` and `--prompt-set-file PATH` are described in
-[TCS Prover's goal loop and team](#tcs-provers-goal-loop-and-team); options
-given through the Python API without them keep Codex's goal mode and the
-built-in subagents.
+`--author-subagents N` (the workflow's default, 0) sets how many subagents the
+author may start at a time, and `--author-prompt-file` gives the author's first
+prompt. `--goal-loop {tcs,codex}` (default `tcs`) and `--prompt-set-file PATH`
+are described in [TCS Prover's goal loop](#tcs-provers-goal-loop); options
+given through the Python API without them keep Codex's goal mode.
 `--model` sets the fallback model for any workflow; `--set NAME=VALUE` sets any
 named option and accepts JSON values. Node `role` settings can use options such
 as `editor_model` and `editor_effort`. To run only the author:
@@ -292,11 +264,8 @@ conversation and exits. It reads one JSON request on standard input,
 `{"schemaVersion": 1, "id": "c_0123456789", "kind": "message", "text": "…",
 "notice": ""}` (`kind` is `summary` with an empty `text`, or `message` with 1 to
 12,000 characters; an invalid request exits with status 1), prepares only the
-author, and sends the `summary` or `conversation` prompt (for an author
-coordinator, `--author-mode coordinator`, the coordinator binding's `summary`,
-unless a Codex model gave it no subagent tool; the server passes `--author-mode
-author` for a coordinator job whose runner said that its author works alone),
-after the notice when there is one, as one turn in the saved conversation named by
+author, and sends the `summary` or `conversation` prompt, after the notice when
+there is one, as one turn in the saved conversation named by
 `--set goal_thread_id=…` and `--set goal_cwd=…`. It never starts or replaces a
 conversation, never sets a Codex goal active, runs outside the time budget, and
 retries every failed model call every minute without limit in that
@@ -308,72 +277,12 @@ notices, `codex_event` records, and then `conversation_reply` with the reply, or
 the status **Author reply failed** (`final: true`) when no retry can help; both
 end with exit status 0.
 
-## The author coordinator
+## The proof author
 
-A job that asks for author mode `coordinator` (the earlier team design; a new
-job's author is an author unless it asks, see `server.recorded_author_mode()`)
-runs the author node's coordinator binding with its 1 or more author subagents:
-one persistent conversation, as for the author, that hands the problem-solving
-to its subagents. What the runner and the server add:
+A job's proof author works on the statement itself, alone or with subagents of
+its own (see [The workflow](workflow.md#the-author)). What the runner and the
+server add:
 
-- **The recorded mode.** A job records `authorMode` (`coordinator` or `author`)
-  in its state and `job-settings.json` when it starts, from its own number; one
-  without the Author stage records `author`. A job saved without `authorMode`
-  (every job from before the coordinator) is restored as `author`, one saved
-  without `authorSubagents` with 0, and such a job saves no mode later
-  (`authorModeRecorded` false, kept through every revision of its statement in
-  place), so it stays a single author when it is resumed, revised in place (any
-  number of times) or continued (`App._kept_author_mode`: a job revised in place and a
-  continuation keep the mode of the job they come from); an author with 1 or
-  more subagents has the author prompt plus the `subagents` note. A continued
-  coordinator keeps its coordinator prompt as a continued author keeps its
-  author prompt. Every launch and every
-  reply turn of the paused author passes `--author-mode` with the recorded mode.
-- **The coordinator prompt** is a per-job prompt like the author's:
-  `default_prompts()["coordinator"]` (the binding's prompt), `PROMPT_ROLES`
-  (role `author`), `state.coordinatorPrompt`, `prompts/coordinator.txt` and
-  `--coordinator-prompt-file`. The server checks it (exactly one `[STATEMENT]`,
-  no field but `{author_subagents}`) only for a coordinator job; any other job
-  keeps the default.
-- **Launch.** The first prompt is the coordinator prompt with
-  `{author_subagents}` filled in, then the statement, then the related-works block
-  (no `subagents` note); `goal_session(..., coordinator=True)`. The runner creates
-  `memory/` in the author's working folder, owner-only where the system has such
-  permissions; an entry of that name is never removed or replaced, and a folder
-  that cannot be made is said in a diagnostic.
-- **No subagent tool.** A Codex model of multi-agent version 0 (GPT 5.6 Luna)
-  runs the author alone instead: today's author prompts without the `subagents`
-  note and without the `multi_agent` feature, and the status **No subagents with
-  this model** says that the author works alone instead of coordinating. A Claude
-  coordinator with the CLI's own subagents (a job from before TCS Prover's team,
-  or one made from it that keeps them, `legacyTeam`) gets the same single-author
-  launch as `alone`, which
-  `claude_cli.goal_session` uses when its CLI offers no subagent tool (`--bare`),
-  saying so once per runner; one with TCS Prover's team keeps its team in
-  `--bare` mode too (see TCS Prover's MCP server below). That status carries `authorModeEffective: "author"`
-  and the model's `modelLabel`, and each start of a coordinating author (its
-  **Goal started** or **Goal resumed** status) carries `authorModeEffective:
-  "coordinator"`: the server keeps the latest as `state.authorModeEffective`
-  (`follow_author_mode()`: `{mode: "author", modelLabel, reason}`, or `null` for
-  the recorded mode), in the state only, never in `job-settings.json`; a restart
-  and a saved batch read it from the transcript. Each launch replaces it as its
-  author starts. The page then says that the author works alone (Run settings,
-  and one line in place of the progress log), and the paused author's reply turns
-  get `--author-mode author`, so its summary uses the author's prompt.
-- **Nothing on a schedule.** The runner sends a working coordinator no message
-  of its own at fixed times. The hourly time check of jobs started before 15
-  November 2026 (a `checkin` binding, `TimeChecks`) is gone; their transcripts
-  keep its status records (**Coordinator time check**, with `elapsedSeconds`
-  and the text sent), which the page still shows.
-- **Hand-in guard.** Where proof files can be read
-  (`proof_handoff.file_handoff_supported()`), a final reply of the coordinator
-  that names no proof file (`names_proof_file()`, which counts a pointer
-  `extract_proof_reference()` cannot use, so the critic step refuses it and says
-  why) is not handed to the critic: it is recorded as the status **Coordinator
-  report** (its first `COORDINATOR_REPORT_CHARS`, 1,600, characters; the whole
-  reply stays in the activity log as the coordinator's message), and the
-  `continuation` prompt follows. Elsewhere (Windows) the reply is handed on as
-  today, and `INLINE_PROOF_NOTE` asks for the proof in it.
 - **The author's subagents** (`AuthorSubagents`, for every author with the
   subagent tool) become status records **Author subagent started**,
   **Author subagent finished** and **Author subagent failed** with
@@ -388,20 +297,13 @@ to its subagents. What the runner and the server add:
   by a limit is a failure with Claude's own words). Whether Codex 0.160's
   app-server reports a spawn of multi-agent version 2 (the built-in GPT models)
   as such an item has not been checked; `codex exec` does not.
-- **Codex settings.** The coordinator's app-server (not the critic) gets
-  `COORDINATOR_HINT` as `features.multi_agent_v2.multi_agent_mode_hint_text`
-  instead of `SUBAGENT_HINT`, with the same limits as any author with subagents,
-  and for models of multi-agent version 2
-  `features.multi_agent_v2.default_wait_timeout_ms = 1800000` (30 minutes;
-  Codex's own default is 30 s; version 1 has no such setting). A web-cutoff run's
-  audit (`retrieval_runtime.verify_rpc`) expects these values exactly in Codex's
-  effective settings (`config/read`); whether Codex reports the default wait there
-  has not been verified, so a web-cutoff coordinator does not get it
-  (`COORDINATOR_WAIT_MS`): it waits Codex's default unless it names a longer
-  wait, as its hint asks. The author's inactivity watchdog (30 minutes without an
-  event, then a `thread/goal/get` check) does not end an attempt whose root
-  waits silently for its subagents while the app-server answers the check
-  (tests/test_author_coordinator.py checks this with the scripted app-server).
+- **No subagent tool.** Codex gives a model of multi-agent version 0 (GPT 5.6
+  Luna) no subagent tool: its author works without subagents, and the status
+  **No subagents with this model** says so. Claude Code in `--bare` mode offers
+  none either; its status **Claude API mode tools** names the tools it lacks.
+- **Waiting for subagents.** The author's inactivity watchdog (30 minutes
+  without an event, then a cheap check) does not end an attempt whose root
+  waits silently for its subagents while the app-server answers the check.
 - **Claude Code settings.** Claude Code, when it offers the subagent tool (to an
   author with Author subagents 1 or more, and to the critic), gets
   `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` (subagents run in the foreground, so
@@ -415,59 +317,137 @@ to its subagents. What the runner and the server add:
   does not document these variables: they were read from the Claude Code
   2.1.289 bundle, and need checking again whenever Claude Code changes. A known
   limit of foreground subagents: a live instruction or a chat
-  message reaches a working Claude coordinator only once its running subagents
-  have reported.
+  message reaches a working Claude author only once its running subagents have
+  reported.
+- **The examiner** (the job setting `examiner`, `--set examiner=false` for
+  off; the `author_examiner` text, empty for none). `_execute` starts it with
+  `start_team(lone=True)`: a `runner/team.Team` without members, with one seat
+  (number 1, the author's model and reasoning), kept across the author's
+  attempts. Each time the author's own conversation is compacted (a Codex
+  `contextCompaction` item, a Claude `compact_boundary`), both goal sessions call
+  `examine_after_compaction()`, which starts an examination unless the last one
+  still runs (a diagnostic then says so). An examination is a one-shot run
+  (`member_attempt()`) in the author's working folder: `codex exec --json`
+  (persisted session, `exec fork` for a retry, `--disable multi_agent`,
+  `--disable goals` and `-c agents.enabled=false`, `--ignore-user-config`,
+  `-a never`, the author's confined profile on macOS or `-s workspace-write`
+  with the run's network rule elsewhere, the agent variables removed) or
+  `claude -p` (`run_structured` with `role="author"`: the author's tools
+  without Agent, its deny rules and Bash sandbox, no `--json-schema`). Its
+  input is the `author_examiner` text; its final reply is its report, saved
+  owner-only and never through a link as `team/member-1/<k>-report.md`
+  (`team.save_report()`: relative to open folders where the system can, else,
+  on Windows, each part checked with lstat, a junction included; always a new
+  file, after any earlier file or link of its name is removed), and
+  `team/timeline.md` lists each examination with its times. The goal session
+  sends each finished report into the author's running turn, framed by
+  `author_examiner_report`, as it sends a live instruction (the request
+  **Examiner report sent to the author**, then the status **Examiner report
+  delivered**; a report the CLI does not take is offered again a minute later).
+  A failed model call is retried every minute without limit, continuing the
+  examiner's conversation when the attempt worked (`AUTHOR_RETRY_NOTE`); a
+  settings problem (`member_problem()`: a missing CLI, a failed login, an
+  unknown model, a request the API connection refuses) ends the examination at
+  once. Records: **Author subagent started/finished/failed** with
+  `subagentMember` 1, `subagentExaminer: true`, `subagentModel`,
+  `subagentTask` (*Examination of the whole run*) and `subagentReport`, each
+  with the examination's id `subagentId` (`member-1-<k>`,
+  `team.assignment_id()`); `k` follows the highest report number in the working
+  folder (`team.highest_report()`), and each examination creates its empty
+  report file as it starts (`team.reserve_report()`), so a later runner of the
+  job never takes an earlier one's numbers. A Codex examination's
+  `turn.completed` carries the usage of its own calls (`member_usage()`);
+  Claude Code's retries of a failed API request inside the run are diagnostics
+  of the examiner. Pause, Stop, the time limit, the end of the work and a
+  restart stop it (`Team.close()`); a failed model call of the author keeps it
+  working.
 - **The page's live window.** The events of the subagents' own conversations
   (`codex_event` records with `root: false`, of the author's subagents and of the
   critic's) keep a window of their own, the newest `SUBAGENT_TRACE_LIMIT` (300),
   beside the newest `TRACE_LIMIT` (1,500) other records, so they never push the
-  coordinator's own records out. The window keeps each record's `traceVersion`,
+  author's own records out. The window keeps each record's `traceVersion`,
   so `/state?after=N` returns exactly the records added since N that it still
   holds, and a full copy's `traceFrom` is the version after which none is
-  missing. The author subagent records, and the coordinator's **Coordinator time
-  check** and **Coordinator report** statuses, are pinned, as the critic's
-  progress is.
+  missing. The author subagent records are pinned, as the critic's progress is.
   `transcript.jsonl` keeps every record.
-- **The progress log.** For a coordinator job (also one another process runs,
-  such as a terminal run) the server's tick reads
-  `memory/progress.md` in the author's working folder (`goalWorkspace`, or the run
-  folder) whenever its size or modification time changed (`read_progress_log`,
-  outside the job lock), as safely as a chat answer: a link, a FIFO or a file with
-  a second hard link is never read, the folder is opened without following a link
-  (on Windows a link is refused first), at most the file's last 400,004 bytes are
-  read, decoded as UTF-8 with invalid bytes replaced, line ends normalized and
-  control characters removed. `state.coordinatorProgress` is `null` while there
-  is no such file, else `{updatedAt, truncated, chars, bytes, version}`: the
-  file's modification time (UTC, ISO 8601), whether the file holds more than the
-  text shown, how many characters that text holds (the last 100,000 at most), the
-  size of the whole file in bytes, and a digest of the text that changes when it
-  changes. The text itself is not in `/state` (which the page polls every 0.7 s):
-  `GET /progress-log?job=…` (the same token and job checks as `/chat-answer`;
-  `App.progress_log()`) returns `{text, updatedAt, truncated, chars, bytes,
-  version}`, or `{text: null, version: null}`, and the page fetches it only when
-  the job page opens or the version changes. A file that changes while it is read
-  is read again at the next tick. Saved read-only batches show the same, read
-  once per request (from the run's own folder when the saved working folder is
-  not a folder of the batch catalog, such as a run moved into a batch folder).
-  The coordinator dates none of its entries, so the job keeps when each version
-  was saved: `state.coordinatorProgressVersions`, `[{version, at, chars}]`
-  oldest first, each new version as the tick read it (its modification time;
-  versions saved within one tick are one), the newest `PROGRESS_LOG_VERSIONS`
-  (500), in the controller folder's `progress-log-versions.json` (owner-only;
-  `saved_progress_log_versions()` reads it for a restarted server and a saved
-  batch). The page lists their times under the log. The first entry says what
-  came before it (`trim_progress_log_versions()`): `earlier`, how many versions
-  were saved before it whose times are no longer kept (the page's count adds
-  them and names the limit), and `existed: true` when the log was there already
-  as the job's first version was read and this server never saw it absent
-  (`App._progress_absent`): its earlier saves are unknown, and the page says
-  "at least".
+- **The author's memory.** The job page of every job with the Author stage lists
+  the author's memory folder (`memory/` in the author's working folder,
+  `goalWorkspace` or the run folder), on request only: nothing of it is in
+  `/state`, and no tick reads it. `GET
+  /memory-files?job=…` (`App.memory_files()`, `list_memory_files()`) returns
+  `{folder, exists, files: [{path, bytes, updatedAt}], count, bytes,
+  truncated}`: the regular files below the folder by path (`/` between names),
+  at most `MEMORY_LIST_MAX` (2,000) of them among `MEMORY_SCAN_MAX` (20,000)
+  entries, in folders up to `MEMORY_DEPTH_MAX` (8) names deep, without
+  `__pycache__`. `GET /memory-file?job=…&path=…` (`App.memory_file()`,
+  `read_memory_file()`) returns `{path, text, chars, truncated, binary, bytes,
+  updatedAt}`: the file's first `MAX_MEMORY_FILE_CHARS` (200,000) characters,
+  decoded as UTF-8 (invalid bytes replaced), line ends normalized and control
+  characters removed, or `binary: true` and no text
+  for a file with a NUL byte among its first 8,192 bytes or more than one in
+  twenty of their characters undecodable. `GET /memory-file/download?job=…&path=…`
+  streams the whole file as `application/octet-stream`, an attachment with
+  `nosniff` and a sandboxing Content-Security-Policy, so no browser opens a
+  model's file in place. All three make the same token and job checks as
+  `/chat-answer`, and refuse with 400.
+  The author can write that folder, so nothing is read through a link:
+  `memory_path_parts()` takes a path apart into plain names (never empty, `.`,
+  `..`, with a separator or a control character, at most 8 of them), and each
+  name is opened below the folder before it (`os.open` with `dir_fd` and
+  `O_NOFOLLOW`; on Windows each entry is checked with `lstat` first). A link, a
+  FIFO and a file with a second hard link are neither listed nor read, as for a
+  chat answer. The page reads the list when the job page opens, every 10 s
+  while the section is open and every minute while it is closed, and reads the
+  open file again when the list gives it another size or change time. Saved
+  read-only batches list and show the same (`BatchCatalog.memory_files()`,
+  `memory_file()`), without the download; the live gateway forwards the three
+  routes.
+- **Rendered Markdown.** The page renders a Markdown note of the memory, the
+  current proof, a proof in the final answer and an earlier goal's proof with
+  `ui/markdown.js` (`TCSMarkdown.render(text, element)`), on markdown-it 14.1.0
+  and KaTeX 0.16.11, kept unchanged in `ui/vendor/` (`ui/vendor/README.md` lists
+  their sources and checksums). The page's Content-Security-Policy
+  (`default-src 'self'`) forbids style attributes in inserted HTML, so
+  markdown-it (with `html: false`; only http, https and mailto links; images
+  shown as text) emits placeholders for formulas, and `katex.render` fills them
+  through the DOM. `ui/page_files.py` lists every file the server and the live
+  gateway send as it is: the page, `markdown.js`, `markdown.css` and the
+  `.js`, `.css` and `.woff2` files of `ui/vendor/`.
+- **The current proof.** `state.currentProof` (`current_proof_mark()`) is
+  `{source, bytes, updatedAt, version}` for the proof the critic accepted
+  (`final-input.json`, once `finalInputReady`) or else the saved candidate
+  (`saved-candidate.md`), or `null`; `GET /current-proof?job=…`
+  (`App.current_proof()`) returns it with `text` (its first
+  `MAX_CURRENT_PROOF_CHARS`, 1,000,000), `chars` and `truncated`. The page shows
+  it while the critic or a LaTeX step works, is paused or stopping there, and
+  reads the text again when `version` changes.
+- **Chat after the job ends.** A finished job with a saved author conversation
+  (`goalThreadId`) has chat mode `finished`: a message or summary is a reply turn
+  (`workflow_runner.py --converse`), as while paused. Records of stage
+  `conversation` are controller notes (`controller_note()`): they never move the
+  job's step, so a finished job's reply leaves `activeNode` where the job ended.
+- **New goals.** `POST /new-goal?job=…` `{goal, thinkingHours?}`
+  (`App.set_new_goal()`, refusals in `_new_goal_problem_locked()`, shown in
+  `state.newGoal`) moves the finished goal's results into `goals/<n>/`
+  (`archive_goal_files()`: `GOAL_RESULT_FILES` and every `final.*`, `latex-*.log`
+  and `latex-*.tex`; copies of `checked-statement.md`, `proof.md` and
+  `progress-summary.md`), appends it to `state.goals` (saved in
+  `job-settings.json`; `saved_goals()`), writes the new goal to
+  `checked-statement.md`, and launches the author and critic graphs like
+  Resume, with `goal_require_resume` and `goal_new_goal`: the runner's first
+  message to the reopened conversation is the `new_goal` text, whose
+  `{original_prompt}` is the first prompt built from the new statement.
+  `newGoalPending` keeps sending it until the first "Exact solve input" request
+  of the new goal. The record `New goal set` is a relaunch label and resets the
+  restored result, so a restart never shows the earlier goal's result as the new
+  one's. A launch that fails moves the files back. `GET
+  /goal-file?job=…&goal=<n>&name=…` returns one file of an earlier goal
+  (`GOAL_FILES`), also for a saved batch.
 
-## TCS Prover's goal loop and team
+## TCS Prover's goal loop
 
-Owner's request (13 Nov 2026): choose the coordinator's and each subagent's model
-(Codex, Claude, CLI or API), and simulate Codex's goal mode and subagent tools so
-that every prompt and tool text is the user's to adjust. What the code does:
+Owner's request (13 Nov 2026): simulate Codex's goal mode so that every prompt
+and tool text is the user's to adjust. What the code does:
 
 - **Every text is in the workflow.** `workflows/author_critic.yaml` holds, beside
   the role and lifecycle prompts, TCS Prover's own texts with "EDIT … HERE"
@@ -480,20 +460,12 @@ that every prompt and tool text is the user's to adjust. What the code does:
   argument; the note is TCS Prover's), `claude_goal_harness` (`{objective}`; the
   former `claude_cli.GOAL_HARNESS_PROMPT`, which stays the fallback of a workflow
   without it), `codex_compact_prompt` (Codex's `compact_prompt`; empty passes
-  nothing), `codex_coordinator_note` (the `developerInstructions` of a Codex
-  coordinator's `thread/start` and `thread/resume` when it has TCS Prover's
-  team: a developer message after Codex's own instructions, which cancels their
-  60-second commentary and 60-second wait rules for the run; empty sends none;
-  these two and the examiner's two are the only prompts that may be empty),
-  `team_note` (`{members}`), `team_member` (`{assignment}`), `team_examiner`
-  (the whole instruction of the team's examiner, a seat `runner/team.Team`
-  starts itself in `assign()` and `wait()`: `Team._examine()`,
-  `EXAMINATION_SECONDS`; `workflow_runner` gives the seat the coordinator's
-  model and the number after the members; empty: no examiner),
-  `team_examiner_note` (added to `team_wait`'s description when there is an
-  examiner) and one description per team tool and argument
-  (`team_tool_*`). `prompt_rules()` says what each prompt may use, as `prepare()`
-  checks it, as the code fills each text in (`_lifecycle_fields()`: a reply
+  nothing), `author_examiner` (the examiner's whole instruction, see
+  [The proof author](#the-proof-author); empty: no examiner) and
+  `author_examiner_report` (`{report}`: how a report reaches the author);
+  `codex_compact_prompt` and `author_examiner` are the only prompts that may be
+  empty (`EMPTY_ALLOWED_PROMPTS`). `prompt_rules()` says what each prompt may
+  use, as `prepare()` checks it, as the code fills each text in (`_lifecycle_fields()`: a reply
   turn fills in `{message}` and nothing in a progress summary; the related works
   note, the examiner note and a verify-only round's instruction are used as
   written);
@@ -506,9 +478,9 @@ that every prompt and tool text is the user's to adjust. What the code does:
   text after the user's edits) in `prompts/prompt-set.json` of its controller
   and run folders; every launch rewrites the controller's copy from the job's
   state and passes `--prompt-set-file` (catalog names; a job from before may
-  hold the retired `convention` text, which nothing uses), reply turns and the
-  writer included, and
-  chat messages use the job's `chat` text. A job from before has no `promptSet`
+  hold texts that nothing uses any more, such as the retired `convention` text
+  and coordinator mode's texts, which the runner leaves out), reply turns and
+  the writer included, and chat messages use the job's `chat` text. A job from before has no `promptSet`
   (`goalLoopRecorded: false`) and reads the live workflow, as before. Beside the
   set, `promptEdits` (`prompts/prompt-edits.json`, `job_prompt_edits()`) keeps
   the texts edited for the job: a new job's `promptOverrides` and role prompts
@@ -522,235 +494,55 @@ that every prompt and tool text is the user's to adjust. What the code does:
   unchanged. `tcs` starts the app-server with `--disable goals` and sends no
   `thread/goal/*` request: TCS Prover starts every turn and, after one that did
   not end the goal, at once sends `goal_continuation` with the continuation
-  prompt first (the coordinator's report answer after a reply the hand-in guard
-  kept). The model ends its goal with `update_goal` (`team.GoalTool`): `complete`
-  with a final reply in the same turn hands that reply on; `blocked` and
+  prompt first. The model ends its goal with `update_goal` (`team.GoalTool`):
+  `complete` with a final reply in the same turn hands that reply on; `blocked` and
   `paused` are recorded as **Goal status** (`goalStatus`, `note`) and the work
   goes on. The liveness probe is `config/read`. Pause, Stop, the time limit,
-  resume, live instructions, chat, the compaction re-anchor, the
-  hand-in guard and the retries are as before. Reply turns of a `tcs` thread
-  reopen it without the goals feature. Web-cutoff runs always use `codex`: their
+  resume, live instructions, chat, the compaction re-anchor and the retries
+  are as before. Reply turns of a `tcs` thread reopen it without the goals
+  feature. Web-cutoff runs always use `codex`: their
   audited configuration (retrieval/runtime.py) has no place for TCS Prover's
   server. Claude Code authors always ran TCS Prover's loop; their harness note
-  is `claude_goal_harness` and their continuation the role's, as before.
+  is `claude_goal_harness` and their continuation the author's, as before.
 - **TCS Prover's MCP server.** `runner/tcs_mcp.py` is a stdio MCP server (standard
   library only, started by the runner's own interpreter with `-I`; it switches
   its stdin and stdout to UTF-8 as it starts, as a piped Python process on
   Windows reads and writes the ANSI code page and `-I` ignores `PYTHONUTF8`)
-  that Codex
-  starts from its thread settings `mcp_servers.tcs` (kept on while the user's
-  servers are off, `required`, `tool_timeout_sec` 2,400, every tool
+  that Codex starts from its thread settings `mcp_servers.tcs` (kept on while
+  the user's servers are off, `required`, `tool_timeout_sec` 2,400, every tool
   `approval_mode: approve`, `omit_tools_from: ["deferred", "code_mode"]`). Its
   environment holds the address of the runner's `team.Service` (127.0.0.1, a
   random port) and a random token; every request carries the token, and the
-  service answers nothing else. Claude Code gets no bridge: its `--mcp-config`
-  file in the private settings folder names an `sdk` server (`{"type": "sdk", "name": "tcs",
-  "timeout": 2400000, "alwaysLoad": true}`, so its tools are never deferred
-  behind Claude Code's tool search), whose MCP messages the CLI writes as
-  stream-json control requests (`mcp_message`) that `claude_cli.goal_session`
-  answers from the same service (`Service.answer()`, each tool call on a thread
-  of its own); an init message
-  that lists not every team tool ends the attempt, which is retried, so a
-  coordinator never works on without its team. Verified against Claude Code 2.1.289
-  with a scripted Anthropic endpoint: under `--safe-mode`, which every Claude
-  process keeps, it drops every other kind of `--mcp-config` server (a stdio
-  server never starts); it loads an `sdk` one, also with `--bare`, before its
-  first request, names its tools `mcp__tcs__<tool>` in its init message and to
-  the model, runs them only when `--allowedTools` names them (under
-  `--permission-prompts none` any other is refused at once), queues a user
-  message written during a call until the call's result, cancels a running call
-  on an interrupt (`notifications/cancelled`) and ends one that outlives
-  `timeout`; the stand-in CLI of tests/test_claude_cli.py follows these shapes.
-  The service runs the tools of the providers added to it: `GoalTool` and `Team`.
-  Neither the bridge nor `Service.answer()` gives server instructions: Codex
-  shows them to the model with the server's tools and Claude Code puts them in
-  its system prompt, and every text the model reads from TCS Prover is an
-  editable text. Without
-  `omit_tools_from` Codex 0.160 defers every MCP tool of a model with tool
-  search (GPT 6.1 Sol, GPT 5.5): a code-mode model then reads only that some
-  tools are omitted and must search `ALL_TOOLS` for them, a direct model sees
-  them only through `tool_search`, and neither reads their descriptions. Not
-  deferred but in code mode, a code-mode model (GPT 6.x) calls each tool from a
-  script of its `exec` tool (`tools.mcp__tcs__<name>`), whose cell yields after
-  30 s, so it waits on a running `team_wait` with Codex's `wait` tool: 16 model
-  calls for a wait of 200 s in a capture. Kept out of both, every
-  model gets the namespace `mcp__tcs` with each tool under its own name
-  (`update_goal`, `team_members`, `team_assign`, `team_wait`, `team_followup`,
-  `team_stop`; GPT 6.1 Sol in its request's `additional_tools`, GPT 5.5 and an
-  API model that Codex does not know in its `tools`) and calls it directly, a
-  function call naming that namespace and the tool, one model call however long
-  the tool runs; Codex refuses a call of the flattened name
-  (`mcp__tcs__team_members`: "unsupported call"). So every default text names
-  each tool by its own name. The app-server reports every call as an
-  `mcpToolCall` item (`server` "tcs", `tool` the tool's name), which the job
-  page shows as "team_wait · completed".
-- **The team** (`--author-team tcs`, the coordinator of every new live job).
-  `_execute` builds `team.team_members()` from `--author-subagent-models` (one
-  `{model, effort}` per author subagent; none: the coordinator's model and
-  effort), appends `team_note` to the coordinator's first prompt after the
-  related works, and removes the CLI's subagent tool (no `multi_agent`, and in
-  the coordinator's Codex thread `agents.enabled = false`: without it Codex
-  0.160 still gives a model of multi-agent version 2 its collaboration tools
-  and tells it that it is the root of a team that can spawn sub-agents; a model
-  with no Codex subagent tool, such as GPT 5.6 Luna, still coordinates). Tools:
-  `team_members`, `team_assign(member, assignment)`, `team_wait(timeout_minutes)`
-  (1 to 30, default 30; returns at once when no member works and no report
-  waits, else when an assignment finishes or fails, with every report since the
-  last wait; one answer carries at most `REPORT_CHARS` (20,000) characters of
-  report text, which reports that come back together share
-  (`team.report_shares()`: equal shares, the room a shorter one leaves going to
-  the longer ones), each cut one with a note naming its file, because Codex
-  0.160 cuts a tool's answer beyond its models' 10,000-token output budget out
-  of the middle; it ends
-  early when TCS Prover sends a live instruction, or one came in
-  the 10 s before it began), `team_followup(member, message)` (continues the
-  member's last conversation; refused while it works or without one) and
-  `team_stop(member)`. Each assignment is a one-shot run (`member_attempt()`):
-  `codex exec --json` (persisted session, `exec fork` for a follow-up or retry,
-  `--disable multi_agent`, `--disable goals` and `-c agents.enabled=false` (Codex
-  0.160's `codex exec` otherwise offers its own goal tools, which start Codex's
-  goal mode in the member's session, a follow-up's `exec fork` inheriting that
-  goal, and to GPT 6.1 Sol its collaboration tools without a session limit),
-  `--ignore-user-config`, `-a never`, the author's
-  confined profile on macOS or `-s workspace-write` with the run's network rule
-  elsewhere, the agent variables removed) or `claude -p` (`run_structured` with
-  `role="author"`: the author's tools without Agent, its deny rules and Bash
-  sandbox, no `--json-schema`) in the author's working folder. The input is
-  `team_member` with the assignment; the final reply is the report, saved
-  owner-only and never through a link as `team/member-<n>/<k>-report.md`
-  (`team.save_report()`: relative to open folders where the system can, else,
-  on Windows, each part checked with lstat, a junction included; always a new
-  file, after any earlier file or link of its name is removed). A
-  failed model call is retried every minute without limit, continuing the
-  member's conversation when the attempt worked (`AUTHOR_RETRY_NOTE`); a
-  settings problem (`member_problem()`: a missing CLI, a failed login, an unknown
-  model or connection) goes to the coordinator as the report of a failed
-  assignment, "The assignment failed: <the problem>", and the member is idle.
-  An API connection that refuses the request (its endpoint rejects it as
-  invalid, HTTP 400 `RequestRejected`; says that the model does not exist or
-  that its key cannot use it, `ModelUnavailable`; or refuses its key: a failed
-  authentication, HTTP 401 or 403), with Codex or Claude Code, ends the
-  assignment the same way, as a `team.Refusal`, but such a refusal can pass (a
-  proxy refuses requests while its own login refreshes), so its report is the
-  owner's wording of 14 Nov 2026 (`team.REFUSED_REPORT`): "Member <n>'s
-  assignment failed: its API connection refused the request (<reason>). This
-  may be a temporary problem of the service or a wrong setting. Keep the work
-  going: give this assignment to another member, or give it to member <n> again
-  later." `<reason>` is the service's own words (the error's `reason`, or the
-  401 text), without the author's "A retry cannot fix this ..." sentence. The
-  member's **Author subagent failed** line says what failed and ends with those
-  words (the error's `summary`: "Request rejected by the API endpoint:
-  <connection> refuses the requests this job sends as invalid (<reason>).",
-  "Model unavailable: <connection> cannot be used (<reason>).", or
-  "authentication failed: <reason>"); what a paused job is told (that a retry
-  cannot fix it, and that a job waiting for it continues once its settings
-  change) is not a member's. A built-in model's refused login or unavailable
-  model is reported as above, "The assignment failed: …" with the whole
-  message.
-  Claude Code first retries a failed API request inside the member's run
-  (`CLAUDE_CODE_RETRY_WATCHDOG`; Claude Code 2.1.289 retried a refused key up to
-  300 times, about 35 s apart): each retry is a diagnostic of that member
-  ("Member n (model): Claude API retry: ..."), and only the run's end reaches
-  the rules above. Members are children of the runner: a pause, Stop, the time limit, the end of
-  the work and a restart stop them (their records say why); a failed model call
-  of the coordinator keeps them working, and the next attempt reads their
-  reports: a `team_wait` that the failed attempt's CLI was running ends without
-  taking a report or an attention (`Team.release_waits()`, from goal_session's
-  cleanup on both paths). A member's retry notes carry `attempt`, counted per
-  assignment, so only the first two stay pinned (`important_record()`), and
-  the failure in plain words and the provider's line (`failure`,
-  `failureReason`: `describe_failure()`) with `retryAt`, so the server can list a
-  member that keeps failing under Needs your attention (see
-  [Repeating failures](#repeating-failures-and-needs-your-attention)). Records: **Author subagent started/finished/failed** with
-  `subagentMember`, `subagentModel` and `subagentReport`, and the members'
-  `codex_event` records (`root: false`). A Codex member's `turn.completed` is
-  recorded once its process's calls are in the job's record, with the usage of
-  those calls (`member_usage()`, `records.TraceProcess.usage()`, and
-  `modelCalls`): a follow-up or retry runs as `exec fork`, whose
-  `turn.completed` counts the whole forked conversation (in the trial, 539,386
-  input tokens for a fourth assignment whose own 3 calls used 102,763), kept
-  as `conversationUsage`; without the record's usage (no record, or a call it
-  holds none of) the event stays as Codex wrote it. Every record of one assignment, its
-  retry notes included, carries its id `subagentId` (`member-<n>-<k>`,
-  `team.assignment_id()`): each run numbers its items from `item_0` again, so
-  the page and `transcript/view_transcript.py` (a local tool) keep an assignment's rows apart
-  by it, and a later assignment never replaces an earlier one's. `k` follows
-  the member's highest report number in the working folder
-  (`team.highest_report()`), and each assignment creates its empty report file
-  as it starts (`team.reserve_report()`), so a later runner of the job (after a
-  pause, a restart or the time limit, each with a team of its own) never takes
-  an earlier one's numbers, even when that runner ended before the report.
-- **Warnings while the coordinator works** (`CoordinatorWatch`, after the
-  first real coordinator trial of 14 Nov 2026: a proxy that drops the team
-  tools would leave a coordinator that can neither delegate nor hand in, with
-  no sign). The goal session reports each model call of the coordinator (a
-  Codex `thread/tokenUsage/updated` whose totals changed; a Claude assistant
-  message ID), each team tool call as it starts and ends (Codex's `mcpToolCall`
-  items of the server `tcs`; Claude's `tools/call` control requests), the end
-  of each turn, and a coordinator reply under TCS Prover's goal loop that names
-  a proof file while `update_goal` gave no "complete". It warns, as a pinned
-  diagnostic with `coordinatorWarning` (`teamless`, `refused`, `handin`) and
-  `needsAttention`, after `COORDINATOR_TEAMLESS_CALLS` (10) model calls or
-  `COORDINATOR_TEAMLESS_SECONDS` (20 minutes, a clock that stops while a team
-  call runs, the goal waits for the critic or a pause is under way) without a
-  team call, at a team tool call Codex refused (`refused_team_call()`: Codex
-  0.160 answers the model "unsupported call: <name>" and sends the app-server
-  no notification, only the line `ERROR codex_core::tools::router:
-  error=unsupported call: <name>` of its error output, which `RPC.stderr_watch`
-  reads; the flattened name `mcp__tcs__team_members`, a tool the namespace does
-  not have, `mcp__tcsteam_status`, and a namespace no server has,
-  `mcp__teamteam_wait`, all captured with the real Codex against a scripted
-  model server), and after `COORDINATOR_UNTAKEN_HANDINS` (3) such replies.
-  Once a team call of the coordinator has worked (`team_worked`: TCS Prover's
-  team answered it without an error, a Codex `mcpToolCall` item that completed
-  with no error, `team_call_worked()`, or a Claude `tools/call` answered
-  without an error result, which ends the call in the watch just before the
-  CLI has the answer), the `teamless` warning has `teamWorked` and names what
-  the coordinator does, by the team's own count of members working when it
-  fires (`Team.busy()`, members not idle, a stopping one included, plus reports
-  not yet collected with `team_wait`, which
-  both goal sessions hand the watch as `working`): with a member working, the
-  label `COORDINATOR_CHECKING_LABEL` ("Coordinator keeps checking on its team
-  instead of waiting"), the coordinator checking on its members between team
-  calls instead of waiting with `team_wait`, each check sending its whole
-  conversation to the model again; with none, the usual label and "while no
-  member is working: it is doing the work itself instead of giving it to a
-  member", without proxies or dropped tools. Its limits, clock and clearing
-  stay (real runs of 14 Nov 2026: GPT 6.1 Sol coordinating 1 member under
-  Codex 0.160 slept 40 s with Codex's clock tool, read its member's
-  `transcript.jsonl` with a script and edited a memory note, 29 to 42 model
-  calls in its first 15 minutes, each re-sending 40-78k tokens, and was told
-  its tools may not reach the model).
-  A status `Coordinator warning cleared` (`coordinatorWarningCleared`, pinned)
-  ends each: the next team call, the next team call that reaches TCS Prover,
-  the next hand-in. A model-call failure ends the goal session, and the next
-  attempt's watch is a new one: the failed attempt's retry details carry the
-  warnings still listed (`warned`, `CoordinatorWatch.shown()`, through
-  `_goal_step()`), which the new watch clears as its own.
-  They also carry `team_worked`, kept once true across the runner's attempts
-  and new conversations, as the team works on through them; a new runner
-  (after a pause, a stop or a restart, which stop the members) starts without
-  it. Without TCS Prover's
-  team only the hand-ins are watched, a refused call included (no team call
-  could clear it; a refused `update_goal` leaves replies not handed in). The
-  server keeps the warnings not cleared
-  (`App._follow_coordinator_warnings()`; a runner's end clears them) and
-  lists a running job's newest one under Needs your attention (kind
-  `coordinator`) after every more pressing cause. No text a model reads
-  changes.
-- **Codex's own subagent tools.** A Codex author or coordinator that starts no
-  subagent of Codex has `agents.enabled = false` in its thread settings
+  service answers nothing else. The service runs one tool, `update_goal`
+  (`GoalTool`), for a Codex author under TCS Prover's goal loop; Claude Code
+  authors get no MCP server of TCS Prover, as they end each turn with a
+  structured goal status. The bridge gives no server instructions: Codex shows
+  them to the model with the server's tools, and every text the model reads
+  from TCS Prover is an editable text. Without `omit_tools_from` Codex 0.160
+  defers every MCP tool of a model with tool search (GPT 6.1 Sol, GPT 5.5): a
+  code-mode model then reads only that some tools are omitted and must search
+  `ALL_TOOLS` for them, a direct model sees them only through `tool_search`,
+  and neither reads their descriptions. Not deferred but in code mode, a
+  code-mode model (GPT 6.x) calls each tool from a script of its `exec` tool
+  (`tools.mcp__tcs__<name>`). Kept out of both, every model gets the namespace
+  `mcp__tcs` with the tool under its own name (`update_goal`; GPT 6.1 Sol in
+  its request's `additional_tools`, GPT 5.5 and an API model that Codex does
+  not know in its `tools`) and calls it directly, a function call naming that
+  namespace and the tool; Codex refuses a call of the flattened name
+  (`mcp__tcs__<tool>`: "unsupported call"). So the default texts name the tool
+  by its own name. The app-server reports every call as an `mcpToolCall` item
+  (`server` "tcs", `tool` the tool's name), which the job page shows as
+  "update_goal · completed".
+- **Codex's own subagent tools.** A Codex author that starts no subagent of
+  Codex has `agents.enabled = false` in its thread settings
   (`_author_thread_options(builtin_agents=False)`): one without the
   `multi_agent` feature (an author that works alone, with Author subagents 0 or
-  a model that gets no subagent tool, and a coordinator with TCS Prover's team),
-  live or web cutoff. Without it Codex 0.160 gives a model of multi-agent
-  version 2 (GPT 6.x) its collaboration tools (`spawn_agent`, `wait_agent`, ...)
-  also with `multi_agent` off and with a web-cutoff run's settings, where a
-  session limit of one thread refuses every spawn. An author with Codex's own
-  subagents keeps them: a web-cutoff coordinator, the coordinator of a job from
-  before TCS Prover's team, and an author of `--author-mode author` with
-  subagents. The setting belongs to the thread, so Codex's effective settings
-  (`config/read`), which a web-cutoff run's audit compares, do not show it, and
+  a model that gets no subagent tool), live or web cutoff. Without it Codex
+  0.160 gives a model of multi-agent version 2 (GPT 6.x) its collaboration
+  tools (`spawn_agent`, `wait_agent`, ...) also with `multi_agent` off and with
+  a web-cutoff run's settings, where a session limit of one thread refuses every
+  spawn. An author with Author subagents 1 or more keeps them. The setting
+  belongs to the thread, so Codex's effective settings (`config/read`), which a web-cutoff run's audit compares, do not show it, and
   Codex keeps it with the thread for good: once a start or resume of the thread
   has it, no later `thread/resume`, even with `agents.enabled = true`, offers
   the thread's model those tools again (both checked with the real Codex). So a
@@ -761,40 +553,29 @@ that every prompt and tool text is the user's to adjust. What the code does:
   would take for the rest of the job. A spawn in such a reply turn is refused
   (`multi_agent` off and a session limit of one thread: Codex 0.160 answered
   "collab spawn failed: agent thread limit reached"), and the author resumed
-  after it starts its subagents again. Team members get
-  `-c agents.enabled=false` (see above).
+  after it starts its subagents again. The examiner gets
+  `-c agents.enabled=false` (see [The proof author](#the-proof-author)).
 - **Checked with the real Codex 0.160** (the installed binary against a scripted
   model server, no model): it starts the bridge from the settings of
   `thread/start` and of `thread/resume` (a resumed thread gets the new address
   and token; Codex keeps no MCP settings with a thread, so a reply turn, which
   passes none, reopens it without TCS Prover's tools); `--disable goals` leaves
   no goal tool of Codex; while a tool call is pending it accepts `turn/steer`
-  and answers `config/read` (a live instruction ends a running
-  `team_wait` and reaches the model as its next user message), and
-  `turn/interrupt` ends the turn, the members stopping with it; `codex exec fork`
-  continues a member's conversation; `compact_prompt` (thread setting or `-c`)
-  is the prompt of a compaction. With the tools direct (GPT 6.1 Sol, GPT 5.5), a
-  `team_wait` is one model call however long it runs: a live instruction, a time
-  check, Pause and Stop end a pending one at once, Codex answers the runner's
-  inactivity check (`config/read`) while it runs, and a resumed goal, a
-  compaction and a reply turn work as before. (Called from code mode, the `exec`
-  cell yielded after 30 s while `team_wait` ran, and the model waited on it with
-  Codex's `wait` tool, 10 s per call unless it asked for longer.)
+  and answers `config/read`, and `turn/interrupt` ends the turn; `codex exec
+  fork` continues a conversation (an examination's retry); `compact_prompt`
+  (thread setting or `-c`) is the prompt of a compaction.
 - **Old jobs and web cutoffs.** A job from before records no `goalLoop`: it is
-  restored as `codex` with `authorTeam` null, so its launches pass `--goal-loop
-  codex --author-team builtin` and no texts, also after a revision in place, and a
-  continuation of it keeps them. Its state says `legacyTeam: true`. A request
-  with `legacyTeam: true` (no page sends one any more) starts a new job that
-  runs `codex` with the built-in subagents (`legacy_team`), saves its texts like
-  any new job, and records `legacyTeam: true` in job-settings.json, so it, its
-  reruns and the jobs made from it keep them too. The New problem form has no
-  goal loop setting: it sends `goalLoop: "tcs"` for a new job (a rerun and saved
-  settings included) and, for a job it continues (a revision in place), the
-  loop that job recorded (app.js `selectedGoalLoop()`); saved settings hold no
-  `goalLoop` (one in a file saved before is dropped as it loads). A web-cutoff coordinator
-  keeps the CLI's built-in subagents with the coordinator's model (status
-  **Built-in subagents**); the server refuses Subagent models with a web
-  cutoff.
+  restored as `codex`, so its launches pass `--goal-loop codex` and no texts,
+  also after a revision in place, and a continuation of it keeps them. Its
+  state says `legacyTeam: true`. A request with `legacyTeam: true` (no page
+  sends one any more) starts a new job that runs `codex` (`legacy_team`), saves
+  its texts like any new job, and records `legacyTeam: true` in
+  job-settings.json, so it, its reruns and the jobs made from it keep it too.
+  The New problem form has no goal loop setting: it sends `goalLoop: "tcs"` for
+  a new job (a rerun and saved settings included) and, for a job it continues
+  (a revision in place), the loop that job recorded (app.js
+  `selectedGoalLoop()`); saved settings hold no `goalLoop` (one in a file saved
+  before is dropped as it loads).
 - **A model without web search.** `codex_web_search_tool()` says whether
   Codex 0.160 offers a model a web search tool in a live run as TCS Prover
   starts it: its hosted `web_search` tool never goes to a "Responses Lite"
@@ -806,9 +587,9 @@ that every prompt and tool text is the user's to adjust. What the code does:
   header, read from `provider_arguments()`, which sets none of them). So a
   Lite model through an API connection has no search tool. As a live run's
   author starts, `note_no_web_search()` records one pinned diagnostic **No web
-  search** (`noWebSearch: true`, `models`) naming the author's and the team
-  members' models that have none; the page shows it like the other
-  warnings of the activity log. The provider settings are unchanged.
+  search** (`noWebSearch: true`, `models`) naming the author's model; the page
+  shows it like the other warnings of the activity log. The provider settings
+  are unchanged.
 
 ## Job records
 
@@ -863,10 +644,9 @@ writes a job's record, `ui/model_calls.py` reads it.
   processes take it with `flock`, `msvcrt` on Windows).
 - **Codex's trace.** Every Codex process of a live run gets
   `CODEX_ROLLOUT_TRACE_ROOT=<record>/codex-trace/<label>`
-  (`workflow_runner._record_codex()`): the author's or coordinator's
-  app-server, each reply and summary turn's, every structured `codex exec` call
+  (`workflow_runner._record_codex()`): the author's app-server, each reply and summary turn's, every structured `codex exec` call
   (statement reviewer, critic with its independent critics, which share its
-  bundle, LaTeX editor and repair) and every team member's.
+  bundle, LaTeX editor and repair) and every examination's.
   Codex 0.160 then writes the exact request bodies (system prompt, tools, full
   input, schema, settings), the output items (encrypted reasoning included),
   response and request ids, usage, the code cells with each nested tool call's
@@ -916,7 +696,7 @@ writes a job's record, `ui/model_calls.py` reads it.
   `not recorded`.
 - **Session copies.** Before TCS Prover deletes a CLI session
   (`_codex_session_deleter()`, `claude_cli.session_deleter()`: structured calls,
-  their retries' forks and team members), the record copies it
+  their retries' forks and the examiner's), the record copies it
   (`Recorder.keep_codex_session()`: every segment of the thread, plain or
   `.zst`, and the subagent threads whose `session_meta` names it as their
   session or parent, any depth; `keep_claude_session()`:
@@ -926,18 +706,17 @@ writes a job's record, `ui/model_calls.py` reads it.
   deleted. A Claude session the CLI never saved (it could not start, or ended
   before saving, as while Claude Code updates itself) has nothing to copy or
   delete, and is neither a problem of the record nor reported as kept. The
-  author's or
-  coordinator's own Codex thread (with its subagents' threads) and Claude
+  author's own Codex thread (with its subagents' threads) and Claude
   session are copied when its session ends without a retry (Pause, Stop, the
   time limit, the end of the work) and after each reply turn, only the files
   that are new or grew (the CLIs only append).
 - **Claude Code.** Every stream-json line of every Claude Code process
-  (structured calls, members, the author, reply turns), after the redaction of
+  (structured calls, the examiner, the author, reply turns), after the redaction of
   transcript records (`claude_cli.scrub_record()`), goes to
   `claude/<label>.jsonl` while the CLI runs and `.jsonl.gz` after
   (`records.ClaudeStream`). A request is one assistant message: its line in
   `calls.jsonl` names its stream lines and the user lines sent since the same
-  agent's previous request (a structured call's or team member's first request
+  agent's previous request (a structured call's or an examination's first request
   also its prompt, which TCS Prover writes to the CLI's input and the stream
   never repeats: `ClaudeStream.sent_input()` stores it once by sha256 and names
   it in `claude/<label>.json`, its call line's `stdin`) and says whether the
@@ -976,7 +755,7 @@ writes a job's record, `ui/model_calls.py` reads it.
   the record of a job that never runs again does not keep the whole answers
   either; its next snapshot then copies the transcript whole.
 - **Codex's settings in the transcript.** Codex's answer to `config/read` (at
-  each start of an author, coordinator, reply or summary turn's app-server, at
+  each start of an author, reply or summary turn's app-server, at
   each liveness probe of TCS Prover's goal loop, and in a web-cutoff run's
   isolation check) holds the user's whole Codex configuration: in the first real
   job about 75 KB each time, with every trusted project folder, each MCP
@@ -1128,21 +907,21 @@ model's values) say the account is out of credit
 "Credit balance is too low", "insufficient credits" or "balance", "payment
 required") or a usage limit (or a login, `NEEDS_YOU_FAILURES`: whichever call
 has it, also while another call waits to retry for another reason or failed
-after it; a team member's failed login or refused key is never retried, as
-`member_problem()` ends its assignment at once, so of a member only a usage
-limit is listed), otherwise once the same failure has repeated for
+after it; the examiner's failed login or refused key is never retried, as
+`member_problem()` ends its examination at once, so of the examiner only a
+usage limit is listed), otherwise once the same failure has repeated for
 `FAILING_ATTENTION_SECONDS` (15 minutes; kind `failing`, *Model calls keep
 failing*). `App._follow_failures()` keeps each call's failure while it keeps
 failing: a retry status with `retryAt` (keyed as the waits are: its
-`activityLabel`, `node` or `stage`), a member's retry note (`member:<id>`) or
+`activityLabel`, `node` or `stage`), the examiner's retry note (`member:<id>`) or
 a paused author's reply's (`conversation:<id>:`); the same failure is the same
 plain words (`failure`, with the provider's line after a generic one such as
 "the CLI stopped unexpectedly") once request IDs and numbers are left out
 (`_failure_signature()`). The streak ends with the model's own output for that
 call (a `codex_event` item other than the user's message or an error, as the
 runner counts an attempt that worked), its step's result (`STEP_RESULT_KINDS`)
-or the next step (a `Workflow step:` status of its stage), the end of a
-member's assignment, or the runner's end. A structured call whose model worked
+or the next step (a `Workflow step:` status of its stage), the end of an
+examination, or the runner's end. A structured call whose model worked
 in the failed attempt (`failureKind` `invalid_answer` or `subagent`, or the
 retry status's `modelOutput`, which `structured()` sets when the attempt
 streamed output before it failed) is still failing at its next attempt's
@@ -1229,7 +1008,7 @@ answered; for a 404, a 429, a 500 after its retries, a dropped connection or a
 body it could not read it sends none, and the model's `web__run` throws (the
 real Codex against a scripted search service). `SearchWatch` follows those
 items; after a turn that completed, the author's goal loop, a structured call
-and a team member (`member_attempt(noted=...)`) each pin a **Web search
+and the examiner (`member_attempt(noted=...)`) each pin a **Web search
 failed** diagnostic (`failedSearches`) naming the connection's search service.
 
 A test of one model (`POST /api-models/test` with its `api:<id>` selection id
@@ -1244,7 +1023,8 @@ only the shape of run requests. A connection's Test (no `model`) loads its
 catalog; for an OpenAI-format one whose catalog loaded it then sends
 `probe_team_tools()`'s request (`team_tool_test_request()`): one function
 `report_result` in a namespace `mcp__tcs`, as Codex 0.160 sends TCS Prover's
-team tools (captured from the real Codex against a scripted model server): in
+tools (`update_goal`; captured from the real Codex against a scripted model
+server): in
 the request's `tools` for a model it does not run as Responses Lite, and for a
 Lite name (`workflow_runner.codex_lite_model()`) in an `additional_tools` input
 item (role `developer`) with `reasoning.context` `"all_turns"`; both streamed,
@@ -1258,7 +1038,7 @@ its first, and passes only when a `function_call` comes back with `name`
 `report_result` and `namespace` `mcp__tcs` (Codex refuses a call without it:
 "unsupported call"). The result is `teamTools` `{ok, model, form, message,
 at}`, recorded in the connection's `lastTest`; `ok` is null (not checked) when
-the answer says nothing about the team tools: no answer within the deadline, a
+the answer says nothing about TCS Prover's tools: no answer within the deadline, a
 status of `TEAM_TOOL_TEST_UNCHECKED_STATUSES` (408, 425, 429 and every 5xx,
 which may pass; 401, 403 and 404, a refused key or model), or another refusal
 (400, 422, …) that the same request without the tools

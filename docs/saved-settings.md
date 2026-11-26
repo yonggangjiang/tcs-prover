@@ -98,10 +98,9 @@ it opens, so connections added or removed in another tab count.
 - Saved settings keep the number of
   [parallel agents](workflow.md#the-author) they were saved with (as the
   author's own subagents, one fewer). TCS Prover's original settings use 1, an
-  author that works alone, and so do saved settings that hold no number.
-  Settings saved while a new job's author was a coordinator load as an author
-  with that many subagents of its own, and any model they chose for each author
-  subagent is dropped as they load.
+  author that works alone, and so do saved settings that hold no number. A
+  model chosen for each author subagent, which settings saved by an earlier
+  version may hold, is dropped as they load.
 - TCS Prover's original settings have the [examiner](workflow.md#the-examiner)
   on, and so do saved settings from before that setting existed.
 - Settings saved while the form still offered a goal loop may hold one: it is

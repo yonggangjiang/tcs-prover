@@ -90,7 +90,7 @@ and `irm https://claude.ai/install.ps1 | iex`.
 4. **Writing.** A LaTeX writer turns the proof into a paper and compiles the PDF.
 
 Each stage can be turned off. On the job page, **Talk to the author** sends the
-author messages and shows its answers; **Pause** and **Resume** hold and
+author messages and shows its replies; **Pause** and **Resume** hold and
 continue it; **Summarize progress** asks for a progress summary (pausing a
 working author first); **Stop** stops the job the way the time limit does, and
 **Continue** picks it up again in the same job. The time limit (none by default)
@@ -102,8 +102,8 @@ retried every minute, without limit.
 | Guide | What it covers |
 | --- | --- |
 | [Models and API connections](docs/models.md) | The Setup page, Codex CLI, Claude Code, API keys, which program each model needs |
-| [The workflow](docs/workflow.md) | Statement review, the author and the author coordinator, the critic, LaTeX |
-| [The job page](docs/job-page.md) | Status, the progress log, the chat, Pause, Summary, Stop, the time limit, related works, downloads, the model calls, the Records page |
+| [The workflow](docs/workflow.md) | Statement review, the author, the critic, LaTeX |
+| [The job page](docs/job-page.md) | Status, the author's memory, the current proof, the chat (also after the job ends), new goals, Pause, Summary, Stop, the time limit, related works, downloads, the model calls, the Records page |
 | [Batches and folder runs](docs/batches.md) | Batches, related works shared with every problem in a batch, running a folder of statements, the running-jobs limit |
 | [Saved settings](docs/saved-settings.md) | Default settings, which new problems open with, and named New problem settings, under **Advanced settings** |
 | [Web search cutoff](docs/web-cutoff.md) | Runs with no web access, or with archives from before a date only |

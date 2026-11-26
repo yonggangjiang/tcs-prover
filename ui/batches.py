@@ -312,7 +312,7 @@ class BatchCatalog:
         return sorted(cards, key=lambda card: (not card['current'], card['id'] != ORIGINAL_BATCH, card['label']))
 
     def _summary(self, directory):
-        from .server import saved_workflow_stages
+        from .server import saved_coordinator_job, saved_workflow_stages
 
         # Controller state is read whole: a paused job must never look finished.
         settings = self._json(directory, 'job-settings.json', None)
@@ -373,6 +373,7 @@ class BatchCatalog:
                 'retrievalCutoffUtc': retrieval['cutoffExclusiveUtc'], 'retrievalPolicyPath': '',
                 'workerActive': False, 'processAlive': False, 'activeElapsedSeconds': elapsed,
                 'canResumeCritic': False, 'canContinueStopped': False, 'checkpoints': [],
+                'coordinatorJob': saved_coordinator_job(settings),
                 'readOnly': True, 'readOnlyReason': 'Saved batch — viewing does not resume or change this job.'}
 
     def _never_started(self, directory, trace_info):
@@ -475,9 +476,9 @@ class BatchCatalog:
             return [], False, 0
 
     def state(self, batch_id, run_id, after=None):
-        from .server import (AUTHOR_MODES, PROGRESS_LOG_FIELDS, PROOF_PROMPTS, RESUME_MARGIN_SECONDS, controller_note,
-                             empty_state, event_node, follow_author_mode, follow_time_limit, model_menu_settings,
-                             role_model_sources, saved_api_models, saved_time_limit_history, workflow_graph)
+        from .server import (PROOF_PROMPTS, RESUME_MARGIN_SECONDS, controller_note, empty_state,
+                             event_node, follow_time_limit, model_menu_settings, ran_as_coordinator, role_model_sources,
+                             saved_api_models, saved_coordinator_job, saved_time_limit_history, workflow_graph)
         directory = self._run(batch_id, run_id)
         state = empty_state()
         state.update(self._summary(directory))
@@ -508,34 +509,23 @@ class BatchCatalog:
                 state[key] = settings[key]
         state['criticCountRecorded'] = _finite_number(settings.get('criticCount'))
         state['authorSubagentsRecorded'] = _finite_number(settings.get('authorSubagents'))
-        # As a restored job: one saved without these is older than the author coordinator, and worked alone.
+        # As a restored job: one saved without its number of subagents is older than that setting, and had none.
         if not state['authorSubagentsRecorded']:
             state['authorSubagents'] = 0
-        state['authorModeRecorded'] = settings.get('authorMode') in AUTHOR_MODES
-        state['authorMode'] = settings['authorMode'] if state['authorModeRecorded'] else 'author'
-        if state['authorMode'] == 'coordinator':
-            # What the page shows of its progress log but the text, which it fetches apart (progress_log()), and when
-            # each of its versions was saved.
-            from .server import saved_progress_log_versions
-            log = self._progress_log(directory, settings)
-            state['coordinatorProgress'] = None if log is None else {key: log[key] for key in PROGRESS_LOG_FIELDS}
-            state['coordinatorProgressVersions'] = saved_progress_log_versions(directory) if log is not None else []
-        # Who ran the goal loop and the coordinator's team, and the texts the job ran with, as a restored job shows
-        # them: a job from before had Codex's goal mode and no TCS Prover team, and saved no texts.
-        from .server import LEGACY_GOAL_LOOP, PROMPT_EDITS_FILENAME, PROMPT_SET_FILENAME, saved_team
-        from runner import team as team_module
+        # A job that ran in coordinator mode (server.COORDINATOR_JOB_TEXT), as a restored job says it.
+        state['coordinatorJob'] = saved_coordinator_job(settings)
+        # The earlier goals of a job continued with new goals, each with its files in goals/<n>/ (server.GOALS_FOLDER).
+        from .server import saved_goals
+        state['goals'] = saved_goals(settings.get('goals'))
+        # Who ran the goal loop, and the texts the job ran with, as a restored job shows them: a job from before had
+        # Codex's goal mode and saved no texts.
+        from .server import LEGACY_GOAL_LOOP, PROMPT_EDITS_FILENAME, PROMPT_SET_FILENAME
         import workflow_runner
         if settings.get('goalLoop') in workflow_runner.GOAL_LOOPS:
             state['goalLoop'] = settings['goalLoop']
             state['legacyTeam'] = settings.get('legacyTeam') is True
-            state['authorTeam'] = saved_team(settings.get('authorTeam'))
-            try:
-                state['authorSubagentModels'] = team_module.validated_team(settings.get('authorSubagentModels'))
-            except ValueError:
-                state['authorSubagentModels'] = None
         else:
-            state.update(goalLoop=LEGACY_GOAL_LOOP, authorTeam=None, authorSubagentModels=None, goalLoopRecorded=False,
-                         legacyTeam=True)
+            state.update(goalLoop=LEGACY_GOAL_LOOP, goalLoopRecorded=False, legacyTeam=True)
         texts = self._json(directory, PROMPT_SET_FILENAME, None)
         state['promptSet'] = texts if texts and all(isinstance(value, str) for value in texts.values()) else None
         # The texts edited for it, which a rerun carries (None: it saved none; {} is a saved "none edited").
@@ -578,8 +568,9 @@ class BatchCatalog:
         for record in records:
             if rebuild:
                 follow_time_limit(history, record)
-            # How a coordinator's author worked, as its runner last reported it among these recent records.
-            state['authorModeEffective'] = follow_author_mode(state.get('authorModeEffective'), record)
+            # A runner that said its author ran in coordinator mode, among these recent records.
+            if ran_as_coordinator(record):
+                state['coordinatorJob'] = True
             kind = _text(record.get('kind'))
             # The controller's notes (the paused author's replies, related works) are not workflow steps.
             if isinstance(record.get('stage'), str) and record['stage'] and not controller_note(record):
@@ -644,25 +635,32 @@ class BatchCatalog:
         with self._open(self._run(batch_id, run_id), name) as stream:
             yield stream
 
-    def _progress_log(self, directory, settings):
-        """A saved coordinator job's progress log (server.read_progress_log()), from the author's working folder
-        when that is an existing folder of this catalog (a run moved into a batch folder still names its old
-        place), else from the run's own folder."""
-        from .server import read_progress_log
-
-        workspace = Path(_text(settings.get('goalWorkspace')) or directory)
-        return read_progress_log(workspace if workspace.is_absolute() and self._directory(workspace) else directory)
-
-    def progress_log(self, batch_id, run_id):
-        """A saved job's progress log as GET /progress-log gives it (server.App.progress_log()), read once."""
-        from .server import PROGRESS_LOG_FIELDS
-
+    def _memory_workspace(self, batch_id, run_id):
+        """The folder whose memory folder a saved job's page shows: the author's working folder when that is an
+        existing folder of this catalog (a run moved into a batch folder still names its old place), else the run's
+        own folder."""
         directory = self._run(batch_id, run_id)
         settings = self._json(directory, 'job-settings.json', None)
-        log = self._progress_log(directory, settings) if settings.get('authorMode') == 'coordinator' else None
-        if log is None:
-            return {'text': None, 'version': None}
-        return {key: log[key] for key in ('text', *PROGRESS_LOG_FIELDS)}
+        workspace = Path(_text(settings.get('goalWorkspace')) or directory)
+        return workspace if workspace.is_absolute() and self._directory(workspace) else directory
+
+    def memory_files(self, batch_id, run_id):
+        """A saved job's memory as GET /memory-files gives it (server.App.memory_files()), read once."""
+        from .server import MEMORY_FOLDER, list_memory_files
+
+        workspace = self._memory_workspace(batch_id, run_id)
+        listing = list_memory_files(workspace)
+        return {'folder': str(workspace / MEMORY_FOLDER), 'exists': listing is not None,
+                **(listing or {'files': [], 'count': 0, 'bytes': 0, 'truncated': False})}
+
+    def memory_file(self, batch_id, run_id, path):
+        """One file of a saved job's memory as GET /memory-file gives it (server.read_memory_file())."""
+        from .server import read_memory_file
+
+        found = read_memory_file(self._memory_workspace(batch_id, run_id), path)
+        if found is None:
+            raise ValueError('That file is not in the author\'s memory, or it is not a file that can be shown.')
+        return found
 
     def response(self, path, batch, job='', query=None):
         """Return a JSON value or a validated download path for a GET route.
@@ -681,14 +679,29 @@ class BatchCatalog:
             except (ValueError, TypeError):
                 raise ValueError('Invalid saved transcript position.') from None
             body = self.state(batch, job, after)
-        elif path == '/progress-log':
-            body = self.progress_log(batch, job)
+        elif path == '/memory-files':
+            body = self.memory_files(batch, job)
+        elif path == '/memory-file':
+            body = self.memory_file(batch, job, query.get('path', ''))
         elif path in {'/transcript', '/download-tex', '/download-pdf'}:
             name = {'/transcript': 'transcript.jsonl', '/download-tex': 'final.tex',
                     '/download-pdf': 'final.pdf'}[path]
             body = self.artifact(batch, job, name)
             content_type = {'/transcript': 'application/x-ndjson', '/download-tex': 'application/x-tex',
                             '/download-pdf': 'application/pdf'}[path]
+            headers['Content-Disposition'] = f'attachment; filename="{name}"'
+        elif path == '/goal-file':
+            # A file of an earlier goal (server.App.goal_file()), read once.
+            from .server import GOAL_FILES, GOALS_FOLDER, saved_goals
+            name, number = query.get('name', ''), query.get('goal', '')
+            directory = self._run(batch, job)
+            settings = self._json(directory, 'job-settings.json', None) or {}
+            if name not in GOAL_FILES or not any(str(goal['number']) == number
+                                                 for goal in saved_goals(settings.get('goals'))):
+                raise ValueError('Unknown file of an earlier goal.')
+            with self._open(directory, f'{GOALS_FOLDER}/{number}/{name}') as stream:
+                body = stream.read()
+            content_type = GOAL_FILES[name]
             headers['Content-Disposition'] = f'attachment; filename="{name}"'
         else:
             raise ValueError('Unknown saved batch request.')

@@ -175,8 +175,8 @@ author's sandbox check (above) runs before every start either way. TCS Prover
 makes the empty folders `.agents`, `.aws`, `.codex` and `.git` in the run
 folder, and in each model call's own folder, before a confined Codex process
 starts there: the places the sandbox keeps read-only for every command, which
-Codex also needs to find when it continues a conversation (a team member's
-follow-up, a retried call). Git treats an empty `.git` as no repository.
+Codex also needs to find when it continues a conversation (a retried call). Git
+treats an empty `.git` as no repository.
 
 ## Windows, and Linux without bubblewrap
 

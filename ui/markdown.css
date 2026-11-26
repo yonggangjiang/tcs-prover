@@ -1,0 +1,137 @@
+/* TCS Prover: typography for a Markdown document rendered by markdown.js (TCSMarkdown.render).
+   Every rule is scoped under .md-doc (render() adds the class to its element), and every colour, face and
+   radius is a token of styles.css, so the document follows the theme (Blue, Brown, Crimson, Ink) and the
+   mode (light, dark). The width is the container's; wide formulas, tables and code scroll sideways inside
+   the document instead of widening the page. KaTeX's own sheet (/vendor/katex/katex.min.css) styles the
+   formulas; the formulas take the text colour. */
+
+.md-doc {
+  min-width: 0;
+  color: var(--ink);
+  font-family: var(--font-prose);
+  font-size: var(--text-md);
+  line-height: var(--leading-prose);
+  overflow-wrap: break-word;
+}
+.md-doc > :first-child { margin-top: 0; }
+.md-doc > :last-child { margin-bottom: 0; }
+/* A long proof has thousands of formulas: the browser lays out and paints only the blocks near the screen
+   (a 250 KB proof with 2,100 formulas: about 0.25 s to the first frame instead of about 0.9 s). A block off
+   screen counts as its estimated height until it has been shown once, then as its real height. */
+.md-doc > p, .md-doc > ul, .md-doc > ol, .md-doc > blockquote, .md-doc > table {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 14em;
+}
+.md-doc > pre, .md-doc > .md-math-display { content-visibility: auto; contain-intrinsic-size: auto 4em; }
+
+/* Headings */
+.md-doc h1, .md-doc h2, .md-doc h3, .md-doc h4, .md-doc h5, .md-doc h6 {
+  margin: 1.6em 0 0.6em;
+  color: var(--ink-strong);
+  font-family: var(--font-display);
+  font-weight: var(--heading-weight);
+  line-height: var(--leading-tight);
+  letter-spacing: var(--tracking-tight);
+}
+.md-doc h1 { font-size: var(--text-2xl); }
+.md-doc h2 { padding-bottom: 0.3em; border-bottom: 1px solid var(--line); font-size: var(--text-xl); }
+.md-doc h3 { font-size: var(--text-lg); }
+.md-doc h4 { font-size: var(--text-md); }
+.md-doc h5, .md-doc h6 { color: var(--ink-2); font-size: var(--text-base); letter-spacing: 0; }
+
+/* Blocks */
+.md-doc p, .md-doc ul, .md-doc ol, .md-doc blockquote, .md-doc pre, .md-doc table, .md-doc hr,
+.md-doc .md-math-display, .md-doc .md-plain { margin: 0 0 1em; }
+.md-doc ul, .md-doc ol { padding-left: 1.6em; }
+.md-doc li { margin: 0.25em 0; }
+.md-doc li > p { margin: 0.4em 0; }
+.md-doc li > ul, .md-doc li > ol { margin: 0.25em 0; }
+.md-doc li::marker { color: var(--ink-3); }
+.md-doc blockquote {
+  padding: 0 0 0 1em;
+  border-left: 2px solid var(--line-strong);
+  color: var(--ink-2);
+}
+.md-doc blockquote > :last-child { margin-bottom: 0; }
+.md-doc hr { height: 0; border: 0; border-top: 1px solid var(--line); }
+.md-doc strong { color: var(--ink-strong); font-weight: 700; }
+.md-doc a { color: var(--accent-text); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.md-doc a:hover { text-decoration-thickness: 2px; }
+
+/* Code */
+.md-doc code {
+  padding: 0.1em 0.35em;
+  border-radius: var(--radius-xs);
+  background: var(--tint-2);
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+}
+.md-doc pre, .md-doc .md-plain {
+  overflow-x: auto;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--console-bg);
+  font: var(--text-sm)/1.6 var(--font-mono);
+  white-space: pre;
+}
+.md-doc .md-plain { white-space: pre-wrap; }
+.md-doc pre code { padding: 0; border-radius: 0; background: none; font-size: inherit; }
+
+/* Tables: a wide table scrolls inside the document. */
+.md-doc table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+}
+.md-doc th, .md-doc td { padding: 6px 12px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+.md-doc th { color: var(--ink-strong); background: var(--tint); font-weight: 650; }
+.md-doc .md-align-left { text-align: left; }
+.md-doc .md-align-center { text-align: center; }
+.md-doc .md-align-right { text-align: right; }
+
+/* Images are never loaded: the alt text, then the address. */
+.md-doc .md-image { color: var(--ink-2); }
+.md-doc .md-image-alt { font-style: italic; }
+.md-doc .md-image-alt::before { content: "[image: "; font-style: normal; }
+.md-doc .md-image-alt::after { content: "]"; font-style: normal; }
+.md-doc .md-image-src { color: var(--ink-3); font-family: var(--font-mono); font-size: 0.875em; overflow-wrap: anywhere; }
+
+/* Math. A placeholder shows its TeX source until KaTeX fills it (and if KaTeX did not load). */
+.md-doc .md-math { color: inherit; }
+.md-doc .md-math-pending { color: var(--ink-3); font-family: var(--font-mono); font-size: 0.875em; }
+.md-doc div.md-math-display { display: block; }
+.md-doc .md-math-display.md-math-pending { display: block; white-space: pre-wrap; }
+/* A long display formula scrolls sideways; the padding keeps the scroll box from clipping tall glyphs. */
+.md-doc .katex-display {
+  margin: 0.25em 0;
+  padding: 0.35em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.md-doc p > .md-math-display .katex-display, .md-doc li > .md-math-display .katex-display { margin: 0.5em 0; }
+.md-doc .katex-display > .katex { max-width: none; }
+.md-doc .katex { font-size: 1.12em; }
+/* A formula KaTeX could not parse: its TeX source, marked. */
+.md-doc .md-math.md-math-error {
+  padding: 0 0.25em;
+  border-bottom: 1px dashed var(--failed);
+  border-radius: var(--radius-xs);
+  color: var(--failed);
+  background: rgb(var(--failed-rgb) / 0.08);
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  white-space: pre-wrap;
+  cursor: help;
+}
+.md-doc div.md-math-error { padding: 0.5em 0.75em; }
+
+@media print {
+  .md-doc > * { content-visibility: visible; }
+  .md-doc pre, .md-doc .md-plain { white-space: pre-wrap; }
+  .md-doc .katex-display, .md-doc table { overflow: visible; }
+}

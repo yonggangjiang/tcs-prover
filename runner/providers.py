@@ -704,8 +704,9 @@ def _last_test(value):
         "status": status if isinstance(status, int) and not isinstance(status, bool) else None,
         "message": (message if isinstance(message, str) else "")[:MAX_TEST_MESSAGE_CHARS],
         "latencyMs": latency if isinstance(latency, (int, float)) and not isinstance(latency, bool) else None,
-        # The request shaped as runs send TCS Prover's team tools (ui.server.probe_team_tools()), of an OpenAI-format
-        # connection's Test: {ok, model, form, message, at}, ok None when the answer said nothing about them.
+        # The request shaped as runs send TCS Prover's tools (update_goal; ui.server.probe_team_tools()), of an
+        # OpenAI-format connection's Test: {ok, model, form, message, at}, ok None when the answer said nothing about
+        # them.
         **({"teamTools": {"ok": None if team.get("ok") is None else team.get("ok") is True, **{
             key: str(team[key])[:MAX_TEST_MESSAGE_CHARS] for key in ("model", "form", "message", "at")
             if isinstance(team.get(key), str)}}} if isinstance(team, dict) else {}),

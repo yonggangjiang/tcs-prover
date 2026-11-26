@@ -659,7 +659,7 @@ def _claude_detail(record, line, kept=None):
                 results.setdefault(block.get("tool_use_id"), block)
     sent = []
     for sha in stream.get("stdin") or ():
-        # What TCS Prover wrote to the CLI's input (the prompt of a structured call or team member), sent first.
+        # What TCS Prover wrote to the CLI's input (the prompt of a structured call or of the examiner), sent first.
         try:
             sent.append(_view({"type": "text", "text": record.objects.get(sha).decode("utf-8", "replace")}))
         except (KeyError, ValueError, OSError, EOFError, zlib.error):

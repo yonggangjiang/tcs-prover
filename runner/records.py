@@ -6,7 +6,7 @@ each model request it traces and sends over HTTP: docs/developers.md, "Job recor
 - Codex's own full trace: every Codex process of a live run gets CODEX_ROLLOUT_TRACE_ROOT=<record>/codex-trace/<label>
   (codex_process()), and each trace is ingested into the record while the process runs and when it ends;
 - the CLI session files: copied into <record>/sources/ (and the copy verified) before TCS Prover deletes any session,
-  and the author's and coordinator's sessions incrementally when they end (keep_codex_session() and the others);
+  and the author's sessions incrementally when they end (keep_codex_session() and the others);
 - Claude Code's output stream: every stream-json line, after TCS Prover's redaction, in <record>/claude/
   (claude_stream());
 - snapshots of the job's transcript, settings and prompt set (snapshot(), by the server).
@@ -1325,7 +1325,7 @@ class ClaudeStream:
     turn's result, shows it ended; at the end of the process the open ones are written too ("interrupted" when no
     result followed them). The file is synced at each call line.
 
-    What TCS Prover writes to the CLI's standard input (a structured call's or team member's prompt), which the stream
+    What TCS Prover writes to the CLI's standard input (a structured call's or the examiner's prompt), which the stream
     never repeats, is kept by sent_input() and belongs to the main agent's next request ("stdin" of its call line).
     """
 
@@ -1733,7 +1733,7 @@ class Recorder:
         return self._copy(codex_session_files(home, thread), f"sources/codex/{thread}", f"Codex session {thread}")
 
     def copy_codex_thread(self, home, thread):
-        """Copy an author's or coordinator's Codex thread into sources/: the files that are new or changed."""
+        """Copy an author's Codex thread into sources/: the files that are new or changed."""
 
         return self._copy(codex_session_files(home, thread), f"sources/codex/{thread}", f"Codex thread {thread}",
                           changed_only=True)
@@ -1745,7 +1745,7 @@ class Recorder:
         return self._copy(claude_session_files(config_dir, session), "sources/claude", f"Claude session {session}")
 
     def copy_claude_session(self, config_dir, session):
-        """Copy an author's or coordinator's Claude Code session into sources/: the files that are new or changed."""
+        """Copy an author's Claude Code session into sources/: the files that are new or changed."""
 
         return self._copy(claude_session_files(config_dir, session), "sources/claude", f"Claude session {session}",
                           changed_only=True)

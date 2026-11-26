@@ -16,10 +16,7 @@ front only when it is not today (*14:05*, *19 Nov 22:32*); durations read
 
 The workflow rail always shows the whole workflow: Statement reviewer, Proof
 author, Independent critic and Writing & polishing (LaTeX editor, Compile
-PDF). Stages not selected for the run are muted. For an
-[author coordinator](workflow.md#the-author-coordinator), the Proof author step
-reads *Coordinates up to 3 author subagents and checks that progress keeps
-growing.* Each step that has worked shows on its right how long, without the
+PDF). Stages not selected for the run are muted. Each step that has worked shows on its right how long, without the
 time the job waited (paused, stopped, or waiting for a Resume); the working
 step's time counts up. Over a job they add up to its active time. One mark shows
 where the run is:
@@ -39,29 +36,13 @@ PDF without TeX), or saving a file. A job whose model calls keep failing the
 same way says so under its title, as the Overview lists it under **Needs your
 attention**: at once for an account out of credit or a usage limit, otherwise
 after 15 minutes of the same failure (see
-[Retries](retries.md#what-needs-you)); its retries go on every minute. A
-coordinator that does not use its team as it should says so there too while
-its run goes on, for example *Coordinator keeps checking on its team instead of
-waiting* (see [the author's team](workflow.md#the-authors-team)).
+[Retries](retries.md#what-needs-you)); its retries go on every minute.
 
 **Run settings**, below the activity log, lists the models and settings the job
-runs with. Its **Proof author** row ends with how the author works:
-
-- An [author coordinator](workflow.md#the-author-coordinator) with
-  [TCS Prover's team](workflow.md#the-authors-team) names each member's model,
-  *coordinator, 3 author subagents: GPT 6.1 Sol · Claude Opus 5.5 · Lab model
-  (API)*, or says *coordinator, 3 author subagents: same model as the
-  coordinator*.
-- A coordinator with the program's own subagents (a web-cutoff run, or a job
-  from before the team) reads *coordinator, up to 3 author subagents at a time*.
-- An author reads *works alone* with **Parallel agents** 1, and with more
-  *3 parallel agents: up to 2 subagents of its own at a time*; the **Examiner**
-  row below it says whether the author has an examiner. When the model of a
-  coordinator job without the team has no subagent tool, its author works
-  alone, and the row says why: *works alone: GPT 5.6 Luna (older) has no
-  subagent tool (coordinator mode needs one)*. A job from before coordinator
-  mode whose author could start subagents keeps its earlier wording, such as
-  *up to 2 subagents at a time*.
+runs with. Its **Proof author** row ends with how the author works: *works
+alone* with **Parallel agents** 1, and with more *3 parallel agents: up to 2
+subagents of its own at a time*; the **Examiner** row below it says whether the
+author has an examiner.
 
 A **Goal loop** row follows: *TCS Prover (editable texts; this job runs with the
 texts saved when it started)* or *Codex built-in (the Codex CLI's own goal mode)*,
@@ -76,18 +57,26 @@ grouped as in **Edit prompts**, each marked *changed* where it differs from
 today's default; for a job from before every text was saved, the role prompts it
 saved, with a note.
 
-In the activity log, the coordinator's team shows as **Author subagent 2 (Claude
-Opus 5.5) started** (the member's number and model, then the first line of its
-assignment and how many members work), **… finished** with the file of its report,
-or **… failed** with the reason; these lines stay listed. A member's own events
-read *Subagent 2 reasoning*, *Subagent 2 tool* and *Subagent 2*. The
-coordinator's team tools show as tool activity (*team_assign · completed*). Each
+**Jobs that ran in coordinator mode.** Earlier versions of TCS Prover could run
+the proof author as a coordinator of author subagents. Such a job still opens
+with its activity log, results, downloads and model calls, and its **Proof
+author** row reads *coordinator mode, from an earlier version of TCS Prover*.
+It cannot be resumed, continued or sent a message: its page offers no
+**Resume**, **Continue** or **Send** and says *This job ran in coordinator mode,
+which TCS Prover no longer has; its record and results stay readable.* A new
+job made from it is an ordinary author job, without its coordinator settings
+and texts.
+
+In the activity log, the author's own subagents show as **Author subagent
+started** (the first line of its assignment and how many run), then **…
+finished**, or **… failed** with the reason; these lines stay listed. An
+examination of the [examiner](workflow.md#the-examiner) shows the same way, with
+the task *Examination of the whole run* and the file of its report. Each
 `update_goal` call of an author in TCS Prover's goal loop is a **Goal status**
 line, such as **Goal status · blocked**, with the author's note and what TCS
 Prover does next: it never stops for a blocked or paused goal, and when the turn
 of a complete one ends, its final reply is handed on as the author's answer; a
-turn without a final reply, and a coordinator's reply that names no proof file
-(kept as a report), get the continuation instead. At the end of each of the
+turn without a final reply gets the continuation instead. At the end of each of the
 author's turns, **Author cache usage** says how many of the turn's input tokens
 were cached, over all of the turn's model requests (*… in the turn's 23 model
 requests* for a Codex author), not only its last one.
@@ -120,32 +109,56 @@ A finished result appears in the output panel. An unfinished run's own text is
 not shown there, since its progress summary says where it stands; it stays in
 `partial-output.md`.
 
-## Progress log
+## Memory
 
-A job with an [author coordinator](workflow.md#the-author-coordinator) shows a
-**Progress log** in its status card, before **Talk to the author**: the
-coordinator's `memory/progress.md`, the log of the team's progress that its
-prompt asks it to keep. A line above it says
-*Written by the author coordinator in memory/progress.md · updated 4 min ago*.
+The author keeps what it must not lose when its conversation is compacted in
+the `memory` folder of its working folder, organized as it sees fit: its notes
+on each approach, checks and their scripts, data, and the papers it saved.
+**Memory**, in the status card before **Talk to the author**, lists all of it
+once the folder holds a file, closed until you open it. Its line says how much
+there is and which note changed last (*Memory · 79 files · 30.4 MB · latest:
+status.md, 14:05*), so you can see what the author works on without opening it.
 
-- TCS Prover reads the file again whenever it changes, and the card follows.
-- The log is shown as plain text, never run or rendered (its Markdown stays as
-  written), in a box that stays scrolled to the end as the log grows, unless you
-  scroll up in it.
-- Of a file longer than 100,000 characters the card shows the last 100,000 and
-  says so, with the size of the whole file and where it is.
-- Under the log, *Saved 5 times, last at 14:50:46* opens the time of each saved
-  version, oldest first, as TCS Prover read the file (about once a second;
-  versions saved within that second count as one). The coordinator's entries
-  carry no dates of their own. The times of the newest 500 versions are kept:
-  past 500 the count goes on, and the times say *Only the newest 500 times are
-  kept*. A log that already existed when TCS Prover first read it (a job from
-  before these times, or one run while no TCS Prover server read it) reads
-  *Saved at least …*: its earlier saves are not counted.
-- Until the coordinator writes the file, the card says *The coordinator has not
-  written its progress log yet.*
-- With a model that has no subagent tool, the author of a coordinator job works
-  alone and writes no log: one line says so in place of the card.
+- **Opening it** the first time shows the list and opens the Markdown note the
+  author changed last.
+- **The list** names each file with its folder, its size and when it last
+  changed. **Sort by** puts the newest change first (what the author works on
+  now) or orders by name; the field above filters by a part of the name. While
+  the section is open the list is read again every 10 seconds.
+- **Open a file** by clicking it: it appears under the list and is read again
+  when the file changes (you keep your place in it). A Markdown note is shown
+  rendered for reading, its formulas typeset; **Show source** shows its text as
+  written. Any other file is shown as plain text. Nothing in a file is ever run:
+  HTML in a note is shown as text, links open only to web addresses, and
+  images are not loaded.
+- Of a file longer than 200,000 characters the box shows the first 200,000 and
+  says so, with the size of the whole file and where it is. A file that is not
+  text (a PDF, say) is not shown. **Download** saves any file whole; a saved
+  batch only shows the files.
+- Not listed: compiled Python (`__pycache__`), links, and anything that is not
+  a regular file. Past 2,000 files, or below 8 folders deep, the list says that
+  the folder holds more and where it is.
+- A TCS Prover server started before this section existed cannot list the
+  folder: one line says so in the section's place, with where the files are
+  meanwhile (you can open them there), and to restart TCS Prover when it suits
+  you. A running job pauses at the restart and continues by itself about a
+  minute later.
+
+## Current proof
+
+Once the author hands in its proof, **Current proof** shows it while the critic
+checks it and while the paper is written from it, paused or stopped there too,
+until the job has its result:
+
+- during the critic, the proof as handed in (`saved-candidate.md`), with the
+  critic's fixes after each round; it is not accepted yet;
+- once the critic accepts it, the accepted proof the paper is written from.
+
+It is rendered like a memory note, formulas typeset, with **Show source** for
+the Markdown as written, and follows the file as it changes. A proof longer
+than 1,000,000 characters is shown up to there, and the card says so. The
+**Final answer** of a finished job shows its proof the same way; a LaTeX source
+and a failure report stay as written.
 
 ## Talk to the author
 
@@ -155,21 +168,40 @@ author's questions and the progress summaries. **Send** sends a message of 1 to
 12,000 characters.
 
 - **While the author works**, the message reaches it as a live instruction at its
-  next step. TCS Prover adds a short note: if the message asks a question or for
-  information, the author writes its answer, addressed to you, to
-  `chat/answer-<id>.md` in its working folder and then continues its proof work;
-  if it only gives an instruction, the author follows it. The answer appears
+  next step. TCS Prover adds a short note, so every message gets a reply,
+  addressed to you, in `chat/answer-<id>.md` in its working folder: an answer if
+  the message asks a question or for information, a short confirmation (that it
+  received the instruction and how it will follow it) if it only gives an
+  instruction. The author then continues its proof work. The reply appears
   under your message once the file has not changed for 2 seconds, and is updated
   if the author changes it. A message the author has taken in shows **Delivered
-  to the author**. Nothing waits for an answer; a message that gets none simply
-  stays delivered. An author coordinator of Claude Code takes it in when its
-  running subagents report, since they run in the foreground.
+  to the author**. A job keeps the prompts it started with: one started before
+  instructions were confirmed, or whose chat prompt was edited, may follow an
+  instruction without a reply, and the card's note says so. Nothing waits for a
+  reply; a message that gets none simply stays delivered. A Claude Code author
+  with subagents takes it in when its running subagents report, since they run
+  in the foreground.
 - **While the job is paused or stopped at the author** (by you, at the time
   limit, after a restart or a failure), the paused author answers in its own
   saved conversation (see [below](#replies-of-the-paused-author)).
 - **While another step works**, or the job is pausing or stopping, **Send** is
   off and the card says when the author works again. What you typed stays, also
   after a reload.
+
+While something is under way, its row says so with three moving dots and how
+long it has waited, so the chat never looks stuck:
+
+- a message the working author has not taken in yet;
+- then **The author is replying…**, until its reply replaces the line. A
+  message the author may leave unanswered (sent to a job with its own chat
+  prompt, or by an earlier TCS Prover) shows no dots once delivered;
+- a paused author's reply or summary: **Waiting to start…**, then **The author
+  is replying…** or **The author is writing the summary…**.
+
+A start or a model call that waits to be tried again, a job paused, stopped or
+at another step, and a saved batch keep a plain line; under reduced motion the
+dots stand still and the time still counts. **Send** reads **Sending…** until
+TCS Prover has the message.
 
 Answers are shown as plain text, never run or rendered; one longer than 100,000
 characters is shortened in the chat, which says so and offers the whole file. A
@@ -181,8 +213,16 @@ when it continues. A job continued as a new job gets your earlier messages
 among its earlier instructions (in `USER_INSTRUCTIONS.md` in its working folder
 when they do not fit in one). In a web-cutoff run every message is recorded in
 the run's audit log before the author receives it; one the log does not accept
-is not sent, and the page says so. A finished job, and a saved (read-only)
-batch, show the conversation without the box.
+is not sent, and the page says so. A saved (read-only) batch, and a finished
+job whose author never started its conversation, show the conversation without
+the box.
+
+- **Once the job has finished**, **Send** and **Summarize progress** still ask
+  the author, which answers in its own saved conversation, without changing
+  files, exactly as while it is paused (see
+  [below](#replies-of-the-paused-author)): ask it about its work or the paper.
+  Under the box, **Set a new goal…** continues the job (see
+  [New goal](#new-goal)).
 
 ### Summarize progress
 
@@ -192,7 +232,7 @@ author writes a progress summary in the chat, and **Resume** continues the work.
 While the author is paused or stopped, it writes the summary at once; while it
 is still pausing or stopping, it writes it once it has paused or stopped. Only
 the time limit writes a summary by itself. A live run saves the newest one as
-`progress-summary.md`. An author coordinator writes it from the team's memory.
+`progress-summary.md`.
 
 ### Replies of the paused author
 
@@ -222,6 +262,35 @@ Claude session and so remembers the exchange; the work itself continues only on
   process running the job).
 - A **Pause and summarize** that arrives just as the author hands in its proof
   says so: the job then paused at the critic, where the author cannot write it.
+
+### New goal
+
+A finished job can continue with a new goal: the same job, run folder, memory
+and author conversation, so the author builds on everything it did. **Set a new
+goal…**, under the chat's box, opens a form:
+
+- **New goal**: write it as a precise statement. It becomes the job's statement:
+  the author proves it, the critic checks the proof against it, and Writing &
+  polishing runs if the job has it.
+- **Time limit for the whole job**: the job's limit counts all of its active
+  time, over every goal. A limit already used up must be raised, or set to 0 for
+  none, with the goal; the form says how much active time the job has used.
+
+**Start the new goal** reopens the author's saved conversation with the
+`new_goal` text, which tells it that the goal changed and gives it the new task
+in full; the job then runs as any job does. The goal it finished is kept:
+
+- its statement and results move to `goals/<n>/` in the run folder (the proof,
+  the accepted input to the writer, the paper and its LaTeX files, the saved
+  candidate), with copies of the author's `proof.md` and progress summary;
+- **Earlier goals**, under the statement, lists each one, newest first, with how
+  it ended and when and its statement; **Read the proof** shows its proof
+  rendered, and its paper and proof download from there;
+- the statement card reads *Goal 2 · statement being solved*, and the job's
+  result, downloads and checkpoints are the new goal's.
+
+A new goal is refused, with the reason, while a reply is being written, for a
+web-cutoff run, and for a job whose author never started its conversation.
 
 ### Questions from the author
 
@@ -371,10 +440,11 @@ do, so the proof must still be complete and self-contained.
   interrupted: in its first prompt, by a live instruction while it works, or
   with your next message or **Resume** while it is paused.
 - The list marks the works its batch shares with every problem **from the
-  batch**, and those of its folder run **from the folder run**; the note above
-  the list says where they are managed (the batch page). A work removed from
-  the batch's shared works that this job kept is marked **from the batch, no
-  longer shared**. The others are the job's own.
+  batch**; the note above the list says where they are managed (the batch
+  page). A work removed from the batch's shared works that this job kept is
+  marked **from the batch, no longer shared**. The works its folder run
+  started with are marked **from the folder run**. The others are the job's
+  own.
 - Works are only ever added to a job: its page cannot remove or download them,
   and a saved file is never overwritten. The one exception: a work removed from
   the batch's shared works also leaves the jobs whose author has not started
@@ -411,10 +481,10 @@ LaTeX step runs or waits for TeX, **Download source** gives the current
 
 Every job keeps a record of its model calls in `.tcs-prover/records/<run
 folder>/`, apart from its run folder: what was sent to the model and what came
-back, for each request of every role (the statement reviewer, the author or
-coordinator and its replies and progress summaries, the critic and its
-independent critics, the LaTeX writer and its repairs,
-and the coordinator's team members), with its model, tokens, timing and status.
+back, for each request of every role (the statement reviewer, the author and
+its replies, progress summaries, subagents and examiner, the critic and its
+independent critics, the LaTeX writer and its repairs), with its model, tokens,
+timing and status.
 
 - **What it holds.** For the Codex CLI, Codex's own full trace: each request
   exactly as sent (its instructions, tools and whole input), each response with
@@ -445,12 +515,11 @@ and the coordinator's team members), with its model, tokens, timing and status.
 **Model calls · 18** on the Live activity card (the count follows the record)
 opens the job's **Model calls** page: the list of its calls at the left, the
 chosen call at the right. Each row is one model request: its number, its role
-(*Coordinator · round 1*, *Member 2 · assignment 3*, *Independent critic ·
-round 1*), its start time, its model, how long it took and its tokens in and
+(*Author*, *Independent critic · round 1*), its start time, its model, how long it took and its tokens in and
 out, its status (a check mark when done, *Failed*, *Cancelled*,
 *Interrupted*, *Not recorded*) and a crossed-out eye when the provider kept
-its reasoning hidden. **All**, **Coordinator** (**Author** for a job without a
-coordinator), **Members** and **Critics** filter the list, and the search box
+its reasoning hidden. **All**, **Author**, **Members** (the author's subagents
+and its examiner) and **Critics** filter the list, and the search box
 keeps the rows whose role, model, status or failure has your words; a number
 counts as a whole number (*round 3* finds the round 3 calls, not call 213), and
 a number alone also finds the call with that number. While the

@@ -36,7 +36,7 @@ from retrieval import isolated_compiler
 from retrieval import runtime as retrieval_runtime
 from runner import claude_cli, prompt_catalog, providers, records
 from runner import team as team_module
-from . import model_calls, named_batches, ownership, presets, program_setup, related_works, retrieval
+from . import model_calls, named_batches, ownership, page_files, presets, program_setup, related_works, retrieval
 from .local_host import same_origin, trusted_host
 from .review import REVIEW_PROMPT
 
@@ -65,35 +65,51 @@ try:
 except Exception:  # noqa: BLE001 - an edited workflow file must never keep the server from starting.
     DEFAULT_AUTHOR_SUBAGENTS = 0
 MAX_AUTHOR_SUBAGENTS = getattr(runtime, "MAX_AUTHOR_SUBAGENTS", 10)
-# How a job's proof author works, recorded when the job starts (authorMode; workflow_runner.py --author-mode):
-# "author", every new job's unless it asks otherwise, proves the statement itself, alone or (authorSubagents 1 or
-# more) with its program's own subagent tool; "coordinator", the earlier team design, does not prove the statement
-# but coordinates that many author subagents. A job keeps the mode it recorded: one that started with a coordinator
-# is resumed and continued with one, and a job saved without a mode (every job from before the coordinator) is
-# "author".
-AUTHOR_MODES = ("coordinator", "author")
-# What a start passes for a job that keeps a coordinator job's mode (_kept_author_mode()): a coordinator while it has
-# 1 or more author subagents, else an author.
-KEPT_COORDINATOR = "kept-coordinator"
-# The author coordinator's progress log, which the job page shows (state.coordinatorProgress): the runner's
-# memory/progress.md in the author's working folder. The page gets its last MAX_PROGRESS_LOG_CHARS characters.
+# A job that ran in coordinator mode (state.coordinatorJob): its proof author coordinated author subagents instead
+# of proving the statement itself, which earlier versions of TCS Prover offered. Such a job recorded authorMode
+# "coordinator" in its job settings (with 1 or more author subagents), or its runner said so on starting the author
+# (a status with authorModeEffective "coordinator"). It still loads and shows its record and results, but nothing
+# runs for it again: every launch, message and reply turn is refused with COORDINATOR_JOB_TEXT. A start request that
+# asks for coordinator mode is refused with COORDINATOR_REQUEST_TEXT, one that names per-subagent models with
+# SUBAGENT_MODELS_TEXT.
+COORDINATOR_JOB_TEXT = ("This job ran in coordinator mode, which TCS Prover no longer has; its record and results "
+                        "stay readable.")
+COORDINATOR_REQUEST_TEXT = ("TCS Prover no longer has coordinator mode: the proof author proves the statement "
+                            "itself, and Parallel agents gives it subagents of its own.")
+SUBAGENT_MODELS_TEXT = ("TCS Prover no longer has per-subagent models (they were part of coordinator mode): the "
+                        "author's subagents run the author's model.")
 MEMORY_FOLDER = getattr(runtime, "MEMORY_FOLDER", "memory")
-PROGRESS_LOG = getattr(runtime, "PROGRESS_LOG", "progress.md")
-MAX_PROGRESS_LOG_CHARS = 100_000
-PROGRESS_LOG_READ_BYTES = 4 * MAX_PROGRESS_LOG_CHARS + 4
-# What a job's state shows of that log: all but its text, which the page fetches apart (/progress-log,
-# App.progress_log()) when "version" changes.
-PROGRESS_LOG_FIELDS = ("updatedAt", "truncated", "chars", "bytes", "version")
-# The coordinator dates none of its entries by itself: the job keeps when each version of the log was saved, as the
-# server read it (about once a second, so versions saved within one second are one), {"version", "at", "chars"} for
-# the newest PROGRESS_LOG_VERSIONS versions, in the controller's PROGRESS_LOG_VERSIONS_FILE; the page lists their
-# times (coordinatorProgressVersions).
-PROGRESS_LOG_VERSIONS = 500
-PROGRESS_LOG_VERSIONS_FILE = "progress-log-versions.json"
-# The author coordinator's own status records that the page's window keeps (important_record()): its hourly time
-# checks and its replies that named no proof file, a few per hour at most.
-COORDINATOR_RECORD_LABELS = frozenset({getattr(runtime, "COORDINATOR_CHECKIN_LABEL", "Coordinator time check"),
-                                       getattr(runtime, "COORDINATOR_REPORT_LABEL", "Coordinator report")})
+# The author's memory, which the job page lists (GET /memory-files) and shows one file at a time (GET /memory-file):
+# the files of MEMORY_FOLDER in the author's working folder, in folders up to MEMORY_DEPTH_MAX names deep, at most
+# MEMORY_LIST_MAX of them (found among at most MEMORY_SCAN_MAX entries); compiled Python (MEMORY_SKIPPED_FOLDERS) is
+# left out. The page gets a file's first MAX_MEMORY_FILE_CHARS characters.
+MEMORY_LIST_MAX = 2000
+MEMORY_SCAN_MAX = 20_000
+MEMORY_DEPTH_MAX = 8
+MEMORY_SKIPPED_FOLDERS = frozenset({"__pycache__"})
+MAX_MEMORY_FILE_CHARS = 200_000
+# The proof the job page shows while the critic checks it or the paper is written from it (GET /current-proof,
+# App.current_proof()): the proof the critic accepted (final-input.json) once there is one, else the saved candidate
+# (saved-candidate.md: the author's hand-in, with the critic's fixes after each round). The page gets its first
+# MAX_CURRENT_PROOF_CHARS characters; the job's state carries only which file it is and its size and change time
+# (currentProof), so the page reads the text again only when it changed.
+MAX_CURRENT_PROOF_CHARS = 1_000_000
+# A finished job can continue with a new goal (App.set_new_goal()): the same job, run folder, memory and author
+# conversation, with the new goal as its statement. Each earlier goal's statement and results are kept in
+# GOALS_FOLDER/<n>/ of the run folder (state.goals): the result files are moved there (GOAL_RESULT_FILES and every file
+# named final.* or latex-*.log), so the job's state, checkpoints and downloads follow the new goal, and the author's
+# proof file and newest progress summary are copied (GOAL_COPIED_FILES). The page offers an earlier goal's files for
+# reading and download (GET /goal-file: GOAL_FILES).
+GOALS_FOLDER = "goals"
+GOAL_RESULT_FILES = ("final-input.json", "proof-output.md", "failure-summary.md", "partial-output.md",
+                     "saved-candidate.md", "SOLUTION.md")
+GOAL_COPIED_FILES = ("proof.md", "progress-summary.md")
+GOAL_FILES = {"checked-statement.md": "text/markdown; charset=utf-8", "proof-output.md": "text/markdown; charset=utf-8",
+              "failure-summary.md": "text/markdown; charset=utf-8", "partial-output.md": "text/markdown; charset=utf-8",
+              "final.tex": "application/x-tex; charset=utf-8", "final.pdf": "application/pdf"}
+NEW_GOAL_LABEL = "New goal set"
+MAX_GOALS = 100
+MEMORY_FILE_READ_BYTES = 4 * MAX_MEMORY_FILE_CHARS + 4
 # Long diffs of the critic coordinator's changes, in the run's controller folder (see App.critic_diff).
 CRITIC_DIFFS_FOLDER = "critic-diffs"
 CRITIC_DIFF_NAME = re.compile(r"round-[0-9]+-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}\.diff")
@@ -225,8 +241,11 @@ STOPPED_CONTINUE_DESCRIPTIONS = {
     "latex_repair": "Compiles the saved LaTeX source again in this same job.",
 }
 # The chat's note (state.conversation.note): what Send does now, or why it is off and when the author works again.
-CHAT_NOTE_AUTHOR = ("Your message reaches the author at its next step. If you ask something, it writes its answer "
-                    "here and keeps working; an instruction it simply follows.")
+CHAT_NOTE_AUTHOR = ("Your message reaches the author at its next step. It replies here and keeps working: an answer "
+                    "if you ask something, a short confirmation if you give an instruction.")
+# A job whose chat prompt is not the built-in one (started before it asked for a confirmation, or edited).
+CHAT_NOTE_AUTHOR_OWN_PROMPT = ("Your message reaches the author at its next step. If you ask something, it writes its "
+                               "answer here and keeps working; an instruction it simply follows.")
 CHAT_NOTE_PAUSED = ("The author answers in its saved conversation without changing files, and remembers the "
                     "exchange when the work continues. Replies do not use the time limit.")
 CHAT_NOTE_PAUSED_CUTOFF = ("The author answers in its saved conversation, and remembers the exchange when the work "
@@ -249,6 +268,11 @@ CHAT_NOTE_HELD_CRITIC = ("The job is {held} at the critic step. If the critic se
                          "you can write to the author then.")
 CHAT_NOTE_HELD_AFTER = "The job is {held} at the {step} step. The proof author does not work again in this run."
 CHAT_NOTE_DONE = "This job has finished, so the author can no longer be asked."
+# A finished job whose author can still answer in its saved conversation (a reply turn, as while paused).
+CHAT_NOTE_FINISHED = ("The job has finished. The author answers in its saved conversation without changing files, "
+                      "and remembers the exchange. To continue the work with the same memory, set a new goal.")
+CHAT_NOTE_FINISHED_CUTOFF = ("The job has finished. The author answers in its saved conversation and remembers the "
+                             "exchange. To continue the work with the same memory, set a new goal.")
 CHAT_NOTE_NO_AUTHOR = "This job has no Author stage."
 CHAT_NOTE_NO_THREAD = "The author has not started its conversation yet; ask for a summary once it has."
 CHAT_NOTE_SUMMARY_QUEUED = "A progress summary is already asked for; the author writes it once it has paused."
@@ -358,9 +382,10 @@ API_TEST_STRUCTURED_PROMPT = (
 )
 API_TEST_SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"],
                    "additionalProperties": False}
-# The Test of an OpenAI-format connection also sends one request shaped as Codex 0.160 sends TCS Prover's team tools
-# to a coordinator (probe_team_tools()): a function tool in the namespace mcp__tcs (Codex's name for the MCP server
-# "tcs"), in the request's tools, or for a model name Codex runs as Responses Lite (workflow_runner.codex_lite_model())
+# The Test of an OpenAI-format connection also sends one request shaped as Codex 0.160 sends TCS Prover's tools (its
+# update_goal, with which a Codex author under TCS Prover's goal loop ends its goal) to the model
+# (probe_team_tools()): a function tool in the namespace mcp__tcs (Codex's name for the MCP server "tcs"), in the
+# request's tools, or for a model name Codex runs as Responses Lite (workflow_runner.codex_lite_model())
 # in an additional_tools input item, with Codex's other Lite settings (reasoning context "all_turns", the encrypted
 # reasoning, store false, the header TEAM_TOOL_TEST_LITE_HEADER), as captured from the real Codex against a scripted
 # model server. It passes only when the
@@ -370,14 +395,14 @@ TEAM_TOOL_TEST_NAMESPACE = f"mcp__{team_module.SERVER_NAME}"
 TEAM_TOOL_TEST_TOOL = "report_result"
 # The header that Codex 0.160 sends with a Lite model's requests (the real Codex's captured requests).
 TEAM_TOOL_TEST_LITE_HEADER = "x-openai-internal-codex-responses-lite"
-# The answers to that request which say nothing about the team tools, so that they stay not checked (ok None), and
+# The answers to that request which say nothing about TCS Prover's tools, so that they stay not checked (ok None), and
 # the end of the message's sentence: a status that may pass (500 stands for every 5xx) and a refused key or model.
 # No answer within the deadline leaves them not checked too; any other refusal (400, 422, ...) is theirs only when
 # the same request without them is answered.
 TEAM_TOOL_TEST_UNCHECKED_STATUSES = {
     **dict.fromkeys((408, 425, 429, 500), "which may pass. Test again later."),
-    **dict.fromkeys((401, 403, 404), "a refusal of the key or of this model, which says nothing about the team "
-                                     "tools."),
+    **dict.fromkeys((401, 403, 404), "a refusal of the key or of this model, which says nothing about TCS "
+                                     "Prover's tools."),
 }
 TEAM_TOOL_TEST_PROMPT = ('This is a connection test. Call the report_result tool with {"ok": true}, and do nothing '
                          "else.")
@@ -674,27 +699,23 @@ def follow_critic_progress(progress, record, critic_count=None):
             "failed": sorted([*progress["failed"], index]) if record.get("failed") is True else progress["failed"]}
 
 
-def follow_author_mode(effective, record):
-    """The way a job's author works as its runner last reported it, after one more transcript record.
+def ran_as_coordinator(record):
+    """Whether a transcript record says that the job's author ran in coordinator mode (see COORDINATOR_JOB_TEXT): the
+    "Goal started" or "Goal resumed" status of a coordinating author carried authorModeEffective "coordinator"."""
 
-    A coordinator job's runner says how its author works when it starts it: a "No subagents with this model"
-    status with authorModeEffective "author" when the model has no subagent tool, so the author works alone
-    (workflow_runner.note_no_subagent_tool()), and authorModeEffective "coordinator" on each "Goal started" or
-    "Goal resumed" status of a coordinating author. The value is {"mode": "author", "modelLabel", "reason"} for
-    the first, None for the second (the job's recorded authorMode holds); a record that says neither leaves it.
-    """
+    return (isinstance(record, dict) and record.get("kind") == "status" and record.get("root") is not False
+            and record.get("authorModeEffective") == "coordinator")
 
-    if (not isinstance(record, dict) or record.get("kind") != "status" or record.get("root") is False
-            or record.get("stage") == "conversation"):
-        return effective
-    mode = record.get("authorModeEffective")
-    if mode == "coordinator":
-        return None
-    if mode == "author":
-        label = record.get("modelLabel")
-        return {"mode": "author", "modelLabel": label if isinstance(label, str) else "",
-                "reason": str(record.get("text") or "")}
-    return effective
+
+def saved_coordinator_job(settings):
+    """Whether a job's saved settings (its job-settings.json) say that it ran in coordinator mode: authorMode
+    "coordinator" with 1 or more author subagents, as such a job recorded it."""
+
+    if not isinstance(settings, dict) or settings.get("authorMode") != "coordinator":
+        return False
+    count = settings.get("authorSubagents")
+    return isinstance(count, int) and not isinstance(count, bool) and count >= 1
+
 
 # The records that start a job's runner again after it waited (the gap before one is never work), and those after
 # which it waits (follow_step_times).
@@ -895,8 +916,9 @@ CHAT_TEXT_FIELDS = ("steerId", "answerFile", "deliveredAt", "answerPath", "answe
 def controller_note(record):
     """Whether a transcript record is a controller note that says nothing about the workflow's progress.
 
-    The paused author's replies (stage "conversation") and related-works
-    records are written while a job waits or is paused; a restart skips them.
+    The replies of the paused or finished author (stage "conversation") and
+    related-works records are written while a job waits, is paused or has
+    finished; a restart skips them, and they never move the job's step.
     """
 
     return isinstance(record, dict) and record.get("stage") in {"conversation", RELATED_WORKS_STAGE,
@@ -919,6 +941,8 @@ def saved_conversation_items(value):
             extra["answerBytes"] = item["answerBytes"]
         if isinstance(item.get("answerShortened"), bool):
             extra["answerShortened"] = item["answerShortened"]
+        if isinstance(item.get("replyExpected"), bool):
+            extra["replyExpected"] = item["replyExpected"]  # The author replies to it (App._chat_replies_locked).
         signature = item.get("answerStat")
         if isinstance(signature, list) and len(signature) == 2 and all(type(value) is int for value in signature):
             extra["answerStat"] = list(signature)
@@ -1174,109 +1198,221 @@ def read_chat_answer(workspace, identity, signature=None):
             "shortened": not whole or len(text) > MAX_CHAT_ANSWER_CHARS, "signature": list(current)}
 
 
-def progress_log_signature(workspace):
-    """(size, mtime_ns) of the author coordinator's progress log in ``workspace``, or None when it is not there."""
+def memory_name(name):
+    """Whether ``name`` is a plain file or folder name of the author's memory: printable, at most 255 characters,
+    never ".", ".." or a name with a path separator (on Windows nor a colon, which names a drive or a stream)."""
 
-    descriptor = _author_file_descriptor(Path(workspace) / MEMORY_FOLDER, PROGRESS_LOG)
-    if descriptor is None:
-        return None
-    try:
-        info = os.fstat(descriptor)
-        return (info.st_size, info.st_mtime_ns)
-    except OSError:
-        return None
-    finally:
-        os.close(descriptor)
+    return (isinstance(name, str) and 0 < len(name) <= 255 and name not in {".", ".."} and name.isprintable()
+            and "/" not in name and "\\" not in name and not (os.name == "nt" and ":" in name))
 
 
-def read_progress_log(workspace, signature=None):
-    """The author coordinator's progress log as the job page shows it, or None when it cannot be read now.
+def memory_path_parts(path):
+    """The names of one memory file's path as the page lists it ("checks/lemma-2.md"): its folders, then the file.
 
-    The log is memory/progress.md (MEMORY_FOLDER, PROGRESS_LOG) in the author's working folder ``workspace``,
-    opened as a chat answer is (_author_file_descriptor: a link, a FIFO or a file with a second hard link is
-    never read). Of a longer file only its last PROGRESS_LOG_READ_BYTES are read, which hold at least its last
-    MAX_PROGRESS_LOG_CHARS characters; they are decoded as UTF-8 (invalid bytes replaced), with line ends
-    normalized and control characters removed. {"text": its last MAX_PROGRESS_LOG_CHARS characters at most,
-    "chars": how many characters "text" holds, "truncated": whether the file holds more than that, "bytes": the
-    size of the whole file, "updatedAt": its modification time (UTC, ISO 8601), "version": a digest of "text",
-    which changes when it changes, "signature": (size, mtime_ns)}.
-    None: the file is not there, cannot be opened or read now, or changed since ``signature`` or while it was
-    read (the next check reads it again). The text is untrusted model output: shown, never run.
+    ValueError for anything else: an empty or absolute path, a name memory_name() refuses, or more than
+    MEMORY_DEPTH_MAX names. The names are looked up one at a time below the memory folder, never as one path, so
+    no path leaves it.
     """
 
-    descriptor = _author_file_descriptor(Path(workspace) / MEMORY_FOLDER, PROGRESS_LOG)
+    if not isinstance(path, str) or not path or len(path) > 4096:
+        raise ValueError("Name a file of the author's memory.")
+    parts = path.split("/")
+    if len(parts) > MEMORY_DEPTH_MAX or not all(memory_name(part) for part in parts):
+        raise ValueError("That is not a file of the author's memory.")
+    return parts
+
+
+def _memory_root(workspace):
+    """Open the memory folder of the author's working folder ``workspace`` for a walk that follows no link, or
+    return None when it is not a real folder.
+
+    The author can write that folder. Where a folder can be opened below an open one (os.open with dir_fd), the
+    walk holds each folder open, so none can be swapped for a link meanwhile: an int. Elsewhere (Windows) it is
+    the folder's path, and every entry is checked before it is used.
+    """
+
+    folder = Path(workspace) / MEMORY_FOLDER
+    try:
+        info = os.lstat(folder)
+    except OSError:
+        return None
+    if linked_entry(info) or not stat.S_ISDIR(info.st_mode):
+        return None
+    if not (NOFOLLOW and hasattr(os, "O_DIRECTORY") and os.open in os.supports_dir_fd
+            and os.scandir in os.supports_fd):
+        return folder
+    try:
+        return os.open(folder, os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW)
+    except OSError:
+        return None
+
+
+def _memory_enter(handle, name):
+    """Open the folder ``name`` of the open memory folder ``handle`` (_memory_root()), never through a link."""
+
+    if isinstance(handle, int):
+        try:
+            return os.open(name, os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW, dir_fd=handle)
+        except OSError:
+            return None
+    path = handle / name
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    return path if stat.S_ISDIR(info.st_mode) and not linked_entry(info) else None
+
+
+def _memory_leave(handle):
+    if isinstance(handle, int):
+        try:
+            os.close(handle)
+        except OSError:
+            pass
+
+
+def list_memory_files(workspace):
+    """The files of the author's memory as the job page lists them, or None when there is no memory folder.
+
+    {"files": [{"path", "bytes", "updatedAt"}] by path, "count", "bytes": their total size, "truncated": whether
+    the folder holds more than is listed (more than MEMORY_LIST_MAX files or MEMORY_SCAN_MAX entries, or folders
+    deeper than MEMORY_DEPTH_MAX names)}. "path" is the file's place below the memory folder, with "/" between its
+    names, and "updatedAt" its modification time (UTC, ISO 8601). Only what read_memory_file() would read is
+    listed: regular files with one hard link, in real folders; a link, a FIFO, a name memory_name() refuses and
+    compiled Python (MEMORY_SKIPPED_FOLDERS) are left out. Nothing is opened but folders.
+    """
+
+    root = _memory_root(workspace)
+    if root is None:
+        return None
+    files, limits = [], {"scan": MEMORY_SCAN_MAX, "truncated": False}
+
+    def visit(handle, prefix, depth):
+        try:
+            entries = os.scandir(handle)
+        except OSError:
+            return
+        with entries:
+            for entry in entries:
+                limits["scan"] -= 1
+                if limits["scan"] < 0 or len(files) >= MEMORY_LIST_MAX:
+                    limits["truncated"] = True
+                    return
+                name = entry.name
+                if not memory_name(name):
+                    continue
+                try:
+                    # A listing below a path (Windows) carries no link count: each entry is asked for.
+                    info = entry.stat(follow_symlinks=False) if isinstance(handle, int) else os.lstat(handle / name)
+                except OSError:
+                    continue
+                if linked_entry(info):
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    if name in MEMORY_SKIPPED_FOLDERS:
+                        continue
+                    if depth >= MEMORY_DEPTH_MAX:
+                        limits["truncated"] = True
+                        continue
+                    child = _memory_enter(handle, name)
+                    if child is not None:
+                        try:
+                            visit(child, f"{prefix}{name}/", depth + 1)
+                        finally:
+                            _memory_leave(child)
+                elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                    files.append({"path": prefix + name, "bytes": info.st_size,
+                                  "updatedAt": datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat()})
+
+    try:
+        visit(root, "", 1)
+    finally:
+        _memory_leave(root)
+    files.sort(key=lambda item: item["path"])
+    return {"files": files, "count": len(files), "bytes": sum(item["bytes"] for item in files),
+            "truncated": limits["truncated"]}
+
+
+def _memory_file_descriptor(workspace, parts):
+    """Open one file of the author's memory read-only (``parts``: memory_path_parts()), or return None.
+
+    As for a chat answer (_author_file_descriptor), with the file's folders opened one below the other: a link
+    anywhere on the way, a FIFO, and a file with a second hard link are never read.
+    """
+
+    handle = _memory_root(workspace)
+    try:
+        for name in parts[:-1]:
+            if handle is None:
+                return None
+            below = _memory_enter(handle, name)
+            _memory_leave(handle)
+            handle = below
+        if handle is None:
+            return None
+        if not isinstance(handle, int):
+            try:
+                return open_run_log(handle / parts[-1], os.O_RDONLY, private=False)
+            except OSError:
+                return None
+        try:
+            descriptor = os.open(parts[-1], os.O_RDONLY | NOFOLLOW | NONBLOCK | BINARY, dir_fd=handle)
+        except OSError:
+            return None
+        try:
+            info = os.fstat(descriptor)
+            if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                return descriptor
+        except OSError:
+            pass
+        os.close(descriptor)
+        return None
+    finally:
+        _memory_leave(handle)
+
+
+def read_memory_file(workspace, path):
+    """One file of the author's memory as the job page shows it, or None when it cannot be read now.
+
+    ``path`` names it as list_memory_files() does (memory_path_parts(); ValueError otherwise). Its first
+    MEMORY_FILE_READ_BYTES are read, which hold at least its first MAX_MEMORY_FILE_CHARS characters, decoded as
+    UTF-8 (invalid bytes replaced), with line ends normalized and control characters removed. {"path", "text":
+    its first MAX_MEMORY_FILE_CHARS characters at most, "chars": how many characters "text" holds, "truncated":
+    whether the file holds more, "binary": True for a file that is not text (a NUL byte among its first 8,192
+    bytes, or more than one in twenty of their characters undecodable), whose "text" is "", "bytes": the size of
+    the whole file, "updatedAt": its modification time (UTC, ISO 8601)}. None: the file is not there, or it is
+    not a file that is read (_memory_file_descriptor()). The text is untrusted model output: shown, never run.
+    """
+
+    descriptor = _memory_file_descriptor(workspace, memory_path_parts(path))
     if descriptor is None:
         return None
     try:
         info = os.fstat(descriptor)
-        current = (info.st_size, info.st_mtime_ns)
-        if signature is not None and tuple(signature) != current:
-            return None
-        start = max(0, info.st_size - PROGRESS_LOG_READ_BYTES)
-        os.lseek(descriptor, start, os.SEEK_SET)
         chunks, size = [], 0
-        while size < PROGRESS_LOG_READ_BYTES:
-            chunk = os.read(descriptor, PROGRESS_LOG_READ_BYTES - size)
+        while size <= MEMORY_FILE_READ_BYTES:
+            chunk = os.read(descriptor, MEMORY_FILE_READ_BYTES + 1 - size)
             if not chunk:
                 break
             chunks.append(chunk)
             size += len(chunk)
-        after = os.fstat(descriptor)
     except OSError:
         return None
     finally:
         os.close(descriptor)
-    if (after.st_size, after.st_mtime_ns) != current or size != info.st_size - start:
-        return None  # Written meanwhile: read again at the next check.
     data = b"".join(chunks)
-    skip = 0
-    while start and skip < min(3, len(data)) and 0x80 <= data[skip] < 0xC0:
-        skip += 1  # A read that starts inside the file begins at a character, not inside one.
-    text = data[skip:].decode("utf-8", errors="replace")
-    text = CHAT_CONTROL_CHARACTERS.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
-    shown = text[-MAX_PROGRESS_LOG_CHARS:]
-    return {"text": shown, "chars": len(shown), "truncated": bool(start) or len(text) > len(shown),
-            "bytes": info.st_size, "updatedAt": datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat(),
-            "version": hashlib.sha256(shown.encode("utf-8")).hexdigest()[:16], "signature": list(current)}
-
-
-def saved_progress_log_versions(run_dir):
-    """When each saved version of a run's progress log was saved, as its controller folder keeps them
-    (PROGRESS_LOG_VERSIONS_FILE): [{"version", "at", "chars"}], oldest first, the first with what came before it
-    ("earlier", "existed": see trim_progress_log_versions()); [] when there is none to read."""
-
-    try:
-        path = controller_directory(run_dir) / PROGRESS_LOG_VERSIONS_FILE
-        saved = json.loads(path.read_text(encoding="utf-8")) if path.is_file() and not path.is_symlink() else []
-    except (OSError, ValueError):
-        saved = []
-    versions = [{"version": entry["version"], "at": entry["at"], "chars": entry.get("chars")}
-                for entry in (saved if isinstance(saved, list) else [])
-                if isinstance(entry, dict) and isinstance(entry.get("version"), str)
-                and isinstance(entry.get("at"), str)]
-    first = next((entry for entry in (saved if isinstance(saved, list) else []) if isinstance(entry, dict)), {})
-    if versions:
-        earlier = first.get("earlier")
-        if type(earlier) is int and earlier > 0:
-            versions[0]["earlier"] = earlier
-        if first.get("existed") is True:
-            versions[0]["existed"] = True
-    return trim_progress_log_versions(versions)
-
-
-def trim_progress_log_versions(versions):
-    """``versions`` (oldest first) cut to the newest PROGRESS_LOG_VERSIONS, in place. Its first entry says what came
-    before it: "earlier", how many versions were saved before it whose times are no longer kept, and "existed"
-    (True), that the log already existed when this job's versions were first read, so that how often it was saved
-    before is not known (the page says "at least")."""
-
-    dropped = len(versions) - PROGRESS_LOG_VERSIONS
-    if dropped > 0:
-        first = versions[0]
-        earlier = (first.get("earlier") or 0) + dropped
-        del versions[:dropped]
-        versions[0] = {**versions[0], "earlier": earlier, **({"existed": True} if first.get("existed") is True else {})}
-    return versions
+    whole = len(data) <= MEMORY_FILE_READ_BYTES
+    data = data[:MEMORY_FILE_READ_BYTES]
+    start = data[:8192].decode("utf-8", errors="replace")
+    binary = b"\0" in data[:8192] or start.count("\ufffd") * 20 > len(start)
+    text = ""
+    if not binary:
+        text = codecs.getincrementaldecoder("utf-8")(errors="replace").decode(data, final=whole)
+        text = CHAT_CONTROL_CHARACTERS.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
+    shown = text[:MAX_MEMORY_FILE_CHARS]
+    return {"path": path, "text": shown, "chars": len(shown), "binary": binary,
+            "truncated": not binary and (not whole or len(text) > len(shown)), "bytes": info.st_size,
+            "updatedAt": datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat()}
 
 
 def delivered_repair(record):
@@ -1646,17 +1782,12 @@ def default_prompts():
     """Read workflow prompts at use time, including edits made while serving."""
 
     global _last_default_prompts
-    workflow = runtime.builtin_workflow("author_critic")
-    author_critic = workflow["prompts"]
-    binding = (workflow["nodes"].get("author") or {}).get("coordinator")
+    author_critic = runtime.builtin_workflow("author_critic")["prompts"]
     prompts = {
         "review": REVIEW_PROMPT,
         "author": author_critic["author"],
         "critic": author_critic["critic"],
         "final": runtime.builtin_workflow("clean_up")["prompts"]["final"],
-        # The author coordinator's first prompt (its coordinator binding's); a template with {author_subagents}.
-        # A workflow edited to bind none has none, which only a coordinator job needs (see _workflow_options).
-        "coordinator": author_critic.get(binding["prompt"] if isinstance(binding, dict) else "coordinator", ""),
     }
     _last_default_prompts = prompts
     return dict(prompts)  # Callers adjust their copy.
@@ -1751,16 +1882,24 @@ PROMPT_EDITS_FILENAME = "prompts/prompt-edits.json"
 
 
 def web_team_options(body, source=None):
-    """The goal loop, the Subagent models and the edited texts other than the role prompts of a request.
+    """The goal loop, the Examiner setting and the edited texts other than the role prompts of a request.
 
     ``source`` is the state of the job a request revises or copies (its settings fill in what the request leaves
-    out); without either, the goal loop is DEFAULT_GOAL_LOOP and every member runs the coordinator's model. A
-    source from before (it recorded no goal loop), or one that kept such a job's settings (legacyTeam), keeps Codex's
-    goal mode and the CLI's built-in subagents (``legacy_team``), as such a job keeps its single author. A request
-    with ``legacyTeam`` true asks for them too: the page's rerun of such a job, whose form keeps its goal loop and
-    subagents.
+    out); without either, the goal loop is DEFAULT_GOAL_LOOP. A source from before (it recorded no goal loop), or one
+    that kept such a job's settings (legacyTeam), keeps Codex's goal mode (``legacy_team``), as such a job keeps its
+    single author. A request with ``legacyTeam`` true asks for it too: the page's rerun of such a job, whose form
+    keeps its goal loop. Texts that no step uses any more (prompt_catalog.RETIRED, those of coordinator mode among
+    them) are dropped. A request that asks for coordinator mode (authorMode "coordinator") or names per-subagent
+    models (authorSubagentModels) is refused; authorMode "author" asks for what every job is.
     """
 
+    mode = body.get("authorMode")
+    if mode == "coordinator":
+        raise ValueError(COORDINATOR_REQUEST_TEXT)
+    if mode not in (None, "author"):
+        raise ValueError("Leave out authorMode: the proof author always proves the statement itself.")
+    if body.get("authorSubagentModels") is not None:
+        raise ValueError(SUBAGENT_MODELS_TEXT)
     overrides = body.get("promptOverrides") if isinstance(body.get("promptOverrides"), dict) else {}
     saved = (source or {}).get("promptSet") if isinstance((source or {}).get("promptSet"), dict) else {}
     texts = {name: text for name, text in {**saved, **overrides}.items()
@@ -1777,7 +1916,6 @@ def web_team_options(body, source=None):
                  if isinstance(recorded, dict) else False)
     source = source or {}
     return {"goal_loop": body.get("goalLoop", source.get("goalLoop", DEFAULT_GOAL_LOOP)),
-            "author_subagent_models": body.get("authorSubagentModels", source.get("authorSubagentModels")),
             # The Examiner setting: the request's, else the source job's, else on.
             "examiner": body.get("examiner", source.get("examiner", DEFAULT_EXAMINER)),
             "prompt_overrides": texts, "prompt_edits": edits, "legacy_team": legacy}
@@ -1864,7 +2002,7 @@ def saved_prompt_edits(run_dir):
 
 
 def saved_team_state(run_dir):
-    """The goal loop, Subagent models and texts a saved job recorded (its controller's job-settings.json,
+    """The goal loop, the Examiner setting and the texts a saved job recorded (its controller's job-settings.json,
     PROMPT_SET_FILENAME and PROMPT_EDITS_FILENAME); {} when they cannot be read (a job from before)."""
 
     try:
@@ -1876,10 +2014,6 @@ def saved_team_state(run_dir):
     if settings.get("goalLoop") in runtime.GOAL_LOOPS:
         state["goalLoop"] = settings["goalLoop"]
         state["legacyTeam"] = settings.get("legacyTeam") is True
-        try:
-            state["authorSubagentModels"] = team_module.validated_team(settings.get("authorSubagentModels"))
-        except ValueError:
-            state["authorSubagentModels"] = None
     texts = saved_prompt_set(run_dir)
     if texts is not None:
         state["promptSet"] = texts
@@ -1892,24 +2026,10 @@ def saved_team_state(run_dir):
     return state
 
 
-def saved_team(value):
-    """A saved authorTeam (a list of member descriptions), or None when it is missing or malformed."""
-
-    if not isinstance(value, list) or not value:
-        return None
-    keys = ("member", "model", "modelLabel", "program", "effort", "connection")
-    members = []
-    for number, entry in enumerate(value, 1):
-        if not isinstance(entry, dict) or entry.get("member") != number or not isinstance(entry.get("model"), str):
-            return None
-        members.append({key: entry.get(key) for key in keys})
-    return members
-
-
 TRACE_LIMIT = 1500
 # The events of the subagents' own conversations (codex_event records with root false: the author's subagents,
-# the critic's independent critics) keep a window of their own, beside TRACE_LIMIT, so a busy team of subagents never
-# pushes the coordinator's own records out of the page's live window. transcript.jsonl keeps every record.
+# the critic's independent critics) keep a window of their own, beside TRACE_LIMIT, so busy subagents never push the
+# author's or the critic's own records out of the page's live window. transcript.jsonl keeps every record.
 SUBAGENT_TRACE_LIMIT = 300
 # A job from before 20 Nov 2026 can hold a convention_result: the verdict of its convention critic, a step since removed.
 PINNED_KINDS = {
@@ -2007,13 +2127,6 @@ def important_record(record):
         return True
     if kind == "status" and record.get("root") is not False and record.get("authorSubagent") is True:
         # One of the author's subagents started, finished or failed (workflow_runner.AuthorSubagents).
-        return True
-    if (kind == "status" and record.get("root") is not False and record.get("stage") != "conversation"
-            and record.get("label") in COORDINATOR_RECORD_LABELS):
-        # The author coordinator's time check, or a reply of it that named no proof file.
-        return True
-    if kind == "status" and isinstance(record.get("coordinatorWarningCleared"), str):
-        # The end of a coordinator's warning (a pinned diagnostic, workflow_runner.CoordinatorWatch) stays beside it.
         return True
     if kind != "codex_event" or record.get("root") is False:
         return False
@@ -2190,38 +2303,9 @@ REVIEW_ONLY_GRAPH = {
 WORKFLOW_STAGES = ("review", "author", "critic", "writing")
 STAGE_ROLES = {"review": "review", "author": "author", "critic": "critic", "writing": "writer"}
 ROLE_STAGES = {role: stage for stage, role in STAGE_ROLES.items()}
-PROMPT_ROLES = {"review": "review", "author": "author", "critic": "critic", "final": "writer",
-                "coordinator": "author"}
+PROMPT_ROLES = {"review": "review", "author": "author", "critic": "critic", "final": "writer"}
 # The per-job prompts of the proof stages, saved as prompts/<name>.txt and passed as --<name>-prompt-file.
-PROOF_PROMPTS = ("author", "critic", "final", "coordinator")
-
-
-def recorded_author_mode(author_subagents, requested=None):
-    """The authorMode a job records when it starts (AUTHOR_MODES), for its number of author subagents.
-
-    ``requested`` None or "author" is an author; "coordinator" asks for the earlier team design and needs 1 or
-    more author subagents; KEPT_COORDINATOR (a job that keeps a coordinator job's mode) is a coordinator with 1 or
-    more and an author with none.
-    """
-
-    if requested == KEPT_COORDINATOR:
-        return "coordinator" if author_subagents else "author"
-    if requested not in (None, *AUTHOR_MODES):
-        raise ValueError("Choose coordinator or author as the author mode.")
-    if requested == "coordinator" and not author_subagents:
-        raise ValueError("The author coordinator needs Author subagents 1 or more.")
-    return "coordinator" if requested == "coordinator" else "author"
-
-
-def saved_author_mode(run_dir):
-    """The authorMode a saved job recorded (its controller's job-settings.json), "author" when it recorded none."""
-
-    try:
-        settings = json.loads(controlled_path(Path(run_dir), JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError, RecursionError):
-        return "author"
-    mode = settings.get("authorMode") if isinstance(settings, dict) else None
-    return mode if mode in AUTHOR_MODES else "author"
+PROOF_PROMPTS = ("author", "critic", "final")
 
 
 def normalize_workflow_stages(value=None):
@@ -2503,45 +2587,33 @@ def empty_state(trace=None, trace_version=0):
         "authorPrompt": prompts["author"],
         "criticPrompt": prompts["critic"],
         "finalPrompt": prompts["final"],
-        "coordinatorPrompt": prompts["coordinator"],
         "criticRounds": DEFAULT_CRITIC_ROUNDS,
         "criticCount": DEFAULT_CRITIC_COUNT,
         # Subagents the proof author may start at a time (0: no subagent tool).
         "authorSubagents": DEFAULT_AUTHOR_SUBAGENTS,
-        # How the proof author works (AUTHOR_MODES), recorded when the job starts.
-        "authorMode": recorded_author_mode(DEFAULT_AUTHOR_SUBAGENTS),
+        # True for a job that ran in coordinator mode (COORDINATOR_JOB_TEXT): it shows, and nothing runs for it again.
+        "coordinatorJob": False,
+        # The earlier goals of a job continued with new goals (App.set_new_goal(): saved_goals()), oldest first; when
+        # the current goal started; and whether its author has yet to receive the new_goal prompt.
+        "goals": [],
+        "goalStartedAt": "",
+        "newGoalPending": False,
         # Who runs a Codex author's goal loop (workflow_runner.GOAL_LOOPS): a job from before records none and has
         # Codex's ("codex"), see restore_saved_app.
         "goalLoop": DEFAULT_GOAL_LOOP,
         # The Examiner setting (DEFAULT_EXAMINER).
         "examiner": DEFAULT_EXAMINER,
-        # The Subagent models setting: None ("Same as the coordinator") or one {model, effort} per author subagent.
-        "authorSubagentModels": None,
-        # A coordinator's TCS Prover team ([{member, model, modelLabel, program, effort, connection}]), or None: no
-        # such team (an author alone, a job from before, a web-cutoff coordinator with the built-in subagents).
-        "authorTeam": None,
         # The texts the job runs with, by Prompts-dialog name (PROMPT_SET_FILENAME), or None for a job from before.
         "promptSet": None,
         # Those of them the user edited (PROMPT_EDITS_FILENAME), which a rerun carries; None when the job saved none.
         "promptEdits": None,
-        # False for a saved job that recorded no goal loop (every job from before): it keeps Codex's goal mode and
-        # the built-in subagents, saves none (see _save_job_settings), and a job made from it keeps them too.
+        # False for a saved job that recorded no goal loop (every job from before): it keeps Codex's goal mode,
+        # saves none (see _save_job_settings), and a job made from it keeps it too.
         "goalLoopRecorded": True,
-        # True for a job that runs Codex's goal mode and the CLI's built-in subagents as a job from before does: such
-        # a job (goalLoopRecorded False), and one made from it or from a rerun of it (web_team_options); a job made
-        # from it keeps them, and the page's rerun of it carries them.
+        # True for a job that runs Codex's goal mode as a job from before does: such a job (goalLoopRecorded False),
+        # and one made from it or from a rerun of it (web_team_options); a job made from it keeps it, and the page's
+        # rerun of it carries it.
         "legacyTeam": False,
-        # False for a saved job that never recorded its author mode (every job from before the coordinator): it
-        # stays a single author, also when its settings are revised, and saves none (see _save_job_settings).
-        "authorModeRecorded": True,
-        # The author coordinator's progress log as the job page shows it (read_progress_log() without its
-        # signature), or None until the file exists.
-        "coordinatorProgress": None,
-        # When each version of that log was saved, oldest first: [{"version", "at", "chars"}] (PROGRESS_LOG_VERSIONS).
-        "coordinatorProgressVersions": [],
-        # How a coordinator job's author works as its runner last reported it (follow_author_mode()): None, as
-        # recorded, or {"mode": "author", ...} when its model has no subagent tool. Kept in the state only.
-        "authorModeEffective": None,
         # False for a saved job that never recorded its number of critics (older jobs): the job page
         # does not credit it with independent critics it may never have run.
         "criticCountRecorded": True,
@@ -2931,10 +3003,10 @@ def _api_test_request(entry, effort=None):
 
 
 def team_tool_test_request(entry, model, effort, tools=True):
-    """Path, headers and body of the Test's request shaped as runs send TCS Prover's team tools (see
+    """Path, headers and body of the Test's request shaped as runs send TCS Prover's tools (see
     TEAM_TOOL_TEST_NAMESPACE), and the form it takes: "additional_tools" for a Lite model, else "tools". Without
     ``tools`` it is the same request without them (no namespace, tool_choice or parallel_tool_calls), which tells
-    whether an endpoint that refuses the request refuses its team tools (probe_team_tools())."""
+    whether an endpoint that refuses the request refuses its tools (probe_team_tools())."""
 
     lite = runtime.codex_lite_model(model)
     namespace = {"type": "namespace", "name": TEAM_TOOL_TEST_NAMESPACE,
@@ -2963,14 +3035,14 @@ def team_tool_test_request(entry, model, effort, tools=True):
 
 
 def probe_team_tools(entry, models, effort=None, timeout=None):
-    """Whether an OpenAI-format connection passes on TCS Prover's team tools as runs send them: {ok, model, form,
+    """Whether an OpenAI-format connection passes on TCS Prover's tools as runs send them: {ok, model, form,
     message, at} for one model of ``models`` (the connection's list: its first Lite model, else its first; see
     TEAM_TOOL_TEST_NAMESPACE), or None without a model. The key never shows in the message.
 
-    ``ok`` is None (not checked) when the answer says nothing about the team tools: no answer within the deadline,
-    a status that may pass or a refusal of the key or the model (TEAM_TOOL_TEST_UNCHECKED_STATUSES), or another
-    refusal that the same request without the team tools gets too; another refusal is theirs only when that request
-    is answered."""
+    ``ok`` is None (not checked) when the answer says nothing about the tools: no answer within the deadline, a
+    status that may pass or a refusal of the key or the model (TEAM_TOOL_TEST_UNCHECKED_STATUSES), or another
+    refusal that the same request without the tools gets too; another refusal is theirs only when that request is
+    answered."""
 
     if not models:
         return None
@@ -2987,8 +3059,8 @@ def probe_team_tools(entry, models, effort=None, timeout=None):
     named = f"{TEAM_TOOL_TEST_NAMESPACE}.{TEAM_TOOL_TEST_TOOL}"
     if status is None:
         result["ok"] = None
-        message = (f"The team tools were not checked: the request with them for {model} failed. {failure} Test again "
-                   "later.")
+        message = (f"TCS Prover's tools were not checked: the request with them for {model} failed. {failure} Test "
+                   "again later.")
     elif not 200 <= status < 300:
         try:
             value = json.loads(text)
@@ -2999,39 +3071,39 @@ def probe_team_tools(entry, models, effort=None, timeout=None):
         words = _api_test_status_words(status, value, text, entry["apiKey"])
         unchecked = TEAM_TOOL_TEST_UNCHECKED_STATUSES.get(500 if 500 <= status < 600 else status)
         if unchecked is None:
-            # Another refusal: the team tools' only when the endpoint answers the same request without them.
+            # Another refusal: the tools' only when the endpoint answers the same request without them.
             plain = _api_test_send(entry, path, headers, team_tool_test_request(entry, model, effort, tools=False)[2],
                                    timeout)
             answered = plain[0] is not None and 200 <= plain[0] < 300 and not _api_test_tool_calls(plain[2])[1]
             unchecked = None if answered else ("and so did the same request without them, so the refusal is not "
-                                               "of the team tools.")
+                                               "of TCS Prover's tools.")
         if unchecked is not None:
             result["ok"] = None
-            message = _api_test_quoted(f"The team tools were not checked: the request with them for {model} failed ",
-                                       words, f", {unchecked}")
+            message = _api_test_quoted(f"TCS Prover's tools were not checked: the request with them for {model} "
+                                       "failed ", words, f", {unchecked}")
         else:
             sent = "an additional_tools item" if form == "additional_tools" else "the request's tools"
             message = _api_test_quoted(
-                f"The endpoint refused the request with team tools for {model}, sent in {sent} ", words,
-                ", but answers the same request without them. A coordinator on this connection could not reach its "
-                "team.")
+                f"The endpoint refused the request with TCS Prover's tools for {model}, sent in {sent} ", words,
+                ", but answers the same request without them. An author on this connection could not end its goal "
+                "with update_goal.")
     else:
         calls, error = _api_test_tool_calls(text)
         called = next(((name, space) for name, space in calls if name in (TEAM_TOOL_TEST_TOOL, named.replace(
             ".", "__"))), None)
         if error:
-            message = f"The model {model} answered the request with team tools with an error: {error}"
+            message = f"The model {model} answered the request with TCS Prover's tools with an error: {error}"
         elif called and called == (TEAM_TOOL_TEST_TOOL, TEAM_TOOL_TEST_NAMESPACE):
             result["ok"] = True
-            message = (f"Team tools reach the model: {model} called {named} with its namespace (the tools went "
-                       f"{shape}).")
+            message = (f"TCS Prover's tools reach the model: {model} called {named} with its namespace (the tools "
+                       f"went {shape}).")
         elif called:
             message = (f"{model} called {called[0]} without the namespace {TEAM_TOOL_TEST_NAMESPACE}: Codex refuses "
-                       "such a call (\"unsupported call\"), so a coordinator on this connection could not use its "
-                       "team.")
+                       "such a call (\"unsupported call\"), so an author on this connection could not end its goal "
+                       "with update_goal.")
         else:
             message = (f"{model} did not call {named} (the tools went {shape}): the endpoint may not pass namespaced "
-                       "tools on, and a coordinator on this connection may not reach its team.")
+                       "tools on, and an author on this connection may not be able to end its goal with update_goal.")
     result["message"] = _api_test_text(message, entry["apiKey"])
     return result
 
@@ -3515,7 +3587,6 @@ class App:
         # each one's latest failed attempt with the time its failures began; and the model calls whose last attempt
         # failed, until one works again, each with the time its failure began to repeat (_follow_failures).
         self._model_retries, self._retry_starts, self._failure_streaks = {}, {}, {}
-        self._coordinator_warnings = {}
         # The owner locks of this run while it may start a runner here (see ownership).
         self._claims = ownership.Claims()
         weakref.finalize(self, self._claims.release_all)
@@ -3533,17 +3604,10 @@ class App:
         # The answer files of chat messages seen changing: {item id: ((size, mtime_ns), monotonic time that
         # signature was first seen, whether it was read already and held no answer)}.
         self._chat_seen = {}
+        # Whether this job's author replies to every chat message (_chat_replies_locked); None until it is read.
+        self._chat_replies = None
         # Read the answer files once more, at once, after the job ended (see collect_chat_answers).
         self._chat_final_pass = False
-        # The author coordinator's progress log as last read (read_progress_log()), whose text the page fetches apart
-        # from the state (progress_log()), and the (size, mtime_ns) it was read at (see collect_progress_log); the
-        # times of its versions (_progress_log_versions(): the run folder they belong to and the list), read from the
-        # controller folder when first needed.
-        self._progress_signature = self._progress_log = None
-        self._progress_versions = None
-        # The run folder whose author's working folder this server saw without a progress log, so that the log's
-        # first version it reads is its first save (not one that "existed", see trim_progress_log_versions()).
-        self._progress_absent = None
         # A Stop of the statement review or a later step that settles in place (see _stop_step_in_place_locked).
         self._stop_in_place = False
         # Whether the activity log said that the job's record could not be made, and when a web-cutoff run's files
@@ -3645,7 +3709,7 @@ class App:
         keys = (
             "reviewModel", "authorModel", "criticModel", "writerModel",
             "reasoningEffort", "reviewEffort", "authorEffort",
-            "criticEffort", "writerEffort", "criticRounds", "criticCount", "authorSubagents", "authorMode",
+            "criticEffort", "writerEffort", "criticRounds", "criticCount", "authorSubagents",
             "thinkingHours", "speedMode", "reasoningSummary",
             "problemMode", "skipStatementReview", "statementReviewOnly", "preparedRun",
             "workflowStages", "originalContent",
@@ -3655,7 +3719,8 @@ class App:
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
             "authorRepairDelivered", "pendingReanchor", "relatedWorksPending", "folderBatch", "authorQuestion",
             "timeLimitHistory", "resumeQueuedAt",
-            "goalLoop", "authorSubagentModels", "authorTeam", "legacyTeam", "apiWebSearch", "examiner",
+            "goalLoop", "legacyTeam", "apiWebSearch", "examiner",
+            "goals", "goalStartedAt", "newGoalPending",
         )
         # The solver rechecks historical settings while UI events persist
         # thread/steering state. Readers must never observe a truncated JSON.
@@ -3674,15 +3739,22 @@ class App:
             self._save_controlled(PROMPT_EDITS_FILENAME,
                                   json.dumps(edits, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
             self._saved_prompt_edits = dict(edits)
-        if options.get("authorModeRecorded") is False:
-            # A job from before the coordinator records no mode, so it stays a single author (see AUTHOR_MODES).
-            values.pop("authorMode", None)
+        if options.get("coordinatorJob") is True:
+            # A job that ran in coordinator mode keeps what it recorded of that mode, and so keeps saying so
+            # (saved_coordinator_job()).
+            try:
+                saved = json.loads(controlled_path(self.run_dir, JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, ValueError, RecursionError):
+                saved = {}
+            saved = saved if isinstance(saved, dict) else {}
+            values.update({key: saved[key] for key in ("authorTeam", "authorSubagentModels") if key in saved})
+            values["authorMode"] = "coordinator"
         if options.get("goalLoopRecorded") is False:
             # A job from before the goal loop records none, so it and the jobs made from it keep Codex's goal mode.
-            for key in ("goalLoop", "authorSubagentModels", "authorTeam", "legacyTeam"):
+            for key in ("goalLoop", "legacyTeam"):
                 values.pop(key, None)
         if values.get("legacyTeam") is not True:
-            values.pop("legacyTeam", None)  # Saved only by a job that keeps a job from before's goal loop and team.
+            values.pop("legacyTeam", None)  # Saved only by a job that keeps a job from before's goal loop.
         # Every save records the job's batch, whatever ``options`` holds.
         if self.batch_id:
             values["batch"] = self.batch_id
@@ -3711,6 +3783,8 @@ class App:
         source_settings_path = controlled_path(source, JOB_SETTINGS_FILENAME)
         if source_settings_path.exists():
             source_settings = json.loads(source_settings_path.read_text(encoding="utf-8"))
+            if saved_coordinator_job(source_settings):
+                raise ValueError(COORDINATOR_JOB_TEXT)
             if source_settings.get("retrievalPolicyPath") or source_settings.get("launchHold"):
                 raise ValueError(
                     "Historical runs cannot be cloned into an unrestricted continuation. "
@@ -3986,13 +4060,20 @@ class App:
                     if len(self.pinned) > PINNED_LIMIT + PINNED_SLACK:
                         self.pinned = bounded_pinned(self.pinned)
             self.state["lastActivityAt"] = entry["time"]
-            if isinstance(record.get("node"), str) and record["node"]:
+            if (self.state.get("newGoalPending") and record.get("kind") == "request"
+                    and record.get("stage") == "solve" and record.get("label") == "Exact solve input"):
+                # The author's first turn of the new goal has started with the new_goal prompt.
+                self.state["newGoalPending"] = False
+            # A controller note (a reply of the paused or finished author, ...) says nothing about the workflow's
+            # step: a finished job's reply leaves the step at which the job ended.
+            if isinstance(record.get("node"), str) and record["node"] and not controller_note(record):
                 self.state["activeNode"] = record["node"]
             if isinstance(record.get("round"), int):
                 self.state["round"] = record["round"]
             self.state["criticProgress"] = follow_critic_progress(self.state.get("criticProgress"), entry,
                                                                   self.state.get("criticCount"))
-            self.state["authorModeEffective"] = follow_author_mode(self.state.get("authorModeEffective"), entry)
+            if ran_as_coordinator(entry):
+                self.state["coordinatorJob"] = True
             self.state["stepTimes"] = follow_step_times(self.state.get("stepTimes"), entry)
             history = self.state.setdefault("timeLimitHistory", [])
             if follow_time_limit(history, entry) and self.run_dir:
@@ -4154,11 +4235,14 @@ class App:
             # Run settings: where each role's model runs, from this response's catalog.
             state["modelSources"] = role_model_sources(state, state["workflow"]["settings"]["model_catalog"])
             # The critic's checkpoint needs the critic stage; the Writing one continues in a new run, which a
-            # web-cutoff run's policy forbids.
+            # web-cutoff run's policy forbids. A job that ran in coordinator mode continues from neither.
             historical = bool(state.get("retrievalPolicyPath") or state.get("retrievalMode") == "historical")
             critic_stage = saved_workflow_stages(state)["critic"]
+            if state.get("coordinatorJob"):
+                state["autoResumeAt"] = 0  # Nothing runs for it again.
             state["checkpoints"] = [
-                item if (not historical if item.get("stage") == "writing" else critic_stage)
+                item if not state.get("coordinatorJob") and (
+                    not historical if item.get("stage") == "writing" else critic_stage)
                 else dict(item, resumable=False)
                 for item in self._checkpoint_cache]
             state["canDownloadTex"] = bool(
@@ -4177,6 +4261,11 @@ class App:
             state["canDownloadProof"] = bool(self.run_dir and state.get("finalInputReady")
                                              and state.get("problemMode") != "latex"
                                              and saved_workflow_stages(state)["writing"])
+            state["currentProof"] = current_proof_mark(self.run_dir, state)
+            # Whether this finished job can continue with a new goal now, and why not (set_new_goal()).
+            new_goal_problem = self._new_goal_problem_locked() if state["phase"] == "done" else ""
+            state["newGoal"] = {"available": state["phase"] == "done" and not new_goal_problem,
+                                "reason": new_goal_problem}
             state["canDownloadSource"] = bool(
                 not state["canDownloadTex"] and self.run_dir
                 and (self.run_dir / "latex-source.tex").is_file()
@@ -4231,30 +4320,13 @@ class App:
                                  "items": items, "batch": batch}
         return state
 
-    def _kept_author_mode(self, requested, source=None, in_place=False):
-        """The author mode a start asks for (see recorded_author_mode()): a job keeps the mode of the job it revises
-        or continues.
-
-        A job revised in place (``in_place``) and a continuation of the saved job ``source`` keep that job's mode:
-        an author stays an author, and a coordinator job stays one (KEPT_COORDINATOR). Anything else asks for
-        ``requested`` (None: an author).
-        """
-
-        if in_place and self.run_dir:
-            return (KEPT_COORDINATOR if self.state.get("authorModeRecorded", True)
-                    and self.state.get("authorMode") == "coordinator" else "author")
-        if source:
-            return KEPT_COORDINATOR if saved_author_mode(source) == "coordinator" else "author"
-        return requested
-
     @staticmethod
     def _team_settings(team_options, source=None, current=None):
-        """The goal-loop, team and text keywords of _workflow_options for a start.
+        """The goal-loop, examiner and text keywords of _workflow_options for a start.
 
         ``team_options`` (web_team_options() of the request, or saved_team_options() of a saved job) when given;
         else those of ``current`` (this job's state, revised in place) or of the saved job ``source`` (a run folder
-        the new job continues), where a job from before keeps Codex's goal mode and the built-in subagents; else
-        the defaults.
+        the new job continues), where a job from before keeps Codex's goal mode; else the defaults.
         """
 
         if team_options is not None:
@@ -4282,24 +4354,17 @@ class App:
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         retrieval_mode="live", retrieval_cutoff_utc="",
-        workflow_stages=None, coordinator_prompt=None, author_mode=None,
-        goal_loop=DEFAULT_GOAL_LOOP, author_subagent_models=None, prompt_overrides=None, prompt_edits=None,
+        workflow_stages=None,
+        goal_loop=DEFAULT_GOAL_LOOP, prompt_overrides=None, prompt_edits=None,
         legacy_team=False, examiner=DEFAULT_EXAMINER,
     ):
         """Normalize and validate settings shared by both input modes.
 
         ``examiner`` is the Examiner setting (DEFAULT_EXAMINER): whether the proof author gets an examiner.
 
-        ``author_mode`` is the author mode a start asks for (recorded_author_mode()); the coordinator prompt is
-        checked, and kept, only for a job whose author is a coordinator (else it is the default, unused).
-
         ``goal_loop`` is who runs a Codex author's goal loop (runtime.GOAL_LOOPS; a web-cutoff job always records
-        "codex": its audited configuration has no place for TCS Prover's server). ``author_subagent_models`` is
-        the Subagent models setting (team.validated_team(): None, every member runs the coordinator's model, or one
-        {model, effort} per author subagent); it applies to a coordinator with the Author stage on, a web-cutoff
-        job refuses a list, and elsewhere it is not kept. A coordinator's team is recorded as authorTeam (None: no
-        TCS Prover team; a web-cutoff coordinator keeps the CLI's built-in subagents). ``legacy_team`` (a job made
-        from a job from before) keeps Codex's goal mode and the built-in subagents. ``prompt_overrides`` are the
+        "codex": its audited configuration has no place for TCS Prover's server). ``legacy_team`` (a job made from a
+        job from before) keeps Codex's goal mode. ``prompt_overrides`` are the
         edited texts other than the role prompts; with them the job records promptSet, every text it runs with.
         ``prompt_edits`` ({catalog name: text}) are the texts the user edited, which the job records as promptEdits
         (job_prompt_edits()): None for a new job, whose role prompts given here and ``prompt_overrides`` are its
@@ -4322,7 +4387,6 @@ class App:
         supplied_prompts = {
             "review": review_prompt, "author": author_prompt,
             "critic": critic_prompt, "final": final_prompt,
-            "coordinator": coordinator_prompt,
         }
         defaults = default_prompts()
         prompts = {
@@ -4359,9 +4423,7 @@ class App:
             raise ValueError(
                 "Choose Status only, Concise summaries, or Detailed summaries."
             )
-        # The coordinator prompt is checked below, with the author mode.
-        required_prompts = [prompts[name] for name, role in PROMPT_ROLES.items()
-                            if role in role_models and name != "coordinator"]
+        required_prompts = [prompts[name] for name, role in PROMPT_ROLES.items() if role in role_models]
         for name, role in PROMPT_ROLES.items():
             if role not in role_models:
                 prompts[name] = defaults[name]
@@ -4383,21 +4445,6 @@ class App:
             raise ValueError(str(exc)) from exc
         critic_count = valid_critic_count(critic_count) if stages["critic"] else DEFAULT_CRITIC_COUNT
         author_subagents = valid_author_subagents(author_subagents) if stages["author"] else DEFAULT_AUTHOR_SUBAGENTS
-        # A job without the Author stage has no author to coordinate.
-        author_mode = recorded_author_mode(author_subagents, author_mode) if stages["author"] else "author"
-        if author_mode == "coordinator":
-            coordinator = prompts["coordinator"]
-            if not coordinator:
-                raise ValueError("Every role prompt must contain instructions.")
-            if coordinator.count(runtime.MARKER) != 1:
-                raise ValueError(f"The coordinator prompt must contain exactly one {runtime.MARKER}.")
-            try:
-                runtime._template_parts(coordinator, {"author_subagents"})
-            except ValueError as exc:
-                raise ValueError(f"The coordinator prompt cannot be used ({exc}). Write {{author_subagents}} where the "
-                                 "number of author subagents goes, and double any other brace: {{ and }}.") from exc
-        else:
-            prompts["coordinator"] = defaults["coordinator"]
         try:
             if workflow_stages is not None and not stages["author"]:
                 thinking_hours = DEFAULT_THINKING_HOURS
@@ -4418,19 +4465,6 @@ class App:
         historical = search_options["retrievalMode"] == "historical"
         if historical or legacy_team:
             goal_loop = LEGACY_GOAL_LOOP
-        team_models, author_team = None, None
-        coordinating = stages["author"] and author_mode == "coordinator"
-        if coordinating and historical and author_subagent_models is not None:
-            raise ValueError("With a web cutoff, author subagents use the coordinator's model.")
-        if coordinating and not historical and not legacy_team:
-            try:
-                team_models = team_module.validated_team(author_subagent_models, author_subagents, check_models=True)
-            except providers.StoreUnavailable as exc:
-                raise ValueError(str(exc)) from exc
-            author_team = team_module.team_members(team_models, author_model, author_effort, author_subagents)
-            if team_models:
-                # Each member's model needs its key (or its CLI) like a role's, and an API model's snapshot.
-                selected_models = [*selected_models, *(entry["model"] for entry in team_models)]
         require_model_access(selected_models)
         api_models = api_model_snapshot(selected_models)
         # The API connections whose own search service the job's Codex models search through (in a live run; the
@@ -4447,8 +4481,6 @@ class App:
         return {
             "goalLoop": goal_loop,
             "examiner": examiner,
-            "authorSubagentModels": team_models,
-            "authorTeam": author_team,
             "legacyTeam": bool(legacy_team),
             "promptSet": prompt_set,
             "promptEdits": None if prompt_edits is False else job_prompt_edits(prompt_edits, defaults_texts),
@@ -4473,11 +4505,9 @@ class App:
             "authorPrompt": prompts["author"],
             "criticPrompt": prompts["critic"],
                 "finalPrompt": prompts["final"],
-            "coordinatorPrompt": prompts["coordinator"],
             "criticRounds": critic_rounds,
             "criticCount": critic_count,
             "authorSubagents": author_subagents,
-            "authorMode": author_mode,
             "thinkingHours": thinking_hours,
             "speedMode": speed_mode,
             "reasoningSummary": reasoning_summary,
@@ -4505,7 +4535,7 @@ class App:
         revise_existing=False,
         workflow_stages=None, original_content=None, source_file=None,
         _prepare_only=False,
-        related_works=None, folder_batch=None, coordinator_prompt=None, author_mode=None, team_options=None,
+        related_works=None, folder_batch=None, team_options=None,
     ):
         """Start the review and return immediately so the page can poll.
 
@@ -4518,6 +4548,9 @@ class App:
         queued one, whose review the server starts when a running slot is free.
         """
 
+        if revise_existing:
+            with self.lock:
+                self._check_coordinator_job_locked()
         self._check_input_replacement()
 
         statement = str(statement).strip()
@@ -4543,7 +4576,7 @@ class App:
             author_effort = DEFAULT_REASONING_EFFORT
             critic_effort = DEFAULT_REASONING_EFFORT
             writer_effort = DEFAULT_REASONING_EFFORT
-            author_prompt = critic_prompt = final_prompt = coordinator_prompt = None
+            author_prompt = critic_prompt = final_prompt = None
             critic_rounds = DEFAULT_CRITIC_ROUNDS
             critic_count = DEFAULT_CRITIC_COUNT
             author_subagents = DEFAULT_AUTHOR_SUBAGENTS
@@ -4569,8 +4602,7 @@ class App:
             speed_mode=speed_mode,
             reasoning_summary=reasoning_summary,
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
-            workflow_stages=stages, coordinator_prompt=coordinator_prompt,
-            author_mode=self._kept_author_mode(author_mode, continuation_source, revise_existing),
+            workflow_stages=stages,
             **self._team_settings(team_options, continuation_source,
                                   self.state if revise_existing and self.run_dir else None),
         )
@@ -4636,10 +4668,9 @@ class App:
             prompt_names = [name for name, role in PROMPT_ROLES.items() if stages[ROLE_STAGES[role]]]
             for name in prompt_names:
                 self._save_prompt(name, options[f"{name}Prompt"])
-            # A job from before the coordinator keeps saving no mode when it is revised in place (AUTHOR_MODES).
-            unrecorded = {"authorModeRecorded": False} if retry and not self.state.get("authorModeRecorded", True) else {}
+            unrecorded = {}
             if retry and not self.state.get("goalLoopRecorded", True):
-                # A job from before keeps Codex's goal mode, the built-in subagents and the live workflow's texts.
+                # A job from before keeps Codex's goal mode and the live workflow's texts.
                 unrecorded.update(goalLoopRecorded=False, promptSet=None, promptEdits=None)
             self._save_job_settings({
                 **options,
@@ -4698,7 +4729,6 @@ class App:
                 self.process = self.active_token = self.worker_token = None
                 self._end_retry_wait_locked()
                 self._model_retries, self._retry_starts, self._failure_streaks = {}, {}, {}
-                self._coordinator_warnings = {}
                 self.state["modelRetry"] = None
                 if self.state["phase"] == "stopping":
                     self._finish_stopped_locked(None, "The reviewer was stopped before it produced a checked statement.")
@@ -4840,7 +4870,6 @@ class App:
             # A reviewer that ended while waiting to retry: that wait was not active time.
             self._end_retry_wait_locked()
             self._model_retries, self._retry_starts, self._failure_streaks = {}, {}, {}
-            self._coordinator_warnings = {}
             self.state["modelRetry"] = None
             stopped = self.state["phase"] == "stopping"
             if valid:
@@ -4904,7 +4933,6 @@ class App:
             author_effort=state["authorEffort"], critic_effort=state["criticEffort"],
             writer_effort=state["writerEffort"], review_prompt=state["reviewPrompt"],
             author_prompt=state["authorPrompt"], critic_prompt=state["criticPrompt"],
-            coordinator_prompt=state.get("coordinatorPrompt"),
             final_prompt=state["finalPrompt"], speed_mode=state["speedMode"],
             reasoning_summary=state["reasoningSummary"], workflow_stages=saved_workflow_stages(state),
             original_content=state.get("originalContent"), source_file=state.get("sourceFile"),
@@ -5094,28 +5122,23 @@ class App:
             self.add_trace({"kind": "diagnostic", "stage": stage, "text": runtime.workflow_warnings()})
         return process, token
 
-    def _team_runner_options(self, conversation=False):
-        """The runner options of the job's goal loop, its coordinator's team, its saved texts and the API connections
+    def _team_runner_options(self):
+        """The runner options of the job's goal loop, its Examiner setting, its saved texts and the API connections
         it searches through.
 
-        A job from before passes Codex's goal mode and the built-in subagents (no authorTeam), and no texts: its
-        runner reads the live workflow, as before. A job with texts gets them rewritten from its state (the
-        controller's copy) at every launch, like its role prompts. The connections are those the job recorded when it
-        started (apiWebSearch); a job from before recorded none.
+        A job from before passes Codex's goal mode and no texts: its runner reads the live workflow, as before. A job
+        with texts gets them rewritten from its state (the controller's copy) at every launch, like its role prompts.
+        The connections are those the job recorded when it started (apiWebSearch); a job from before recorded none.
         """
 
         loop = self.state.get("goalLoop") if self.state.get("goalLoop") in runtime.GOAL_LOOPS else LEGACY_GOAL_LOOP
-        team = self.state.get("authorTeam")
-        options = ["--goal-loop", loop, "--author-team", "tcs" if team else "builtin"]
+        options = ["--goal-loop", loop]
         if self.state.get("apiWebSearch"):
             # The API connections whose own search service the job searches through, as the job recorded them.
             options.extend(["--set", "api_web_search=" + json.dumps(self.state["apiWebSearch"])])
         if self.state.get("examiner") is False:
             # The Examiner setting is off (the runner's default is on, with an author_examiner text).
             options.extend(["--set", "examiner=false"])
-        models = self.state.get("authorSubagentModels")
-        if team and models and not conversation:
-            options.extend(["--author-subagent-models", json.dumps(models, separators=(",", ":"))])
         texts = self.state.get("promptSet")
         if isinstance(texts, dict):
             path = self._save_controlled(PROMPT_SET_FILENAME,
@@ -5138,8 +5161,6 @@ class App:
             "--critic-rounds", str(self.state["criticRounds"]),
             "--critic-count", str(self.state["criticCount"]),
             "--author-subagents", str(self.state.get("authorSubagents", DEFAULT_AUTHOR_SUBAGENTS)),
-            # Always the mode the job recorded, never the runner's own default (see AUTHOR_MODES).
-            "--author-mode", self.state.get("authorMode") if self.state.get("authorMode") in AUTHOR_MODES else "author",
             "--thinking-hours", str(self.state["thinkingHours"]),
             "--reasoning-effort", self.state["reasoningEffort"],
             "--reasoning-summary", self.state["reasoningSummary"],
@@ -5168,6 +5189,9 @@ class App:
             options.extend(["--set", "goal_thread_id=" + json.dumps(self.state["goalThreadId"])])
         if self.state.get("goalWorkspace"):
             options.extend(["--set", "goal_cwd=" + json.dumps(self.state["goalWorkspace"])])
+        if self.state.get("newGoalPending") and stages["author"]:
+            # The user set a new goal: the author's reopened conversation gets the new_goal prompt first.
+            options.extend(["--set", "goal_new_goal=true"])
         if self.state.get("goalResume"):
             options.extend(["--set", "goal_resume=true"])
             if self.state.get("authorSteerDelivered"):
@@ -5291,7 +5315,7 @@ class App:
     def _follow_failures(self, record, key_prefix=""):
         """Keep each model call's failure while it keeps failing, for Needs your attention (attention()).
 
-        A call is the runner's retry key (its activity label, node or stage), a team member's assignment
+        A call is the runner's retry key (its activity label, node or stage), an examination of the author's examiner
         ("member:<id>"), or with ``key_prefix`` a paused author's reply ("conversation:<id>:"). A failed attempt that
         waits to retry (a "Retrying model call" status with its time, or a member's retry note) starts the call's
         streak, or keeps it when the failure is the same as the last one (_failure_signature: its words without the
@@ -5346,45 +5370,6 @@ class App:
                     streaks.pop(name)
             elif kind == "status" and member and record.get("subagentState") in {"finished", "failed", "stopped"}:
                 streaks.pop(key, None)
-
-    def _follow_coordinator_warnings(self, record):
-        """Keep the coordinator's warnings that its runner has not cleared, for Needs your attention (attention()).
-
-        The runner warns, without stopping the run, that the coordinator works without its team, that Codex refused
-        one of its team tool calls, or that it named its proof file without handing it in (a diagnostic with
-        coordinatorWarning, workflow_runner.CoordinatorWatch), and clears each warning with a status that has
-        coordinatorWarningCleared; a runner's end clears them all.
-        """
-
-        if not isinstance(record, dict):
-            return
-        warning, cleared = record.get("coordinatorWarning"), record.get("coordinatorWarningCleared")
-        if not isinstance(warning, str) and not isinstance(cleared, str):
-            return
-        with self.lock:
-            warnings = getattr(self, "_coordinator_warnings", None)
-            if warnings is None:
-                warnings = self._coordinator_warnings = {}
-            if isinstance(warning, str) and warning:
-                warnings.pop(warning, None)  # The newest warning last.
-                warnings[warning] = {"title": str(record.get("label") or "Coordinator needs attention"),
-                                     "text": str(record.get("text") or ""), "at": record.get("time")}
-            elif isinstance(cleared, str):
-                warnings.pop(cleared, None)
-
-    def _coordinator_attention(self, state):
-        """The newest warning of the running coordinator that is not cleared (_follow_coordinator_warnings), as a
-        Needs your attention item; its run goes on meanwhile."""
-
-        if state.get("phase") not in {"running"}:
-            return None
-        with self.lock:
-            warnings = list((getattr(self, "_coordinator_warnings", None) or {}).items())
-        if not warnings:
-            return None
-        kind, warning = warnings[-1]
-        return {"kind": "coordinator", "warning": kind, "title": warning["title"], "text": warning["text"],
-                "retrying": True}
 
     def _end_retry_wait_locked(self, now=None):
         """Leave a finished retry wait out of the current segment's active time."""
@@ -5506,6 +5491,8 @@ class App:
 
         now = time.time() if now is None else now
         with self.lock:
+            if self.state.get("coordinatorJob"):
+                return False  # Nothing runs for it again.
             deadline = self.state.get("autoResumeAt", 0)
             if not deadline and self._settings_changed_locked(now):
                 deadline = now
@@ -5625,13 +5612,13 @@ class App:
         LaTeX compiler (MacTeX); and a model call that keeps failing: at once
         when its account is out of credit, otherwise once the same failure has
         repeated for FAILING_ATTENTION_SECONDS (_failing_attention). Retries of
-        the causes that can pass by themselves go on meanwhile. Last, a running
-        coordinator's warning (_coordinator_attention): it works without its
-        team, Codex refused a team tool call, or its proof file was named but
-        not handed in; the run goes on.
+        the causes that can pass by themselves go on meanwhile. A job that ran
+        in coordinator mode needs nothing: nothing runs for it again.
         """
 
         state = self.state if state is None else state
+        if state.get("coordinatorJob"):
+            return None
         phase, error = state.get("phase"), str(state.get("error") or "")
         retry = state.get("modelRetry") if isinstance(state.get("modelRetry"), dict) else None
         streaks = self._failing_streaks(phase)
@@ -5681,7 +5668,7 @@ class App:
             # earlier words "Claude CLI missing or incompatible" of a saved job or an older runner.
             return {"kind": "cli", "title": f"{runtime.CLI_NAMES[cli]} not installed or not working",
                     "retrying": True, "text": str(waiting.get("text") or failure)}
-        # A login or a usage limit needs you at once whichever call has it: a team member's is listed also while
+        # A login or a usage limit needs you at once whichever call has it: the examiner's is listed also while
         # another call waits to retry for another reason, or failed after it (the newest such call), and a paused
         # author's reply's whatever paused the job.
         pressing = [streak for streak in streaks if streak.get("failure") in NEEDS_YOU_FAILURES]
@@ -5689,7 +5676,7 @@ class App:
             retry = max(pressing, key=lambda streak: streak["last"])
             cause, role = retry["failure"], TRACE_STAGE_ROLES.get(retry.get("stage"), "author")
         if cause not in NEEDS_YOU_FAILURES:
-            return self._failing_attention(state, streaks) or self._coordinator_attention(state)
+            return self._failing_attention(state, streaks)
         model = state.get(f"{role}Model") or ""
         try:
             api = providers.provider_kind(model) == providers.API
@@ -5697,7 +5684,7 @@ class App:
         except (providers.ProviderError, TypeError):
             api, name = False, "The CLI"
         if retry and retry.get("memberModel"):
-            name = retry["memberModel"]  # A team member's own model.
+            name = retry["memberModel"]  # The examiner's model.
         retrying = bool(retry) or bool(state.get("autoResumeAt"))
         # A paused job's reply retries, not the job.
         reply = bool(retry and retry.get("reply"))
@@ -5761,14 +5748,14 @@ class App:
 
     @staticmethod
     def _streak_call(streak):
-        """The call of a streak in words: "The model call of the critic coordinator", "The model call of author
-        subagent 2 (Lab Claude)", "The author's reply"."""
+        """The call of a streak in words: "The model call of the critic coordinator", "The model call of the examiner
+        (Lab Claude)", "The author's reply"."""
 
         if streak.get("reply"):
             return "The author's reply"
         if streak.get("member"):
             model = f" ({streak['memberModel']})" if streak.get("memberModel") else ""
-            return f"The model call of author subagent {streak['member']}{model}"
+            return f"The model call of the examiner{model}"
         activity = streak.get("activity") or ""
         if activity:
             return f"The model call of the {activity[:1].lower()}{activity[1:]}"
@@ -5777,8 +5764,8 @@ class App:
 
     @staticmethod
     def _streak_model_name(state, streak):
-        """Whose account a streak's call bills: a team member's model, an API connection's name, or Claude or Codex
-        for a built-in model."""
+        """Whose account a streak's call bills: the examiner's model, an API connection's name, or Claude or Codex for
+        a built-in model."""
 
         if streak.get("member") and streak.get("memberModel"):
             return streak["memberModel"]
@@ -6303,6 +6290,7 @@ class App:
         """Start a curated workspace in place, with no inherited author session."""
 
         with self.lock:
+            self._check_coordinator_job_locked()
             self._check_launch_hold()
             if self.state["phase"] != "prepared" or self.has_active_worker():
                 raise ValueError("This workspace is no longer waiting to start.")
@@ -6404,13 +6392,14 @@ class App:
         A paused job is due at its automatic retry (or when the settings it
         waited for change), or once its held check passed by itself; a queued
         job from when it was queued, or at the next try after a failed start.
-        A held historical job's check is no start (see hold_check_due_at).
+        A held historical job's check is no start (see hold_check_due_at), and a job that ran in coordinator mode
+        never starts again.
         """
 
         with self.lock:
             if self.worker_token is not None or self.state.get("runningElsewhere"):
                 return math.inf, 0
-            if self.state.get("manuallyStopped"):
+            if self.state.get("manuallyStopped") or self.state.get("coordinatorJob"):
                 return math.inf, 0
             if self.state["phase"] == "paused" and self.state.get("resumeQueuedAt"):
                 return self.state["resumeQueuedAt"], 0
@@ -6456,6 +6445,12 @@ class App:
         if self.run_dir is not None and not self.fixed_trace and direct_run_directory(self.run_dir, self.runs):
             shutil.rmtree(controller_directory(self.run_dir), ignore_errors=True)
             shutil.rmtree(self.run_dir, ignore_errors=True)
+
+    def _check_coordinator_job_locked(self):
+        """Refuse whatever would run something for a job that ran in coordinator mode (COORDINATOR_JOB_TEXT)."""
+
+        if self.state.get("coordinatorJob"):
+            raise ValueError(COORDINATOR_JOB_TEXT)
 
     def resume(self):
         """Reopen this run with a new CLI process and the saved goal/thread."""
@@ -6559,6 +6554,7 @@ class App:
         Like a continuation in a new run, the time budget starts again.
         """
         with self.lock:
+            self._check_coordinator_job_locked()
             if self.has_active_worker() or self.state["phase"] in ACTIVE_PHASES:
                 raise ValueError("A model is already working on this job.")
             self._check_launch_hold()
@@ -6627,6 +6623,24 @@ class App:
                 raise ValueError("A completed final.pdf is not available for this job.")
             return (self.run_dir / "final.pdf").read_bytes()
 
+    def current_proof(self):
+        """The current proof as the job page shows it (GET /current-proof): {"source", "text", "chars", "truncated",
+        "updatedAt", "version"}, or {"text": None, "version": None} while there is none (current_proof_file())."""
+
+        with self.lock:
+            run_dir, state = self.run_dir, dict(self.state)
+        found = current_proof_file(run_dir, state)
+        mark = current_proof_mark(run_dir, state)
+        if found is None or mark is None:
+            return {"text": None, "version": None}
+        source, path = found
+        if source == "accepted":
+            text = saved_final_input(run_dir)["solution"]
+        else:
+            text = path.read_text(encoding="utf-8", errors="replace").strip()
+        shown = text[:MAX_CURRENT_PROOF_CHARS]
+        return {**mark, "text": shown, "chars": len(text), "truncated": len(shown) < len(text)}
+
     def approved_proof(self):
         """Read the proof handed to the LaTeX stage (critic-approved when the critic runs), for a download."""
 
@@ -6666,7 +6680,7 @@ class App:
             "--speed", self.state["speedMode"],
             "--final-prompt-file", str(self._save_prompt("final", self.state["finalPrompt"])),
             "--set", "workflow_stages=" + json.dumps({"review": False, "author": False, "critic": False, "writing": True}),
-            *self._team_runner_options(conversation=True),
+            *self._team_runner_options(),
         ]
 
     def _launch_final_locked(self, source):
@@ -6723,7 +6737,7 @@ class App:
         retrieval_mode="live", retrieval_cutoff_utc="",
         _prepare_only=False,
         workflow_stages=None, original_content=None,
-        related_works=None, folder_batch=None, coordinator_prompt=None, author_mode=None, team_options=None,
+        related_works=None, folder_batch=None, team_options=None,
     ):
         """Send a statement directly to the proof author without review.
 
@@ -6757,14 +6771,6 @@ class App:
                                                   != original_template.strip()):
                     raise ValueError("A continued author must keep its original author prompt; start a new job to change it.")
                 author_prompt = original_template
-            saved_coordinator = controlled_path(continuation_source, "prompts/coordinator.txt")
-            if saved_coordinator.is_file() and saved_author_mode(continuation_source) == "coordinator":
-                # A continued coordinator keeps its first prompt, as a continued author does.
-                original_coordinator = read_utf8(saved_coordinator, "saved coordinator prompt")
-                if coordinator_prompt is not None and str(coordinator_prompt).strip() != original_coordinator.strip():
-                    raise ValueError("A continued coordinator must keep its original coordinator prompt; start a new "
-                                     "job to change it.")
-                coordinator_prompt = original_coordinator
         options = self._workflow_options(
             critic_rounds=critic_rounds,
             critic_count=critic_count,
@@ -6784,8 +6790,7 @@ class App:
             reasoning_summary=reasoning_summary,
             include_review=False,
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
-            workflow_stages=stages, coordinator_prompt=coordinator_prompt,
-            author_mode=self._kept_author_mode(author_mode, continuation_source),
+            workflow_stages=stages,
             **self._team_settings(team_options, continuation_source),
         )
         options["sourceFile"] = source_file
@@ -7059,7 +7064,7 @@ class App:
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         retrieval_mode="live", retrieval_cutoff_utc="",
-        workflow_stages=None, original_content=None, coordinator_prompt=None, author_mode=None, team_options=None,
+        workflow_stages=None, original_content=None, team_options=None,
     ):
         """Create a new job that audits one complete saved candidate proof; its critic starts afresh."""
 
@@ -7090,8 +7095,7 @@ class App:
             reasoning_summary=reasoning_summary,
             include_review=False,
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
-            workflow_stages=workflow_stages, coordinator_prompt=coordinator_prompt,
-            author_mode=self._kept_author_mode(author_mode, source_run),
+            workflow_stages=workflow_stages,
             **self._team_settings(team_options, source_run),
         )
         options["originalContent"] = original_content if original_content is not None else solution
@@ -7150,6 +7154,8 @@ class App:
     def approve(self, edited_statement=None):
         """Solve the reviewed statement, including any direct author edit."""
 
+        with self.lock:
+            self._check_coordinator_job_locked()
         self._check_launch_hold()
 
         with self.lock:
@@ -7256,7 +7262,6 @@ class App:
             self._stop_in_place = False
             self._end_retry_wait_locked()
             self._model_retries, self._retry_starts, self._failure_streaks = {}, {}, {}
-            self._coordinator_warnings = {}
             self.state["modelRetry"] = None
             if stopped_in_place and not (restored is not None and restored["phase"] == "paused"
                                          and read_pause_object(self.run_dir).get("pauseCause") == "stopped"):
@@ -7323,7 +7328,6 @@ class App:
                 entry = self.add_trace(record)
                 self._follow_model_retry(record)
                 self._follow_failures(record)
-                self._follow_coordinator_warnings(entry)
                 self._follow_author_question(record)
                 if (record.get("kind") == "critic_result" and record.get("root") is not False
                         and isinstance(record.get("report"), dict) and record["report"].get("verdict") == "reject"):
@@ -7553,7 +7557,6 @@ class App:
             # A runner that ended while waiting to retry: that wait was not active time.
             self._end_retry_wait_locked()
             self._model_retries, self._retry_starts, self._failure_streaks = {}, {}, {}
-            self._coordinator_warnings = {}
             self.state["modelRetry"] = None
             if self.process is process:
                 self.process = None
@@ -7815,6 +7818,143 @@ class App:
             })
             return hours
 
+    def _new_goal_problem_locked(self):
+        """Why this job cannot continue with a new goal now (set_new_goal()), or "" when it can."""
+
+        state = self.state
+        if state.get("coordinatorJob"):
+            return COORDINATOR_JOB_TEXT
+        if state.get("readOnly"):
+            return "This saved job is read-only."
+        if state.get("runningElsewhere"):
+            return state["runningElsewhere"]
+        try:
+            author = saved_workflow_stages(state)["author"]
+        except ValueError:
+            author = False
+        if not author or state.get("problemMode") == "latex":
+            return "This job has no Author stage, so it has no author to continue with a new goal."
+        if state["phase"] != "done" or self.has_active_worker():
+            return "A new goal can be set once the job has finished."
+        if not state.get("goalThreadId"):
+            return "The author never started its conversation, so there is no work to continue."
+        if state.get("retrievalPolicyPath") or state.get("retrievalMode") == "historical":
+            return "A web-cutoff run cannot take a new goal; start a new problem instead."
+        if self._conversation_busy_locked():
+            return CONVERSATION_BUSY
+        if len(saved_goals(state.get("goals"))) >= MAX_GOALS:
+            return f"This job already has {MAX_GOALS} goals; start a new problem instead."
+        return ""
+
+    def set_new_goal(self, goal, hours=None):
+        """Continue this finished job with a new goal: the same job, run folder, memory and author conversation.
+
+        The finished goal's statement and results move to GOALS_FOLDER/<n>/ (archive_goal_files()) and are listed
+        in state.goals; the new goal becomes the job's statement (checked-statement.md), and the job runs its stages
+        again from the proof author, whose saved conversation is reopened with the new_goal prompt (newGoalPending,
+        goal_new_goal). ``hours``, when given, replaces the job's time limit (which counts the whole job's active
+        time); a limit already used up refuses the goal until a higher one is given.
+        """
+
+        goal = str(goal or "").strip()
+        if not goal:
+            raise ValueError("Write the new goal: the statement the author should now prove.")
+        if "\0" in goal:
+            raise ValueError("The new goal cannot contain NUL characters.")
+        if len(goal) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"The new goal is longer than {MAX_STATEMENT_CHARS:,} characters.")
+        if hours is not None and hours != "":
+            try:
+                hours = float(hours)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("The time limit must be a number of hours.") from exc
+            if not math.isfinite(hours) or hours < 0:
+                raise ValueError("Set 0 for unlimited, or a positive number of hours.")
+            hours = round(hours, 10)
+        else:
+            hours = None
+        self._check_launch_hold()
+        with self.lock:
+            self._check_owned_here()
+            problem = self._new_goal_problem_locked()
+            if problem:
+                raise ValueError(problem)
+            self._check_launch_models_locked()
+            elapsed = self._elapsed_seconds()
+            limit = float(self.state.get("thinkingHours") or 0) if hours is None else hours
+            if 0 < limit * 3600 < elapsed + RESUME_MARGIN_SECONDS:
+                raise ValueError(f"The job's time limit of {hours_text(limit)} is used up by the {span_text(elapsed)} "
+                                 "of active work so far. Give a higher limit, or 0 for none, with the new goal.")
+            previous = dict(self.state)
+            goals = saved_goals(self.state.get("goals"))
+            number = len(goals) + 1
+            try:
+                statement = saved_statement(self.run_dir)
+            except ValueError:
+                statement = ""
+            placed = archive_goal_files(self.run_dir, number)
+            goals.append({"number": number, "statement": statement, "resultKind": self.state.get("resultKind") or "",
+                          "startedAt": self.state.get("goalStartedAt") or self.state.get("startedAt") or "",
+                          "finishedAt": self.state.get("finishedAt") or self.state.get("lastActivityAt") or "",
+                          "folder": f"{GOALS_FOLDER}/{number}", "files": [name for name in placed if name in GOAL_FILES]})
+            now = datetime.now(timezone.utc).isoformat()
+            process = None
+            try:
+                self._save_controlled("checked-statement.md", f"# Checked statement\n\n{goal}\n")
+                if hours is not None:
+                    self._write_author_limit(hours)
+                    self.state["thinkingHours"] = hours
+                self.state.update(
+                    goals=goals, goalStartedAt=now, newGoalPending=True, goalResume=True, elapsedSeconds=elapsed,
+                    resumedAt=now, finishedAt="", error="", resultKind="", output="", revisionRequired=False,
+                    criticBugs="", finalInputReady=False, autoResumeAt=0, sessionUnavailable=False, safetyStop=False,
+                    settingsProblem=None, waitingForSettings="", resumeQueuedAt=0, stoppedStage="",
+                    manuallyStopped=False)
+                self._clear_pause_request()
+                self._save_job_settings(self.state)
+                process, token = self._launch_workflow_locked(
+                    ["author_critic.yaml", "clean_up.yaml"], goal,
+                    [*self._proof_options_locked(), "--set", "goal_require_resume=true",
+                     "--elapsed-seconds", str(elapsed)],
+                    "solve", "author")
+                self._spawn_worker(self._read_output, (process, token), token)
+            except (OSError, ValueError, RuntimeError):
+                if process is not None:
+                    stop_process_tree(process)
+                self.state = previous
+                self.process = self.active_token = self.worker_token = None
+                restore_goal_files(self.run_dir, number, placed)
+                try:
+                    self._save_controlled("checked-statement.md", f"# Checked statement\n\n{statement}\n")
+                    self._save_job_settings(self.state)
+                except (OSError, ValueError):
+                    pass
+                self._settle_run_claim()
+                raise
+            self.add_trace({"kind": "status", "stage": "solve", "node": "author", "label": NEW_GOAL_LABEL,
+                            "text": goal, "goalNumber": number + 1,
+                            **({"authorLimitHours": hours} if hours is not None else {})})
+            return number + 1
+
+    def goal_file(self, number, name):
+        """One file of an earlier goal (GOALS_FOLDER/<number>/<name>, a name of GOAL_FILES), for reading or download."""
+
+        if name not in GOAL_FILES:
+            raise ValueError("Unknown file of an earlier goal.")
+        try:
+            number = int(number)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Unknown earlier goal.") from exc
+        with self.lock:
+            run_dir = self.run_dir
+            known = any(goal["number"] == number for goal in saved_goals(self.state.get("goals")))
+        if run_dir is None or not known:
+            raise ValueError("Unknown earlier goal.")
+        path = Path(run_dir) / GOALS_FOLDER / str(number) / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("That file of the earlier goal is not available.")
+        return path.read_bytes(), GOAL_FILES[name]
+
     def steer_author(self, instruction):
         """Queue one live instruction for the currently running author turn."""
 
@@ -7829,6 +7969,7 @@ class App:
                 f"{runtime.AUTHOR_STEER_MAX_CHARS} characters."
             )
         with self.lock:
+            self._check_coordinator_job_locked()
             if not self._author_running_locked():
                 raise ValueError(
                     "Live instructions can only be sent while the proof author "
@@ -8022,6 +8163,7 @@ class App:
 
         with self.lock:
             self._check_owned_here()
+            self._check_coordinator_job_locked()
             question = self._open_question_locked(question_id, now)
             if not self._author_running_locked():
                 raise ValueError("Answers can only be sent while the proof author is running.")
@@ -8081,9 +8223,12 @@ class App:
         return hours * 3600 - elapsed < RESUME_MARGIN_SECONDS
 
     def resume_refusal(self):
-        """Why Resume must wait, or "": a reply being written, or a time limit that is used up."""
+        """Why Resume must wait, or "": a job that ran in coordinator mode, a reply being written, or a time limit
+        that is used up."""
 
         with self.lock:
+            if self.state.get("coordinatorJob"):
+                return COORDINATOR_JOB_TEXT
             if self._conversation_busy_locked():
                 return CONVERSATION_BUSY
             elapsed = self._elapsed_seconds()
@@ -8136,9 +8281,12 @@ class App:
         return next((item for item in self._conversation if item["id"] == identity), None)
 
     def _conversation_problem_locked(self):
-        """Why the paused author cannot be asked now (a reply turn), or "" when it can."""
+        """Why the author cannot be asked now in a reply turn (it can while the job is paused or stopped at the proof
+        author, and once the job has finished), or "" when it can."""
 
         state = self.state
+        if state.get("coordinatorJob"):
+            return COORDINATOR_JOB_TEXT
         try:
             author = saved_workflow_stages(state)["author"]
         except ValueError:
@@ -8149,10 +8297,11 @@ class App:
         if state["phase"] == "running" and at_author:
             # A message for the working author goes as a live instruction (send_chat), never as a reply turn.
             return "Talking to the author is available while the run is paused at the proof author."
-        if not (state["phase"] == "paused" and at_author):
+        if not (state["phase"] == "paused" and at_author) and state["phase"] != "done":
             return self._chat_step_note_locked()
         if not state.get("goalThreadId"):
-            return "The author has not started its conversation yet."
+            return ("The author has not started its conversation yet." if state["phase"] != "done"
+                    else CHAT_NOTE_DONE)
         if state.get("sessionUnavailable"):
             return "The saved author conversation is no longer available."
         if state.get("safetyStop"):
@@ -8202,6 +8351,8 @@ class App:
         """
 
         state = self.state
+        if state.get("coordinatorJob"):
+            return "off", COORDINATOR_JOB_TEXT, "off", COORDINATOR_JOB_TEXT
         try:
             author = saved_workflow_stages(state)["author"]
         except ValueError:
@@ -8217,7 +8368,8 @@ class App:
             if self.process is None or self.process.poll() is not None:
                 return "off", CHAT_NOTE_STARTING, "off", CHAT_NOTE_STARTING
             reason = CONVERSATION_BUSY if busy else "" if state.get("goalThreadId") else CHAT_NOTE_NO_THREAD
-            return "author", CHAT_NOTE_AUTHOR, "off" if reason else "pause", reason
+            note = CHAT_NOTE_AUTHOR if self._chat_replies_locked() else CHAT_NOTE_AUTHOR_OWN_PROMPT
+            return "author", note, "off" if reason else "pause", reason
         if phase == "pausing" and at_author:
             # A Stop reads as stopping, never as pausing.
             stopping = self._pause_cause_locked() == "stopped"
@@ -8234,6 +8386,17 @@ class App:
             historical = bool(state.get("retrievalPolicyPath") or state.get("retrievalMode") == "historical")
             read_only = not historical and getattr(runtime, "CONVERSATION_READ_ONLY", True)
             return "paused", CHAT_NOTE_PAUSED if read_only else CHAT_NOTE_PAUSED_CUTOFF, "now", ""
+        if phase == "done" and not state.get("readOnly"):
+            # A finished job: its author answers in reply turns, as while paused (it never works again in this
+            # goal; a new goal continues the job).
+            problem = self._conversation_problem_locked()
+            if problem:
+                return "off", problem, "off", problem
+            if busy:
+                return "busy", CONVERSATION_BUSY, "off", CONVERSATION_BUSY
+            historical = bool(state.get("retrievalPolicyPath") or state.get("retrievalMode") == "historical")
+            read_only = not historical and getattr(runtime, "CONVERSATION_READ_ONLY", True)
+            return "finished", CHAT_NOTE_FINISHED if read_only else CHAT_NOTE_FINISHED_CUTOFF, "now", ""
         note = self._chat_step_note_locked()
         return "off", note, "off", note
 
@@ -8253,7 +8416,7 @@ class App:
             mode, note, _, _ = self._chat_mode_locked()
             if mode == "author":
                 return self._send_chat_instruction_locked(text)
-            if mode == "paused":
+            if mode in {"paused", "finished"}:
                 return self._queue_conversation_locked("message", text, "user")
             raise ValueError(note)
 
@@ -8269,6 +8432,7 @@ class App:
             raise ValueError(f"The chat prompt of workflows/author_critic.yaml cannot be used ({exc}); the message "
                              "was not sent.") from exc
         framed = runtime.render_template(template, {"message": text, "answer_file": answer_file})
+        replies = self._chat_replies_locked(template)
         limit = getattr(runtime, "AUTHOR_STEER_QUEUE_MAX_CHARS", runtime.AUTHOR_STEER_MAX_CHARS)
         if len(framed) > limit:
             raise ValueError(f"With its chat framing this message has {len(framed):,} characters; a live "
@@ -8280,10 +8444,29 @@ class App:
                 "createdAt": datetime.now(timezone.utc).isoformat(), "dueAt": 0, "startedAt": "", "finishedAt": "",
                 "attempts": 0, "reply": "", "error": "", "notice": [], "compacted": False,
                 "steerId": steer_id, "answerFile": answer_file, "deliveredAt": "", "answerPath": "",
-                "answerUpdatedAt": ""}
+                "answerUpdatedAt": "", "replyExpected": replies}
         self._conversation.append(item)
         self._save_conversation_locked()
         return item
+
+    def _chat_replies_locked(self, template=None):
+        """Whether the working author replies to every chat message, a question and an instruction alike.
+
+        It does when the job's chat prompt is the built-in one (workflows/author_critic.yaml), which asks for an
+        answer or a short confirmation; a job started before that prompt, or whose chat prompt was edited, keeps its
+        own, which may leave an instruction unanswered. The chat shows the author replying to a message sent with
+        ``replyExpected`` until its reply comes. Read once per job (``template``: the job's chat prompt, read for a
+        message being sent, which reads it again); False when either prompt cannot be read.
+        """
+
+        if template is None and self._chat_replies is not None:
+            return self._chat_replies
+        try:
+            own = chat_template(self.state.get("promptSet")) if template is None else template
+            self._chat_replies = own == chat_template()
+        except ValueError:
+            self._chat_replies = False
+        return self._chat_replies
 
     def _prepare_chat_folder_locked(self):
         """Create the author's chat folder, where it writes its answers (best effort: the message goes anyway).
@@ -8385,76 +8568,47 @@ class App:
                 except OSError:
                     pass  # The chat keeps the answer; only its activity record is missing.
 
-    def collect_progress_log(self):
-        """Show the author coordinator's progress log anew when it changed (the server's tick, about once a second).
-
-        A coordinator job (authorMode "coordinator") reads memory/progress.md in its author's working folder
-        (read_progress_log()) whenever its size or modification time changed, outside the job lock; the job's
-        state keeps what the page shows of it but its text (coordinatorProgress: PROGRESS_LOG_FIELDS, None while
-        there is no file), and progress_log() gives the text. A file that could not be read this time (it changed
-        while it was read) is read again at the next check.
-        """
+    def _memory_workspace(self):
+        """The working folder whose memory folder the job page shows: the author's (also of a job another process
+        runs, or a saved one: reading changes nothing)."""
 
         with self.lock:
-            # Also for a job another process runs (a terminal run): reading the file changes nothing.
-            if self.run_dir is None or self.state.get("authorMode") != "coordinator" or self.state.get("readOnly"):
-                return
-            # A state rebuilt since (a new step of the job) shows no log: it is read again.
-            known = self._progress_signature if self.state.get("coordinatorProgress") is not None else None
-            workspace, run = self._author_workspace(), str(self.run_dir)
-        # The file system is read outside the lock: polls never wait for it.
-        signature = progress_log_signature(workspace)
-        if signature is None:
-            with self.lock:
-                if str(self.run_dir) == run:
-                    self._progress_absent = run  # Its first version will be its first save.
-        if signature == known:
-            return
-        log = read_progress_log(workspace, signature) if signature is not None else None
-        if signature is not None and log is None:
-            return  # Not readable this time: the next check reads it again.
-        with self.lock:
-            self._progress_signature, self._progress_log = signature, log
-            self.state["coordinatorProgress"] = (None if log is None else
-                                                 {key: log[key] for key in PROGRESS_LOG_FIELDS})
-            self.state["coordinatorProgressVersions"] = self._progress_log_versions(log)
+            if self.run_dir is None:
+                raise ValueError("This job has no run folder.")
+            return self._author_workspace()
 
-    def _progress_log_versions(self, log):
-        """When each version of the progress log was saved, with ``log`` (read_progress_log()) added when its version
-        is new: [{"version", "at", "chars"}], oldest first, the newest PROGRESS_LOG_VERSIONS, the first saying what
-        came before it (trim_progress_log_versions(); under the job lock). A log that this server never saw absent
-        and of which no version is kept yet (a job from before the version times, one run while no server read it)
-        existed already: its first version here is not its first save.
+    def memory_files(self):
+        """The files of the author's memory as the job page lists them (GET /memory-files): list_memory_files()
+        with "folder", the memory folder's place on this computer, and "exists", whether it is there. Read at
+        each request, outside the job lock: polls never wait for it."""
 
-        Kept in the controller folder (PROGRESS_LOG_VERSIONS_FILE, owner-only), so a restart keeps them; a file that
-        cannot be read or written leaves the times of this server's own reads.
-        """
+        workspace = self._memory_workspace()
+        listing = list_memory_files(workspace)
+        return {"folder": str(workspace / MEMORY_FOLDER), "exists": listing is not None,
+                **(listing or {"files": [], "count": 0, "bytes": 0, "truncated": False})}
 
-        if self._progress_versions is None or self._progress_versions[0] != str(self.run_dir):
-            self._progress_versions = (str(self.run_dir), saved_progress_log_versions(self.run_dir))
-        versions = self._progress_versions[1]
-        if log is not None and (not versions or versions[-1]["version"] != log["version"]):
-            existed = not versions and self._progress_absent != str(self.run_dir)
-            versions.append({"version": log["version"], "at": log["updatedAt"], "chars": log["chars"],
-                             **({"existed": True} if existed else {})})
-            trim_progress_log_versions(versions)
-            try:
-                self._save_controlled(PROGRESS_LOG_VERSIONS_FILE, json.dumps(versions) + "\n", run_copy=False)
-            except (OSError, runtime.Error):
-                pass  # Kept in memory: the next version tries the file again.
-        return [dict(entry) for entry in versions]
+    def memory_file(self, path):
+        """One file of the author's memory as the job page shows it (GET /memory-file): read_memory_file()."""
 
-    def progress_log(self):
-        """The author coordinator's progress log as the job page shows it (GET /progress-log): the state's
-        coordinatorProgress with its text, {"text", "updatedAt", "truncated", "chars", "bytes", "version"}, or
-        {"text": None, "version": None} while the job shows none. /state carries only the version, so the page
-        fetches the text (at most MAX_PROGRESS_LOG_CHARS characters) when it changes or the job page opens."""
+        workspace = self._memory_workspace()
+        found = read_memory_file(workspace, path)
+        if found is None:
+            raise ValueError("That file is no longer in the author's memory, or it is not a file that can be shown.")
+        return found
 
-        with self.lock:
-            shown, log = self.state.get("coordinatorProgress"), self._progress_log
-            if not isinstance(shown, dict) or log is None or log.get("version") != shown.get("version"):
-                return {"text": None, "version": None}
-            return {**shown, "text": log["text"]}
+    def open_memory_file(self, path):
+        """One whole file of the author's memory, opened for a download: (binary stream, size, file name)."""
+
+        parts = memory_path_parts(path)
+        descriptor = _memory_file_descriptor(self._memory_workspace(), parts)
+        if descriptor is None:
+            raise ValueError("That file is no longer in the author's memory, or it is not a file that can be shown.")
+        try:
+            size = os.fstat(descriptor).st_size
+        except OSError:
+            os.close(descriptor)
+            raise
+        return os.fdopen(descriptor, "rb"), size, parts[-1]
 
     def open_chat_answer(self, identity):
         """The whole answer file of one answered chat message, opened for a download: (binary stream, size)."""
@@ -8563,7 +8717,7 @@ class App:
         return item
 
     def stop_author_reply(self, identity=None):
-        """Cancel the queued or running reply (``identity``: the one the page shows); the job stays paused."""
+        """Cancel the queued or running reply (``identity``: the one the page shows); the job stays as it was."""
 
         identity = identity or None
         with self.lock:
@@ -8581,7 +8735,8 @@ class App:
             # No "node": a summary asked for with Pause and summarize can be stopped while the pause holds the
             # job at the critic, where add_trace must not move the job's step to the author.
             self.add_trace({"kind": "status", "stage": "conversation", "conversationId": item["id"],
-                            "label": "Author reply stopped", "text": "The reply was stopped; the job stays paused."})
+                            "label": "Author reply stopped",
+                            "text": "The reply was stopped; the job stays as it was."})
             process = None
             if running:
                 # Its reader sees that it no longer owns the job, and only saves.
@@ -8675,10 +8830,6 @@ class App:
         options = [
             "--converse",
             "--author-model", self.state["authorModel"], "--author-effort", self.state["authorEffort"],
-            # The coordinator's summary prompt for a coordinator job (the turn itself has no subagents), the
-            # author's for one whose author works alone, as its runner reported (follow_author_mode()).
-            "--author-mode", "author" if self.state.get("authorModeEffective")
-            else self.state.get("authorMode") if self.state.get("authorMode") in AUTHOR_MODES else "author",
             "--reasoning-effort", self.state["reasoningEffort"],
             "--reasoning-summary", self.state["reasoningSummary"], "--speed", self.state["speedMode"],
             "--thinking-hours", "0",
@@ -8689,7 +8840,7 @@ class App:
             "--set", "run_tmp_dir=" + json.dumps(str(self._controller_directory() / RUN_TMP_FOLDER)),
             # How its goal loop ran (a thread of TCS Prover's loop has no Codex goal) and the job's texts (its
             # summary and reply prompts).
-            *self._team_runner_options(conversation=True),
+            *self._team_runner_options(),
         ]
         if not historical:
             options.extend(["--set", "goal_stderr_log=" + json.dumps(str(self.run_dir / AUTHOR_STDERR_FILENAME))])
@@ -8706,7 +8857,8 @@ class App:
 
         now = time.time() if now is None else now
         with self.lock:
-            if self.state["phase"] != "paused" or self.has_active_worker() or self.state.get("runningElsewhere"):
+            if (self.state["phase"] not in {"paused", "done"} or self.has_active_worker()
+                    or self.state.get("runningElsewhere")):
                 return False
             item = next((item for item in self._conversation
                          if item["kind"] in REPLY_KINDS and item["status"] == "queued"), None)
@@ -8912,6 +9064,7 @@ class App:
         """
 
         self._conversation = self._load_conversation()
+        self._chat_replies = None  # Read again for this job's prompts.
         if not owned:
             return  # Another process owns the run: nothing in it is written.
         paused = self.state["phase"] == "paused"
@@ -9618,8 +9771,6 @@ def saved_setting_problem(key, value):
             valid = isinstance(value, int) and valid_author_subagents(value) == value
         except ValueError:
             valid = False
-    elif key == "authorMode":
-        valid = value in AUTHOR_MODES
     elif key.endswith(("Model", "Effort")) or key in {
             "speedMode", "reasoningSummary", "problemMode", "goalThreadId", "goalWorkspace",
             "authorSteerDelivered", "resumedAt", "launchError"}:
@@ -9631,7 +9782,7 @@ def saved_setting_problem(key, value):
 
 # The records of a launch of an idle job in its own folder (Resume, Continue, a web-cutoff job's continuation):
 # each ends the stop before it, of either kind (see saved_manual_stop and restore_saved_app).
-RELAUNCH_LABELS = frozenset({"Resume requested", "Historical run continued"})
+RELAUNCH_LABELS = frozenset({"Resume requested", "Historical run continued", NEW_GOAL_LABEL})
 
 
 def restore_record(record):
@@ -9862,7 +10013,7 @@ def restore_saved_app(app, *, owned=True):
             for key in (
                 "reviewModel", "authorModel", "criticModel", "writerModel",
                 "reasoningEffort", "reviewEffort", "authorEffort",
-                "criticEffort", "writerEffort", "criticRounds", "criticCount", "authorSubagents", "authorMode",
+                "criticEffort", "writerEffort", "criticRounds", "criticCount", "authorSubagents",
                 "thinkingHours", "speedMode", "reasoningSummary",
                 "problemMode", "skipStatementReview", "statementReviewOnly", "preparedRun",
                 "workflowStages", "originalContent",
@@ -9918,17 +10069,19 @@ def restore_saved_app(app, *, owned=True):
                 state["folderBatch"] = settings["folderBatch"]
             # Kept below only when the author continues after this restart.
             state["authorQuestion"] = saved_author_question(settings.get("authorQuestion"))
-            # Who runs the goal loop and the coordinator's team; a job from before has Codex's goal mode and the
-            # CLI's built-in subagents (no authorTeam). A malformed value of the run folder's copy keeps that.
+            # A job that ran in coordinator mode: it shows, and nothing runs for it again (COORDINATOR_JOB_TEXT).
+            state["coordinatorJob"] = saved_coordinator_job(settings)
+            # The earlier goals of a job continued with new goals (App.set_new_goal()).
+            state["goals"] = saved_goals(settings.get("goals"))
+            if isinstance(settings.get("goalStartedAt"), str):
+                state["goalStartedAt"] = settings["goalStartedAt"]
+            state["newGoalPending"] = settings.get("newGoalPending") is True
+            # Who runs the goal loop; a job from before has Codex's goal mode. A malformed value of the run folder's
+            # copy keeps that.
             if settings.get("goalLoop") in runtime.GOAL_LOOPS:
                 state["goalLoop"] = settings["goalLoop"]
                 persisted_settings.add("goalLoop")
                 state["legacyTeam"] = settings.get("legacyTeam") is True
-                state["authorTeam"] = saved_team(settings.get("authorTeam"))
-                try:
-                    state["authorSubagentModels"] = team_module.validated_team(settings.get("authorSubagentModels"))
-                except ValueError:
-                    state["authorSubagentModels"] = None
     except FileNotFoundError:
         pass
     except (OSError, UnicodeError, ValueError, RecursionError):
@@ -9956,8 +10109,7 @@ def restore_saved_app(app, *, owned=True):
     state["promptEdits"] = saved_prompt_edits(run_dir) if state["promptSet"] is not None else None
     app._saved_prompt_edits = state["promptEdits"]
     if "goalLoop" not in persisted_settings:
-        state.update(goalLoop=LEGACY_GOAL_LOOP, authorTeam=None, authorSubagentModels=None, goalLoopRecorded=False,
-                     legacyTeam=True)
+        state.update(goalLoop=LEGACY_GOAL_LOOP, goalLoopRecorded=False, legacyTeam=True)
     if "examiner" not in persisted_settings:
         # A job from before the Examiner setting keeps what it had: an examiner only with a text of its own.
         state["examiner"] = bool(isinstance(state["promptSet"], dict)
@@ -10022,13 +10174,9 @@ def restore_saved_app(app, *, owned=True):
         state["workflowStages"][name] for name in ("author", "critic", "writing"))
     state["criticCountRecorded"] = "criticCount" in persisted_settings
     state["authorSubagentsRecorded"] = "authorSubagents" in persisted_settings
-    # A job saved without these is older than the author coordinator: its author works alone, with the number of
-    # subagents it saved (none when it saved no number). It is never resumed or continued as a coordinator.
+    # A job saved without its number of subagents is older than that setting: its author had none.
     if "authorSubagents" not in persisted_settings:
         state["authorSubagents"] = 0
-    state["authorModeRecorded"] = "authorMode" in persisted_settings
-    if not state["authorModeRecorded"] or not state["authorSubagents"]:
-        state["authorMode"] = "author"
     state["originalContent"] = state.get("originalContent") or state.get("draft", "")
     state["workflow"] = workflow_graph(state["workflowStages"])
 
@@ -10052,7 +10200,8 @@ def restore_saved_app(app, *, owned=True):
     stop_in_force = False
     for record in _iter_run_records(run_dir):
         follow_time_limit(state["timeLimitHistory"], record)
-        state["authorModeEffective"] = follow_author_mode(state.get("authorModeEffective"), record)
+        if ran_as_coordinator(record):
+            state["coordinatorJob"] = True
         state["stepTimes"] = follow_step_times(state.get("stepTimes"), record)
         if controller_note(record):
             continue
@@ -10097,6 +10246,11 @@ def restore_saved_app(app, *, owned=True):
             author_finished = submitted_since_resume = True
         elif record.get("kind") == "status" and record.get("label") == "Resume requested":
             submitted_since_resume = False
+        if record.get("kind") == "status" and label == NEW_GOAL_LABEL:
+            # A new goal: the earlier goal's result (in GOALS_FOLDER) is not this goal's.
+            state.update(resultKind="", output="", revisionRequired=False, criticBugs="", round=0, error="")
+            author_finished = submitted_since_resume = False
+            ended_with_error = False
         if record.get("kind") == "failure_result":
             state["resultKind"] = "needs-revision" if record.get("resultKind") == "needs-revision" else "failure"
             state["revisionRequired"] = state["resultKind"] == "needs-revision"
@@ -10589,6 +10743,103 @@ def saved_statement(path):
     return statement
 
 
+def archive_goal_files(run_dir, number):
+    """Move the finished goal's results out of ``run_dir`` into GOALS_FOLDER/<number>/ (see GOALS_FOLDER), copy its
+    statement (the controller's copy), proof file and summary there, and return the names placed there."""
+
+    run_dir = Path(run_dir)
+    folder = run_dir / GOALS_FOLDER / str(number)
+    folder.mkdir(parents=True, exist_ok=True)
+    placed = []
+    statement = controlled_path(run_dir, "checked-statement.md")
+    if statement.is_file() and not statement.is_symlink():
+        shutil.copyfile(statement, folder / "checked-statement.md")
+        placed.append("checked-statement.md")
+    names = [*GOAL_RESULT_FILES, *sorted(path.name for path in run_dir.iterdir()
+                                         if path.name.startswith("final.") or (path.name.startswith("latex-")
+                                                                               and path.name.endswith((".log", ".tex"))))]
+    for name in dict.fromkeys(names):
+        path = run_dir / name
+        if path.is_file() and not path.is_symlink():
+            path.replace(folder / name)
+            placed.append(name)
+    for name in GOAL_COPIED_FILES:
+        path = run_dir / name
+        if path.is_file() and not path.is_symlink():
+            shutil.copyfile(path, folder / name)
+            placed.append(name)
+    return placed
+
+
+def restore_goal_files(run_dir, number, placed):
+    """Undo archive_goal_files() for a new goal that could not start: the moved files go back (copies stay)."""
+
+    folder = Path(run_dir) / GOALS_FOLDER / str(number)
+    for name in placed:
+        if name in GOAL_COPIED_FILES or name == "checked-statement.md":
+            continue
+        try:
+            (folder / name).replace(Path(run_dir) / name)
+        except OSError:
+            pass
+
+
+def saved_goals(value):
+    """The earlier goals a job saved (state.goals), checked: [{number, statement, resultKind, startedAt, finishedAt,
+    folder, files}], oldest first; anything malformed is left out."""
+
+    goals = []
+    for entry in value if isinstance(value, list) else []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("number"), int) or entry["number"] < 1:
+            continue
+        goals.append({
+            "number": entry["number"],
+            "statement": str(entry.get("statement") or ""),
+            "resultKind": str(entry.get("resultKind") or ""),
+            "startedAt": str(entry.get("startedAt") or ""),
+            "finishedAt": str(entry.get("finishedAt") or ""),
+            "folder": f"{GOALS_FOLDER}/{entry['number']}",
+            "files": [name for name in entry.get("files") or [] if isinstance(name, str) and name in GOAL_FILES],
+        })
+    return goals[-MAX_GOALS:]
+
+
+def current_proof_file(run_dir, state):
+    """("accepted" or "candidate", its path) of the proof the job page shows as the current one (see
+    MAX_CURRENT_PROOF_CHARS), or None: a job without the Author stage, or none handed in yet."""
+
+    if run_dir is None:
+        return None
+    try:
+        if not saved_workflow_stages(state)["author"]:
+            return None
+    except ValueError:
+        return None
+    for source, name in (("accepted", runtime.FINAL_INPUT_FILENAME), ("candidate", runtime.SAVED_CANDIDATE_FILENAME)):
+        if source == "accepted" and not state.get("finalInputReady"):
+            continue
+        path = Path(run_dir) / name
+        if path.is_file() and not path.is_symlink():
+            return source, path
+    return None
+
+
+def current_proof_mark(run_dir, state):
+    """What the job's state says of its current proof: {"source", "bytes", "updatedAt", "version"}, or None."""
+
+    found = current_proof_file(run_dir, state)
+    if found is None:
+        return None
+    source, path = found
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return {"source": source, "bytes": info.st_size,
+            "updatedAt": datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat(),
+            "version": f"{source}:{info.st_size}:{info.st_mtime_ns}"}
+
+
 def saved_final_input(path, records=None):
     """Load the exact clean statement/proof pair sent to the final editor."""
 
@@ -10661,7 +10912,6 @@ def saved_critic_source(path):
         "author_prompt": prompts["author"],
         "critic_prompt": prompts["critic"],
         "final_prompt": prompts["final"],
-        "coordinator_prompt": prompts["coordinator"],
     }
 
 
@@ -10688,7 +10938,7 @@ def saved_research_source(path):
             if settings[f"{role}Model"] != saved:
                 replaced.append(role)
     # A job saved without its number of author subagents (older than that setting) had none, as when it is
-    # restored: a continuation of it never gets the new default's subagents (see AUTHOR_MODES).
+    # restored: a continuation of it never gets the new default's subagents.
     settings.setdefault("authorSubagents", 0)
     defaults = default_prompts()
     for role in PROOF_PROMPTS:
@@ -10979,10 +11229,7 @@ class Server(ThreadingHTTPServer):
 
         programs, sign_in = set(), set()
         ahead = cls._setup_stages_ahead(state)
-        # The coordinator's team members run their own models in the author stage, each counted like a role's.
-        members = [("author", entry.get("model")) for entry in state.get("authorTeam") or []
-                   if isinstance(entry, dict)]
-        for stage, model in [*((stage, state.get(f"{role}Model")) for stage, role in STAGE_ROLES.items()), *members]:
+        for stage, model in ((stage, state.get(f"{role}Model")) for stage, role in STAGE_ROLES.items()):
             if stage not in ahead:
                 continue
             try:
@@ -11169,10 +11416,6 @@ class Server(ThreadingHTTPServer):
                 app.collect_chat_answers()
             except Exception:
                 traceback.print_exc()  # One job's answer files never stop the other jobs' tick.
-            try:
-                app.collect_progress_log()
-            except Exception:
-                traceback.print_exc()  # Nor does one coordinator's progress log.
             app.copy_web_cutoff_if_due()
 
     def _adopt_released_runs(self):
@@ -11416,7 +11659,6 @@ class Server(ThreadingHTTPServer):
             writer_effort=body.get("writerEffort", legacy_effort),
             **web_prompt_options(body, ("review", *PROOF_PROMPTS), app.state if run_id else None),
             team_options=web_team_options(body, app.state if run_id else None),
-            author_mode=body.get("authorMode"),
             speed_mode=body.get("speedMode", DEFAULT_SPEED),
             reasoning_summary=body.get(
                 "reasoningSummary", DEFAULT_REASONING_SUMMARY
@@ -11527,8 +11769,6 @@ class Server(ThreadingHTTPServer):
             "writer_effort": body.get("writerEffort", legacy_effort),
             **web_prompt_options(body, PROOF_PROMPTS),
             "team_options": web_team_options(body),
-            # A request may ask for the earlier team design ("coordinator"); otherwise the job's author is an author.
-            "author_mode": body.get("authorMode"),
             "speed_mode": body.get("speedMode", DEFAULT_SPEED),
             "reasoning_summary": body.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
             **({"workflow_stages": normalize_workflow_stages(body["workflowStages"])} if "workflowStages" in body else {}),
@@ -11784,7 +12024,10 @@ class Server(ThreadingHTTPServer):
     def start_saved_critic_job(self, source_run, settings=None):
         """Create a browser-visible job from one saved complete proof."""
 
-        settings = {**saved_research_source(source_run)["settings"], **(settings or {})}
+        saved = saved_research_source(source_run)["settings"]
+        if saved_coordinator_job(saved):
+            raise ValueError(COORDINATOR_JOB_TEXT)
+        settings = {**saved, **(settings or {})}
         stages = {**saved_workflow_stages(settings), "review": False}
         if not stages["critic"]:
             raise ValueError("The critic stage is disabled for this saved workflow.")
@@ -11826,7 +12069,6 @@ class Server(ThreadingHTTPServer):
                 "criticPrompt", source["critic_prompt"]
             ),
             final_prompt=settings.get("finalPrompt", source["final_prompt"]),
-            coordinator_prompt=settings.get("coordinatorPrompt", source.get("coordinator_prompt")),
             speed_mode=settings.get("speedMode", DEFAULT_SPEED),
             reasoning_summary=settings.get(
                 "reasoningSummary", DEFAULT_REASONING_SUMMARY
@@ -11843,6 +12085,8 @@ class Server(ThreadingHTTPServer):
         """Continue saved author work with its original prompt and a fresh budget."""
 
         source = saved_research_source(source_run)
+        if saved_coordinator_job(source["settings"]):
+            raise ValueError(COORDINATOR_JOB_TEXT)
         with self.jobs_lock:
             self._check_author_workspace_idle(source["run_dir"])
             historical = self._historical_source_job(source["run_dir"])
@@ -11868,7 +12112,6 @@ class Server(ThreadingHTTPServer):
             author_prompt=options.get("authorPrompt"),
             critic_prompt=options.get("criticPrompt"),
             final_prompt=options.get("finalPrompt"),
-            coordinator_prompt=options.get("coordinatorPrompt"),
             speed_mode=options.get("speedMode", DEFAULT_SPEED),
             reasoning_summary=options.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
             continuation_source=source["run_dir"], stopped_stage="solve",
@@ -12247,6 +12490,8 @@ class Server(ThreadingHTTPServer):
 
         source_app = self.get_job(run_id)
         source_state = source_app.snapshot()
+        if source_state.get("coordinatorJob"):
+            raise ValueError(COORDINATOR_JOB_TEXT)
         if source_state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
             raise ValueError(
                 "Stop this job before starting another critic from its proof."
@@ -12256,7 +12501,7 @@ class Server(ThreadingHTTPServer):
                 "criticRounds", "criticCount", "authorSubagents", "thinkingHours", "authorModel",
                 "criticModel", "writerModel", "reasoningEffort",
                 "authorEffort", "criticEffort", "writerEffort",
-                "speedMode", "reasoningSummary", "authorPrompt", "coordinatorPrompt",
+                "speedMode", "reasoningSummary", "authorPrompt",
                 "workflowStages", "originalContent",
             )
         }
@@ -12271,6 +12516,8 @@ class Server(ThreadingHTTPServer):
 
         source_app = self.get_job(run_id)
         source_state = source_app.snapshot()
+        if source_state.get("coordinatorJob"):
+            raise ValueError(COORDINATOR_JOB_TEXT)
         if source_state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
             raise ValueError("Stop this job before continuing a checkpoint.")
         checkpoint = next(
@@ -12301,6 +12548,7 @@ class Server(ThreadingHTTPServer):
         with self.jobs_lock:
             source_app = self.get_job(run_id)
             with source_app.lock:
+                source_app._check_coordinator_job_locked()
                 validated_continuation_source(source_app.run_dir, self.runs)
                 source_state = source_app.snapshot()
                 if source_state["phase"] in {"reviewing", "running", "stopping", "pausing", "paused"}:
@@ -12329,7 +12577,7 @@ class Server(ThreadingHTTPServer):
         state = source_app.snapshot() if state is None else state
         if (
             state.get("phase") in {"reviewing", "running", "stopping", "pausing"}
-            or source_app.has_active_worker()
+            or source_app.has_active_worker() or state.get("coordinatorJob")
         ):
             return None
         historical = bool(state.get("retrievalPolicyPath") or state.get("retrievalMode") == "historical")
@@ -12605,6 +12853,7 @@ class Server(ThreadingHTTPServer):
         with self.jobs_lock:
             source_app = self.get_job(run_id)
             with source_app.lock:
+                source_app._check_coordinator_job_locked()
                 plan = self._stopped_continuation_plan(source_app)
                 if not plan or plan["action"] != "preflight":
                     return self._continue_stopped_job_locked(source_app)
@@ -12671,7 +12920,6 @@ class Server(ThreadingHTTPServer):
                 author_prompt=source_state["authorPrompt"],
                 critic_prompt=source_state["criticPrompt"],
                 final_prompt=source_state["finalPrompt"],
-                coordinator_prompt=source_state.get("coordinatorPrompt"),
                 review_only=source_state["statementReviewOnly"],
                 workflow_stages=source_state["workflowStages"],
                 original_content=source_state.get("originalContent"),
@@ -12694,7 +12942,6 @@ class Server(ThreadingHTTPServer):
                 "author_prompt": source_state["authorPrompt"],
                 "critic_prompt": source_state["criticPrompt"],
                 "final_prompt": source_state["finalPrompt"],
-                "coordinator_prompt": source_state.get("coordinatorPrompt"),
                 "workflow_stages": {**source_state["workflowStages"], "review": False},
                 "original_content": source_state.get("originalContent"),
                 **common,
@@ -12780,6 +13027,8 @@ class Server(ThreadingHTTPServer):
             job["conversationBusy"] = bool(state.get("conversation", {}).get("busy"))
             # Whether the running author has an open question (the job page shows it), by the same rules.
             job["authorQuestionOpen"] = bool(state.get("authorQuestion"))
+            # A job that ran in coordinator mode: shown, never run again (COORDINATOR_JOB_TEXT).
+            job["coordinatorJob"] = bool(state.get("coordinatorJob"))
             # Why the job needs you (it keeps retrying meanwhile when it can), and when it tries next.
             job["needsAttention"] = state.get("needsAttention")
             job["autoResumeAt"] = state.get("autoResumeAt") or 0
@@ -12796,14 +13045,14 @@ class Server(ThreadingHTTPServer):
             run_dir = app.run_dir
             checkpoints = state.get("checkpoints", [])
             historical = bool(state.get("retrievalPolicyPath") or state.get("retrievalMode") == "historical")
-            if historical and state.get("launchHold"):
-                # A held run continues only after Re-run preflight releases it.
-                # Copy: the snapshot shares these dicts with the job's cache.
+            if (historical and state.get("launchHold")) or state.get("coordinatorJob"):
+                # A held run continues only after Re-run preflight releases it, and a job that ran in coordinator
+                # mode never. Copy: the snapshot shares these dicts with the job's cache.
                 checkpoints = [{**checkpoint, "resumable": False} for checkpoint in checkpoints]
             job["checkpoints"] = checkpoints
             # A historical run's critic continues in its own folder (start_saved_critic_job).
             job["canResumeCritic"] = bool(
-                not (historical and state.get("launchHold"))
+                not (historical and state.get("launchHold")) and not state.get("coordinatorJob")
                 and saved_workflow_stages(state)["critic"]
                 and state["phase"] not in {"reviewing", "running", "stopping", "pausing", "paused"}
                 and run_dir
@@ -13113,7 +13362,7 @@ class Server(ThreadingHTTPServer):
             entry = providers.validated_api_connection(fields, requested)
             result = discover_api_models(entry)
             if result["ok"] and entry["format"] == providers.OPENAI_FORMAT:
-                # Then one request shaped as runs send TCS Prover's team tools (probe_team_tools()).
+                # Then one request shaped as runs send TCS Prover's tools (probe_team_tools()).
                 result["teamTools"] = probe_team_tools(entry, [model["id"] for model in result["models"]],
                                                        effort=body.get("effort"))
             result["recorded"] = False
@@ -13349,7 +13598,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(self.server.batch_shared_works(batch or ""))
             except ValueError as exc:
                 return self.send({"error": str(exc)}, status=400)
-        if request.path == "/batches" or (batch is not None and request.path not in {"/", "/app.js", "/styles.css"}):
+        if request.path == "/batches" or (batch is not None and request.path not in page_files.PAGE_ASSETS):
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
             if request.path == "/batches":
@@ -13399,6 +13648,27 @@ class Handler(BaseHTTPRequestHandler):
                 body = self.server.get_job(run_id).critic_diff(name)
                 return self.send(body, "text/x-diff; charset=utf-8",
                                  headers={"Content-Disposition": f'attachment; filename="critic-changes-{name}"'})
+            except (ValueError, OSError) as exc:
+                return self.send({"error": str(exc)}, status=400)
+        if request.path == "/goal-file":
+            # A file of an earlier goal (App.goal_file()): shown as text by the page, or downloaded.
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            try:
+                body, kind = self.server.get_job(run_id).goal_file((query.get("goal") or [""])[0],
+                                                                   (query.get("name") or [""])[0])
+                name = (query.get("name") or [""])[0]
+                return self.send(body, kind, headers={"Content-Disposition": f'attachment; filename="{name}"',
+                                                      "X-Content-Type-Options": "nosniff"})
+            except (ValueError, OSError) as exc:
+                return self.send({"error": str(exc)}, status=400)
+        if request.path == "/current-proof":
+            # The proof the critic checks or the paper is written from (App.current_proof()), whose version /state
+            # carries (currentProof).
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            try:
+                return self.send(self.server.get_job(run_id).current_proof())
             except (ValueError, OSError) as exc:
                 return self.send({"error": str(exc)}, status=400)
         if request.path in {"/download-proof", "/download-source"}:
@@ -13467,14 +13737,41 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send({"error": str(exc), **exc.body}, status=exc.status)
             except Exception as exc:  # Setup prints nothing to the terminal: the page says what failed.
                 return self.send({"error": f"Setup failed ({type(exc).__name__})"}, status=500)
-        if request.path == "/progress-log":
-            # The author coordinator's progress log of one job, whose version /state carries (App.progress_log()).
+        if request.path in {"/memory-files", "/memory-file", "/memory-file/download"}:
+            # The author's memory of one job: its files (App.memory_files()), one of them as text
+            # (App.memory_file()), or one of them whole, as a download that no browser opens in place.
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            name = (query.get("path") or [""])[0]
             try:
-                return self.send(self.server.get_job(run_id).progress_log())
-            except ValueError as exc:
+                job = self.server.get_job(run_id)
+                if request.path == "/memory-files":
+                    return self.send(job.memory_files())
+                if request.path == "/memory-file":
+                    return self.send(job.memory_file(name))
+                stream, size, filename = job.open_memory_file(name)
+            except (ValueError, OSError) as exc:
                 return self.send({"error": str(exc)}, status=400)
+            with stream:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(size))
+                # The name in the header is plain ASCII; the page names the saved file itself.
+                self.send_header("Content-Disposition",
+                                 f'attachment; filename="{re.sub(r"[^A-Za-z0-9._-]", "_", filename)}"')
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Security-Policy",
+                                 "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; sandbox")
+                self.end_headers()
+                remaining = size  # Never more than announced, even if the team appends meanwhile.
+                while remaining > 0:
+                    chunk = stream.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+            return
         if request.path == "/chat-answer":
             # The whole answer file of one chat message (the chat shows at most MAX_CHAT_ANSWER_CHARS of it).
             if not self.authorized():
@@ -13523,13 +13820,8 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
             return self.record_route(request.path, query)
-        files = {
-            "/": ("index.html", "text/html; charset=utf-8"),
-            "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-            "/styles.css": ("styles.css", "text/css; charset=utf-8"),
-            # Linked from index.html, so the browser's own icon request finds it.
-            "/favicon.svg": ("favicon.svg", "image/svg+xml"),
-        }
+        # The page, its script and styles, its icon, and the Markdown and math renderer (page_files).
+        files = page_files.PAGE_FILES
         if request.path not in files or (request.query and request.path != "/"):
             return self.send({"error": "Not found."}, status=404)
         name, kind = files[request.path]
@@ -13769,6 +14061,8 @@ class Handler(BaseHTTPRequestHandler):
                 app.dismiss_author_question(body.get("questionId"))
             elif request.path == "/chat":
                 app.send_chat(body.get("text"))
+            elif request.path == "/new-goal":
+                app.set_new_goal(body.get("goal"), body.get("thinkingHours"))
             elif request.path == "/ask-author":
                 app.ask_author(body.get("text"))
             elif request.path == "/author-summary":

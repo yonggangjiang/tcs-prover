@@ -8,9 +8,7 @@ messages as documented on goal_session().
 
 Isolation, verified against Claude Code 2.1.289 (see tests/test_claude_cli.py):
 - an explicit --tools list, so product tools (artifacts, workflows, cron,
-  skills, remote triggers, ...) are never offered, and no MCP servers but
-  TCS Prover's own for a coordinator's team, which this process answers
-  itself (an "sdk" server, see goal_session());
+  skills, remote triggers, ...) are never offered, and no MCP servers;
 - --restricted confines Read/Write/Edit to the working directory and ignores
   user, project and local settings files; deny rules keep them off the run
   folder's protected entries (protected_settings());
@@ -55,8 +53,7 @@ import time
 import uuid
 
 from retrieval import runtime as retrieval_runtime
-from runner import confinement, proof_handoff, providers, records
-from runner import team as team_module
+from runner import confinement, providers, records
 
 EMPTY_MCP_CONFIG = '{"mcpServers":{}}'
 SEARCH_TOOLS = ("WebSearch", "WebFetch")
@@ -71,10 +68,6 @@ SANDBOX_ALL_HOSTS = ("*",)
 BARE_TOOLS = ("Bash", "Read", "Edit")
 STRUCTURED_OUTPUT_TOOL = "StructuredOutput"
 SUBAGENT_TOOLS = ("Task", "Agent")
-# TCS Prover's MCP server (runner/team.py SERVER_NAME), and how Claude Code names one of its tools in --allowedTools,
-# in its init message and to the model.
-TEAM_SERVER = "tcs"
-TEAM_TOOL_PREFIX = f"mcp__{TEAM_SERVER}__"
 # Subagent outcomes, verified against Claude Code 2.1.289: a subagent that an
 # API error (rate limit, overload, server error) cut off after some work
 # returns that work as an ordinary tool result headed by the error and this
@@ -95,8 +88,8 @@ SUBAGENT_REFUSALS = ("limit reached", "available agents:", "denied by permission
 # SUBAGENT_DENIED does in the private settings file. With a number of subagents the CLI also gets
 # CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS (at most that many at once; 20 by default) and
 # CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1 (subagents start none of their own; 3 levels by default). With foreground
-# subagents a running Claude coordinator reads a live instruction or a chat message only once its running
-# subagents have reported.
+# subagents a running Claude author reads a live instruction or a chat message only once its running subagents
+# have reported.
 SUBAGENT_ENVIRONMENT = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1", "CLAUDE_CODE_FORK_SUBAGENT": "0"}
 SUBAGENT_DENIED = ("Agent(fork)",)
 # Pre-approved writes stay inside the working directory; Edit rules cover Write.
@@ -178,12 +171,7 @@ End every turn by calling the StructuredOutput tool:
 # (author_conversation()); it travels in a file named HARNESS_FILE too, so
 # leftover_authors() also recognizes a conversation CLI.
 CONVERSATION_HARNESS_NOTE = """TCS PROVER HARNESS NOTE (provider plumbing; the message itself arrives in the user turn)
-The long-running goal is paused while the user talks with you. Reply in plain text; this turn needs no structured goal status."""
-
-
-def _team_service():
-    from runner import team  # The service lives in runner/team.py, which imports nothing from here.
-    return team.Service()
+The long-running goal is not running while the user talks with you. Reply in plain text; this turn needs no structured goal status."""
 
 
 def _runtime_module(runtime):
@@ -754,20 +742,17 @@ def api_configuration(model, effort, secret, folder, environment, runtime, stage
                   else "The claude command on PATH did not confirm that it uses a private CLAUDE_CONFIG_DIR")
 
 
-def command_arguments(executable_path, model, effort, tools, allowed, settings_path, *, bare, extra=(), denied=(),
-                      mcp_config=None):
+def command_arguments(executable_path, model, effort, tools, allowed, settings_path, *, bare, extra=(), denied=()):
     """Common flags of every Claude role; ``denied`` are tools an earlier CLI offered unasked.
 
-    ``mcp_config`` is the file of TCS Prover's own MCP server (the coordinator's team, team.Service.claude_config());
-    without it the CLI gets none. --safe-mode keeps the user's customizations off and, in Claude Code 2.1.289, drops
-    every --mcp-config server that is not an "sdk" server, which TCS Prover's is.
+    The CLI gets no MCP server (an empty --mcp-config); --safe-mode keeps the user's customizations off.
     """
 
     return [
         executable_path, "-p", "--output-format", "stream-json", "--verbose",
         "--model", providers.wire_model(model), "--effort", effort,
         # Never load the user's MCP servers, customizations or browser integration.
-        "--strict-mcp-config", "--mcp-config", str(mcp_config) if mcp_config else EMPTY_MCP_CONFIG,
+        "--strict-mcp-config", "--mcp-config", EMPTY_MCP_CONFIG,
         "--safe-mode", "--disable-slash-commands", "--no-chrome", "--restricted",
         # Anything not pre-approved is denied; nothing ever waits for a prompt.
         "--permission-mode", "dontAsk", "--permission-prompts", "none",
@@ -1115,7 +1100,7 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
     tool, with the settings of SUBAGENT_ENVIRONMENT and SUBAGENT_DENIED;
     ``subagents`` (the critic's number) is how many may run at once.
 
-    A team member's assignment (runner/team.py) runs here too, with ``role``
+    An examination of the author's examiner (runner/team.py) runs here too, with ``role``
     "author" and no ``schema``: the author's tools in the author's working
     folder ``workspace`` (its search mode, its private configuration folder
     for an API model and the deny rules that keep its controller files
@@ -1384,8 +1369,8 @@ def _record_stream(**labels):
 
 
 def _copy_session(config_dir, session):
-    """Copy an author's or coordinator's saved session (what is new or changed, its subagents' and tool results'
-    files included) into the job's record; Claude Code keeps the session itself."""
+    """Copy an author's saved session (what is new or changed, its subagents' and tool results' files included) into
+    the job's record; Claude Code keeps the session itself."""
 
     recorder = records.recorder()
     if recorder is not None and _session_id(session):
@@ -1715,8 +1700,8 @@ def pause_request_cause(path):
 
 
 def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
-                 node_name="author", stages=None, initial_instruction="", handoff_note="", coordinator=False,
-                 alone=None, texts=None, team=None, service=None, examiner=None):
+                 node_name="author", stages=None, initial_instruction="", handoff_note="",
+                 texts=None, examiner=None):
     """Run the persistent author through Claude with the Codex goal-session protocol.
 
     ``examiner`` is the author's examiner (workflow_runner.start_team(lone=True)): it examines the run each time the
@@ -1786,36 +1771,16 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
       whose missing answer ends the attempt as a failed model call;
     - the root's Agent (or Task) tool calls and their results become the
       status records of its subagents (workflow_runner.AuthorSubagents); with
-      the subagent tool the CLI gets SUBAGENT_ENVIRONMENT and SUBAGENT_DENIED;
-    - with ``coordinator`` (the author coordinator, see
-      workflow_runner.author_mode()),
-      where proof files can be read, a final answer that names no proof file
-      (workflow_runner.names_proof_file()) is recorded as a "Coordinator
-      report" status and continued, never handed on. A CLI that offers no
-      subagent tool (--bare) runs ``alone`` instead: the author's own first
-      prompt, lifecycle prompts and critic feedback ({"prompt", "prompts",
-      "recovery"}), without any of this, and the run says so once.
+      the subagent tool the CLI gets SUBAGENT_ENVIRONMENT and SUBAGENT_DENIED.
 
     The harness note is the ``texts`` claude_goal_harness text (an editable
     prompt; GOAL_HARNESS_PROMPT where a workflow has none) with {objective}.
-    A coordinator with ``team`` (workflow_runner._execute: TCS Prover's team in
-    place of the Agent tool) gets TCS Prover's MCP server with its team tools
-    (--mcp-config with that server only, its tools pre-approved), served by
-    ``service`` or by one of this session. It is an "sdk" server
-    (team.Service.claude_config()): the CLI writes each of its MCP messages as
-    a control request, which this session answers (answer_server(), each tool
-    call on a thread of its own), because Claude Code drops every other kind
-    of --mcp-config server under --safe-mode. It loads in --bare mode too, so
-    such a coordinator never works ``alone``. A live instruction
-    written to it ends a running team_wait early (team.Team.attention()), and
-    an end that is not retried stops the team's members.
     """
 
     directory = os.path.abspath(os.fspath(options.get("goal_cwd") or os.getcwd()))
     if runtime.retrieval_policy(directory, features):
         raise _failure(runtime, "ConfigurationError")(HISTORICAL_MESSAGE)
     texts = texts or {}
-    own_service = None
     stages = stages or {"initial": "solve", "resume": "repair", "failure": "failure"}
     continued = options.get("goal_retry") if isinstance(options.get("goal_retry"), dict) else {}
     rewind = continued.get("rewind") if isinstance(continued.get("rewind"), dict) else {}
@@ -1884,33 +1849,19 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     pending, given_up = {}, {}
     # The examiner's reports the author has not received yet, oldest first, and when the next try may go.
     examiner_reports, examiner_wait = [], {"until": 0.0}
-    # A coordinator with TCS Prover's team that works without it is listed under Needs your attention while it works
-    # on (workflow_runner.CoordinatorWatch): its model calls (one assistant message ID per request) and team calls,
-    # each of which worked when TCS Prover's team answered it without an error, and the team's own count of members
-    # working or with a report not yet collected (Team.busy()).
-    # An attempt that continues an earlier one after a model-call failure clears the warnings that one left listed.
-    watch_class = getattr(runtime, "CoordinatorWatch", None)
-    team_watch = (watch_class(lambda kind, **fields: emit(kind, threadId=thread, **fields),
-                              warned=continued.get("warned") or (), worked=continued.get("team_worked") is True,
-                              working=getattr(team, "busy", None))
-                  if coordinator and team is not None and watch_class is not None else None)
-    replies = {"last": None}  # The newest answer's message ID: its content blocks come one after another.
     held, told = {}, set()  # Live instructions that could not be sent, and those already reported.
     # The newest CLI message, and the control request that checks a quiet CLI still answers.
     activity = {"last": time.monotonic(), "probe": None, "at": None}
     seen_compactions = set()
     tools = []
-    tools_expected = None  # With the team: tools and the team's MCP tools, which init also lists.
     denied = []
     pause_reason = ""
     retry = None
     safety_stop = False
     environment = copies = None
-    # The status records of the root's own subagents, and whether a final answer must name a proof file to be
-    # handed on (start_guard()).
+    # The status records of the root's own subagents.
     tracker = getattr(runtime, "AuthorSubagents", None)
     subagents = tracker(lambda kind, **fields: emit(kind, **fields)) if tracker is not None else None
-    guarded = False
     # Why the subagents still running end with this attempt (its CLI stops, and they with it).
     ending = {"reason": "It stopped when the author's Claude Code session ended."}
 
@@ -1986,16 +1937,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
 
     def steer(instruction, identity):
         send_user(instruction, "steer", identity)
-        if team is not None:
-            team.attention("a live instruction")  # A running team_wait returns, so Claude reads it now.
         # The controller recognizes a restored instruction by its command id.
         emit("request", label="Live author instruction sent", text=instruction, threadId=session, steerId=identity)
-
-    def start_guard():
-        """The coordinator's hand-in guard, once the launch knows whether it coordinates."""
-
-        nonlocal guarded
-        guarded = bool(coordinator) and proof_handoff.file_handoff_supported() and hasattr(runtime, "names_proof_file")
 
     def follow_subagents(message):
         """The root's Agent (or Task) calls and their results: the status records of its subagents."""
@@ -2063,65 +2006,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                  text="The author's current conversation has received the examiner's report.", threadId=thread)
         return began
 
-    def answer_server(message):
-        """Answer one control request of the CLI for TCS Prover's MCP server (an "sdk" server, see
-        team.Service.claude_config()); any other control request is left unanswered, as before.
-
-        A tool call runs on a thread of its own (a team_wait may wait up to 30 minutes) and its answer goes to the
-        CLI that asked, under the transport's write lock: a CLI that has ended since (a pause, a stop, a relaunch)
-        no longer waits for it.
-        """
-
-        request = message.get("request") if isinstance(message.get("request"), dict) else {}
-        identity = message.get("request_id")
-        if request.get("subtype") != "mcp_message" or not isinstance(identity, str):
-            return
-        asker = transport
-
-        def send(response):
-            try:
-                asker.send({"type": "control_response", "response": {"request_id": identity, **response}})
-            except (OSError, ValueError):
-                pass  # The CLI has ended: nobody waits for this answer.
-
-        if service is None or team is None or request.get("server_name") != TEAM_SERVER:
-            send({"subtype": "error", "error": f"There is no MCP server {str(request.get('server_name'))[:80]!r}."})
-            return
-
-        def run(key=None):
-            rpc = request.get("message")
-            try:
-                answer = service.answer(rpc)
-            except Exception as exc:  # noqa: BLE001 - the CLI must get an answer, or its call would wait forever.
-                answer = {"jsonrpc": "2.0", "id": rpc.get("id") if isinstance(rpc, dict) else None,
-                          "error": {"code": -32603, "message": f"TCS Prover could not answer: {exc}"}}
-            if answer is None:  # A notification gets the empty answer Claude Code expects.
-                answer = {"jsonrpc": "2.0", "result": {}, "id": 0}
-            try:
-                if key is not None:
-                    # A watched team call ends as TCS Prover answers it, before the CLI (and so its next model call)
-                    # has the answer; it worked when the team answered it without an error (CoordinatorWatch).
-                    result = answer.get("result") if isinstance(answer, dict) and "error" not in answer else None
-                    team_watch.team_call(key, finished=True,
-                                         worked=isinstance(result, dict) and not result.get("isError"))
-            finally:
-                send({"subtype": "success", "response": {"mcp_response": answer}})
-
-        call = request.get("message") if isinstance(request.get("message"), dict) else {}
-        if call.get("method") == "tools/call":
-            name = (call.get("params") or {}).get("name") if isinstance(call.get("params"), dict) else None
-            watched = team_watch is not None and name in team_module.TEAM_TOOLS
-
-            def run_watched():
-                key = f"claude-call-{identity}" if watched else None
-                if watched:
-                    team_watch.team_call(key)
-                run(key)
-
-            threading.Thread(target=run_watched, name="tcs-claude-call", daemon=True).start()
-        else:
-            run()
-
     def watch():
         pause_started = None
         interrupted_turn = None
@@ -2148,8 +2032,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     emit("diagnostic", text="Claude did not acknowledge the pause; keeping its saved session and the last saved work.")
                     runtime.stop_process(transport.process)
                     return
-                if team_watch is not None:
-                    team_watch.tick(active=False)
                 continue
             if runtime.workflow_remaining(options) <= 0:
                 expired.set()
@@ -2167,12 +2049,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 if not stop.wait(grace):
                     runtime.stop_process(transport.process)
                 return
-            if team_watch is not None and team_watch.team:
-                try:
-                    team_watch.tick(active=state["active"] and not pausing.is_set())
-                except Exception as exc:  # noqa: BLE001 - a warning must never stop the watcher.
-                    team_watch.team = False
-                    emit("diagnostic", text=f"The coordinator's team warnings stopped: {exc}", threadId=thread)
             if examiner is not None and not pausing.is_set():
                 examiner_reports.extend(examiner.take_reports())
                 if (examiner_reports and time.monotonic() >= examiner_wait["until"]
@@ -2228,9 +2104,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                  else ["--session-id", identity])
         transport = SessionProcess(batch_safe([base_command[0], *flags, *base_command[1:]], runtime),
                                    directory, environment, scrub,
-                                   stream=lambda: _record_stream(role="coordinator" if coordinator else "author",
-                                                                 node=node_name, model=model, stage=stage,
-                                                                 label="Coordinator" if coordinator else "Author"),
+                                   stream=lambda: _record_stream(role="author", node=node_name, model=model,
+                                                                 stage=stage, label="Author"),
                                    record_scrub=scrub_event)
 
     def start_turn(instruction):
@@ -2403,20 +2278,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                  text=f"{reason}, so Anthropic-format API models run Claude Code in --bare mode, which does not "
                       f"offer {', '.join(dropped)}.")
         subagent_tool = bool(set(tools) & set(SUBAGENT_TOOLS))
-        if coordinator and alone is not None and team is None and not subagent_tool:
-            # No subagent tool (--bare): the author works alone, with its own prompts. A coordinator with TCS
-            # Prover's team keeps it in --bare mode too, which loads its "sdk" server (Claude Code 2.1.289).
-            coordinator = False
-            prompt, prompts = alone["prompt"], alone["prompts"]
-            initial_instruction = alone["recovery"] if initial_instruction else ""
-            values["original_prompt"] = prompt
-            if not continued.get("values"):
-                values["instruction"] = initial_instruction
-            if not alone.get("noted") and hasattr(runtime, "note_no_subagent_tool"):
-                alone["noted"] = True  # Said once per runner: retries reuse this launch.
-                runtime.note_no_subagent_tool(stages["initial"], model, settings.get("subagents"), coordinator=True,
-                                              bare=True)
-        start_guard()
         denied = disallowed_tools()
         protected, protected_paths = protected_settings(directory)
         if subagent_tool:
@@ -2439,18 +2300,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                                                                        {"objective": render("goal")})
                                 if "claude_goal_harness" in texts
                                 else GOAL_HARNESS_PROMPT.replace("[OBJECTIVE]", render("goal")))
-        mcp_config = None
-        if team is not None:
-            if service is None:
-                service = own_service = _team_service()
-            service.add(team)
-            mcp_config = private.write("mcp-servers.json", json.dumps(service.claude_config()))
-            team_tools = [f"{TEAM_TOOL_PREFIX}{name}" for name in service.names()]
-            allowed = [*allowed, *team_tools]
-            tools_expected = [*tools, *team_tools]
         base_command = command_arguments(
             located(runtime, model, "solve"), model, settings["effort"], tools, allowed, private.path, bare=bare,
-            denied=denied, mcp_config=mcp_config,
+            denied=denied,
             extra=["--input-format", "stream-json", "--replay-user-messages",
                    *(SUMMARY_DISPLAY if ask_summaries else []),
                    "--json-schema", json.dumps(GOAL_TURN_SCHEMA),
@@ -2462,6 +2314,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         if continued.get("instruction"):
             # A retry: the interrupted turn's instruction, or the retry note.
             instruction = continued["instruction"]
+        elif saved and _session_id(saved) and options.get("goal_new_goal") and "new_goal" in prompts:
+            # The user set a new goal for the finished job: the new_goal prompt carries the new task in full.
+            instruction = render("new_goal")
         elif saved and _session_id(saved) and "reopen" in prompts and not options.get("goal_reanchor"):
             # A session that is resumed holds the task already: the short reopen prompt, and
             # critic feedback only if it never received it. After a conversation turn that
@@ -2528,18 +2383,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                         note = structured.get("progress_note") if isinstance(structured, dict) else None
                         record({"method": "thread/goal/updated", "params": {"goal": {
                             "status": {"in_progress": "active"}.get(goal_status, goal_status or "active")}}})
-                        if (goal_status == "complete" and isinstance(final, str) and final.strip() and guarded
-                                and not runtime.names_proof_file(final)):
-                            # The coordinator's answer names no proof file: a report on its work, never a
-                            # submission. The whole answer stays in the activity log.
-                            record(translator.item("completed", {"type": translator.kind("agent"),
-                                                                 "id": f"{thread}:report:{uuid.uuid4().hex[:8]}",
-                                                                 "text": translator.text(final)}))
-                            emit("status", label=getattr(runtime, "COORDINATOR_REPORT_LABEL", "Coordinator report"),
-                                 threadId=thread, text=runtime._clipped(
-                                     final, getattr(runtime, "COORDINATOR_REPORT_CHARS", 1600)))
-                            start_turn(carry(render("report" if "report" in prompts else "continuation")))
-                        elif goal_status == "complete" and isinstance(final, str) and final.strip():
+                        if goal_status == "complete" and isinstance(final, str) and final.strip():
                             # No live instruction is sent while the answer is reviewed.
                             state["active"] = False
                             answer = final
@@ -2622,19 +2466,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             if kind == "system":
                 subtype = message.get("subtype")
                 if subtype == "init" and message.get("parent_tool_use_id") is None:
-                    surprise = unexpected_tools(message, tools_expected or tools)
+                    surprise = unexpected_tools(message, tools)
                     if surprise:
                         raise surprise_failure(surprise, denied, runtime, "the author was stopped")
-                    if tools_expected is not None and isinstance(message.get("tools"), list):
-                        # A coordinator without its team's tools could only work alone, unseen: end the attempt.
-                        missing = [name for name in tools_expected
-                                   if name.startswith(TEAM_TOOL_PREFIX) and name not in message["tools"]]
-                        if missing:
-                            servers = message.get("mcp_servers") if isinstance(message.get("mcp_servers"), list) else []
-                            status = next((str(server.get("status")) for server in servers if isinstance(server, dict)
-                                           and server.get("name") == TEAM_SERVER), "not loaded")
-                            raise runtime.Error(f"Claude Code did not offer the coordinator its team's tools "
-                                                f"({', '.join(missing)}); TCS Prover's MCP server: {status}.")
                     with lock:
                         if not state["initialized"]:
                             reported = str(message.get("session_id") or "").lower()
@@ -2652,10 +2486,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                             _REFUSALS.pop(session, None)
                             if thread != session:
                                 thread = session
-                                # A coordinator says so (workflow_runner.note_no_subagent_tool()).
                                 emit("status", label="Goal resumed" if state["resuming"] else "Goal started",
-                                     threadId=thread, text=f"Thread {thread}",
-                                     **({"authorModeEffective": "coordinator"} if coordinator else {}))
+                                     threadId=thread, text=f"Thread {thread}")
                             announce()
                         if not state["running"]:
                             # Queued input started a turn by itself (CLIs without lifecycle messages).
@@ -2689,23 +2521,14 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     state["output"] = True  # The model worked in this turn.
                     if _session_id(message.get("uuid")):
                         state["anchor"] = str(message["uuid"]).lower()
-                    reply = (message.get("message") or {}).get("id") if isinstance(message.get("message"), dict) else None
-                    if team_watch is not None and isinstance(reply, str) and reply and reply != replies["last"]:
-                        replies["last"] = reply  # Each content block of one answer comes in a message of its own.
-                        team_watch.model_call()
                 continue
             if kind == "control_response":
                 response = message.get("response") if isinstance(message.get("response"), dict) else {}
                 if response.get("subtype") == "error" and response.get("request_id") != activity["probe"]:
                     emit("diagnostic", text=scrub(f"Claude rejected a control request: {response.get('error')}"))
                 continue
-            if kind == "control_request":
-                answer_server(message)
-                continue
             if kind != "result":
                 continue
-            if team_watch is not None:
-                team_watch.turn_ended()
             with lock:
                 if state["unexpected"] and not state["delivered"] and not pausing.is_set():
                     # The turn of input given up on ended; the instruction sent after it runs next.
@@ -2792,9 +2615,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 retry = {"thread": thread, "stage": stage, "values": dict(values),
                          "instruction": state["instruction"] or None, "delivered": state["delivered"],
                          "output": state["output"], "anchor": state["anchor"], "rewind": rewind,
-                         "rewind_failed": rewind_failed, "steer": state["steer"], "pending_compaction": undelivered,
-                         "warned": team_watch.shown() if team_watch is not None else [],
-                         "team_worked": team_watch.team_worked if team_watch is not None else False}
+                         "rewind_failed": rewind_failed, "steer": state["steer"], "pending_compaction": undelivered}
                 if thread and getattr(runtime, "_context_window_failure", lambda error: False)(exc):
                     # The same conversation would fail again: continue in a new one.
                     repair = pending_repair()
@@ -2808,19 +2629,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         if transport is not None:
             # Input already written may have started a turn the CLI is running.
             transport.close(runtime, grace, interrupt=state["running"] or bool(pending))
-        if service is not None and team is not None:
-            service.remove(team)
-        if own_service is not None:
-            own_service.close()
-        if team is not None and retry is None:
-            # Pause, stop, the time limit or the end of the work: the members stop with the coordinator. A failed
-            # model call keeps them working for the next attempt, which reads their reports.
-            team.close(ending["reason"])
-        elif team is not None:
-            # A team_wait that this attempt's CLI was running ends without taking those reports (or an attention):
-            # its caller is gone, and they are the next attempt's. The CLI has stopped and the team left the
-            # service above, so no late call of this attempt starts another.
-            team.release_waits()
         if examiner is not None and retry is None:
             examiner.close(ending["reason"])
         if subagents is not None and hasattr(subagents, "stopped"):

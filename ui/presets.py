@@ -65,8 +65,8 @@ STAGES = {"review": "review", "author": "author", "critic": "critic", "writer": 
 # How warnings name a role ("Critic model not available: …"), as the form's stages do.
 ROLE_WORDS = {"review": "Reviewer", "author": "Author", "critic": "Critic", "writer": "Writer"}
 # What a preset keeps: the form's settings in its order (proofJobSettings() without promptOverrides and goalLoop).
-# Never the goal loop or the per-subagent models of the earlier team design, which are no settings of the form:
-# those that settings saved before hold are dropped as they load.
+# Never the goal loop, which is no setting of the form, nor anything else: what settings saved before hold besides
+# these (the goal loop, the per-subagent models of coordinator mode) is dropped as they load.
 SETTINGS = ("workflowStages", "reviewModel", "reviewEffort", "authorModel", "authorEffort", "authorSubagents",
             "criticModel", "criticEffort", "criticCount", "criticRounds", "writerModel", "writerEffort",
             "thinkingHours", "speedMode", "reasoningSummary", "retrievalMode", "retrievalCutoffUtc",

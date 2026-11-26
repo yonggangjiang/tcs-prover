@@ -23,8 +23,8 @@ no proof).
   once, and **Pause** (while the author works) pauses the job instead of
   retrying. The first retries of a call stay pinned in the activity log; the
   rest stay in the recent window and in `transcript.jsonl`.
-- **Slow calls.** A structured call (reviewer, critic, LaTeX editor) and an author
-  team member's assignment are never stopped while they work: an attempt is
+- **Slow calls.** A structured call (reviewer, critic, LaTeX editor) and an
+  examination of the author's examiner are never stopped while they work: an attempt is
   stopped and retried only after its program has written nothing for an hour, or
   two hours while a critic waits for its subagents (Codex is silent then and
   allows such a wait an hour), or when its program stays alive but returns no
@@ -105,11 +105,10 @@ limit or an API key the endpoint refuses, of any of the job's calls (a paused
 author's reply's too: then the reply retries, and comes by itself once it is
 fixed), or a program that is not installed (or does not start), after the same
 failure three times in a row (also while a paused author's reply waits for it).
-Of a team member's calls only a usage limit is listed so, while the member's
-assignment retries: its expired login, a key its API connection refuses and a
-program it lacks end that assignment at once instead, with a report to the
-coordinator, which goes on with its team (see [the author's
-team](workflow.md#the-authors-team)); no retry waits for them, and the job is
+Of the examiner's calls only a usage limit is listed so, while its examination
+retries: its expired login, a key its API connection refuses and a program it
+lacks end that examination at once instead (see [the
+examiner](workflow.md#the-examiner)); no retry waits for them, and the job is
 not listed for them. The Overview then lists the job under
 **Needs your attention** with what to do, for example *Codex login needed: Sign
 in again on the Setup page, or run codex login in a terminal*, *Claude login
@@ -122,17 +121,6 @@ that is fixed: a program Setup installs is found by the waiting job at its next
 retry. **Models & API → Running jobs** can
 also show a browser notification when a job first needs you.
 
-A coordinator that cannot use its team, or does not wait for it, is listed there
-too, while its run goes on: one that made 10 model calls, or worked 20 minutes,
-without a team call, one whose team tool call Codex refused, and one that named
-its proof file in 3 replies without handing it in (see [the author's
-team](workflow.md#the-authors-team)). Once a team call of that coordinator has
-worked, its team tools reach the model, and the first of these says what it
-does: while a member works, it reads **Coordinator keeps checking on its team
-instead of waiting** (it checks on its members instead of waiting with
-`team_wait`); while no member works, it says that the coordinator is doing the
-work itself instead of giving it to a member.
-
 A job whose model calls keep failing the same way is listed there too, while
 its retries go on every minute without limit: at once when the provider says
 that the account is out of credit (**Out of credit**, for example Claude Code's
@@ -141,7 +129,7 @@ was reached, and otherwise once the same failure has repeated for 15 minutes
 (**Model calls keep failing**: which call, for how long, and the failure). The
 15 minutes count from the first failure of that kind; another failure starts
 them again (the numbers and request IDs in a provider's message do not make it
-another). This covers every role, a team member and a paused author's reply.
+another). This covers every role, the examiner and a paused author's reply.
 The line goes as soon as a model call of it works again (the model's first
 output), and when its step or the job's runner ends. A call whose answer is
 checked (a critic's, the statement reviewer's, the LaTeX editor's) works again only once an answer is accepted when its model had

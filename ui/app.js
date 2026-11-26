@@ -201,10 +201,13 @@ const ui = {
   authorConversation: $("authorConversation"), authorConversationHeading: $("authorConversationHeading"),
   authorConversationNote: $("authorConversationNote"), authorConversationList: $("authorConversationList"),
   conversationSummaryLink: $("conversationSummaryLink"),
-  progressLog: $("progressLog"), progressLogHeading: $("progressLogHeading"), progressLogMeta: $("progressLogMeta"),
-  progressLogText: $("progressLogText"), progressLogNote: $("progressLogNote"), progressLogEmpty: $("progressLogEmpty"),
-  progressLogAlone: $("progressLogAlone"), progressLogVersions: $("progressLogVersions"),
-  progressLogVersionsSummary: $("progressLogVersionsSummary"), progressLogVersionsText: $("progressLogVersionsText"),
+  authorMemory: $("authorMemory"), authorMemoryCount: $("authorMemoryCount"), authorMemoryFilter: $("authorMemoryFilter"),
+  authorMemorySort: $("authorMemorySort"), authorMemoryList: $("authorMemoryList"), authorMemoryNote: $("authorMemoryNote"),
+  authorMemoryFile: $("authorMemoryFile"), authorMemoryFileName: $("authorMemoryFileName"),
+  authorMemoryDownload: $("authorMemoryDownloadButton"), authorMemoryClose: $("authorMemoryCloseButton"),
+  authorMemoryFileMeta: $("authorMemoryFileMeta"), authorMemoryFileText: $("authorMemoryFileText"),
+  authorMemoryFileDoc: $("authorMemoryFileDoc"), authorMemorySource: $("authorMemorySourceButton"),
+  authorMemoryFileNote: $("authorMemoryFileNote"), authorMemoryOlder: $("authorMemoryOlder"),
   relatedWorksPanel: $("relatedWorksPanel"), relatedWorksHeading: $("relatedWorksHeading"),
   relatedWorksNote: $("relatedWorksNote"), relatedWorksList: $("relatedWorksList"),
   relatedWorksEmpty: $("relatedWorksEmpty"), relatedWorksActions: $("relatedWorksActions"),
@@ -218,12 +221,6 @@ const ui = {
   composerNoteTitle: $("composerNoteTitle"), composerNoteText: $("composerNoteText"),
   composerSaveNote: $("composerSaveNoteButton"), composerCancelNote: $("composerCancelNoteButton"),
   relatedWorksHelp: $("relatedWorksHelp"), composerRelatedFiles: $("composerRelatedFiles"),
-  batchRelatedWorks: $("batchRelatedWorks"), batchRelatedWorksHeading: $("batchRelatedWorksHeading"),
-  batchRelatedWorksHelp: $("batchRelatedWorksHelp"), batchRelatedGroups: $("batchRelatedGroups"),
-  batchNoteForm: $("batchNoteForm"), batchNoteTarget: $("batchNoteTarget"), batchNoteTitle: $("batchNoteTitle"),
-  batchNoteText: $("batchNoteText"), batchSaveNote: $("batchSaveNoteButton"),
-  batchCancelNote: $("batchCancelNoteButton"), batchRelatedStatus: $("batchRelatedStatus"),
-  batchRelatedFiles: $("batchRelatedFiles"),
   batchShared: $("batchShared"), batchSharedCount: $("batchSharedCount"), batchSharedList: $("batchSharedList"),
   batchSharedEmpty: $("batchSharedEmpty"), batchSharedAddFiles: $("batchSharedAddFilesButton"),
   batchSharedAddNote: $("batchSharedAddNoteButton"), batchSharedNoteForm: $("batchSharedNoteForm"),
@@ -242,6 +239,18 @@ const ui = {
   runMetadata: $("runMetadata"), resultPanel: $("resultPanel"), resultHeading: $("resultHeading"),
   criticReviewHistory: $("criticReviewHistory"),
   resultDescription: $("resultDescription"), resultOutput: $("resultOutput"),
+  resultDoc: $("resultDoc"), resultSource: $("resultSourceButton"),
+  currentProofPanel: $("currentProofPanel"), currentProofDescription: $("currentProofDescription"),
+  currentProofSource: $("currentProofSourceButton"), currentProofDoc: $("currentProofDoc"),
+  currentProofText: $("currentProofText"), currentProofNote: $("currentProofNote"),
+  newGoalControl: $("newGoalControl"), newGoalOpen: $("newGoalOpenButton"), newGoalReason: $("newGoalReason"),
+  newGoalForm: $("newGoalForm"), newGoalText: $("newGoalText"), newGoalHours: $("newGoalHours"),
+  newGoalLimitHelp: $("newGoalLimitHelp"), newGoalStart: $("newGoalStartButton"), newGoalCancel: $("newGoalCancelButton"),
+  earlierGoalsPanel: $("earlierGoalsPanel"), earlierGoalsHeading: $("earlierGoalsHeading"),
+  earlierGoalsList: $("earlierGoalsList"), earlierGoalView: $("earlierGoalView"),
+  earlierGoalViewTitle: $("earlierGoalViewTitle"), earlierGoalSource: $("earlierGoalSourceButton"),
+  earlierGoalClose: $("earlierGoalCloseButton"), earlierGoalDoc: $("earlierGoalDoc"), earlierGoalText: $("earlierGoalText"),
+  earlierGoalNote: $("earlierGoalNote"),
   retrievalPanel: $("retrievalPanel"), retrievalHeading: $("retrievalHeading"),
   retrievalStatus: $("retrievalStatus"), retrievalDescription: $("retrievalDescription"),
   retrievalCutoffDisplay: $("retrievalCutoffDisplay"), retrievalCutoffValue: $("retrievalCutoffValue"),
@@ -695,7 +704,7 @@ async function rerunWithStatement(statement) {
   const keys = ["runId", "reviewModel", "authorModel", "criticModel", "writerModel", "reviewEffort", "authorEffort",
     "criticEffort", "writerEffort", "reasoningEffort", "speedMode", "reasoningSummary", "retrievalMode",
     "retrievalCutoffUtc", "retrievalPolicyPath", "retrieval", "criticRounds", "criticCount", "authorSubagents",
-    "authorSubagentModels", "examiner", "thinkingHours", "skipStatementReview",
+    "examiner", "thinkingHours", "skipStatementReview",
     "statementReviewOnly", "promptSet", "promptEdits",
     ...Object.keys(promptLabels).map((name) => `${name}Prompt`)];
   const settings = Object.fromEntries(keys.filter((key) => state[key] !== undefined).map((key) => [key, state[key]]));
@@ -958,24 +967,13 @@ function retrievalSummary(source) {
     : "Cutoff on · -1 · web-search tools disabled";
 }
 
+// A job that ran in coordinator mode (state.coordinatorJob), which earlier versions of TCS Prover had: its page and
+// its row say so, and offer nothing that would run it again (the server refuses that with the same words).
+const COORDINATOR_JOB_NOTE = "This job ran in coordinator mode, which TCS Prover no longer has; its record and "
+  + "results stay readable.";
+
 // When the server tries a job again by itself: an automatic resume after an error pause, the
 // next start of a queued job whose start failed, or the next attempt of a failed model call.
-// One subagent's model as the team's line names it: the menu's name, and "(API)" for an API connection's model
-// ("Lab model (API)").
-function teamModelLabel(model, label = "") {
-  const row = (state.workflow?.settings?.model_catalog || []).find((item) => item.id === model);
-  const name = label || row?.label || (String(model).startsWith("api:") ? String(model).slice(4) : String(model));
-  const api = row ? row.provider === "api" : String(model).startsWith("api:");
-  return `${String(name).replace(/ — default$/, "")}${api && !/\(API\)$/.test(name) ? " (API)" : ""}`;
-}
-
-// The author's team in words: "coordinator, 3 author subagents: GPT 6.1 Sol · Claude Opus 5.5 · Lab model (API)",
-// or "coordinator, 3 author subagents: same model as the coordinator" (``labels`` null).
-function teamText(count, labels) {
-  return `coordinator, ${count} author subagent${count === 1 ? "" : "s"}: `
-    + (labels ? labels.join(" · ") : "same model as the coordinator");
-}
-
 function retryText(job) {
   const at = (seconds) => timeText(seconds * 1000, { seconds: true });
   if (job.phase === "paused" && job.autoResumeAt > 0) return `Automatic retry at ${at(job.autoResumeAt)}`;
@@ -1106,6 +1104,12 @@ function renderJobs(jobs) {
       hold.textContent = job.launchHold;
       copy.append(hold);
     }
+    if (job.coordinatorJob) {
+      const coordinator = document.createElement("small");
+      coordinator.className = "job-tags";
+      coordinator.textContent = COORDINATOR_JOB_NOTE;
+      copy.append(coordinator);
+    }
     // Another process owns this run; this server shows it and takes it over once it is free.
     if (job.runningElsewhere) {
       const elsewhere = document.createElement("small");
@@ -1231,7 +1235,6 @@ async function loadJobs() {
       const result = await request(jobPath("/jobs"));
       if (currentJob || composingProblem || batch !== currentBatch) return;
       renderJobs(result.jobs || []);
-      if (typeof renderBatchRelatedWorks === "function") renderBatchRelatedWorks(result.jobs || []);
     }
     // A poll succeeded again: drop its earlier error, but keep errors from actions.
     if (pollNotice && ui.notice.textContent === pollNotice) show(ui.notice, false);
@@ -1514,41 +1517,36 @@ function updateModelSummary() {
 // next job: an edit is a promptOverrides entry by its name, checked on Apply as the server checks it (POST
 // /prompt-catalog/check; the rules below first, which are all an older server without that check has). An open job
 // shows the texts it runs with (state.promptSet, saved when it started), read-only; a job from before that shows the
-// role prompts it saved. A server without the catalog (an older one) offers the six role prompts, as before.
+// role prompts it saved. A server without the catalog (an older one) offers the five role prompts, as before.
 
-// The six per-job role prompts as an older server lists them (state.workflow.settings.prompts): their names and
+// The five per-job role prompts as an older server lists them (state.workflow.settings.prompts): their names and
 // what they are for, for the dialog without a catalog.
 const promptLabels = {
-  review: "Reviewer prompt", author: "Author prompt", coordinator: "Coordinator prompt",
+  review: "Reviewer prompt", author: "Author prompt",
   critic: "Critic prompt", convention: "Convention critic prompt", final: "Final writer prompt",
 };
 
 const promptHelp = {
   review: "The full request also includes the statement and any revision feedback.",
   author: "Keep exactly one [STATEMENT]. The workflow replaces it with your statement.",
-  coordinator: "This prompt replaces the Author prompt for coordinator jobs (Author subagents 1 or more): the "
-    + "author coordinator follows it to run the author subagents instead of proving the statement itself. Keep "
-    + "exactly one [STATEMENT], which the workflow replaces with your statement. {author_subagents} is the number of "
-    + "author subagents; write any other brace twice: {{ and }}. A model without a subagent tool works alone with the "
-    + "Author prompt instead.",
   critic: "The critic follows these instructions: it starts the independent critics as its subagents, weighs their reports and decides. {count} is the number of independent critics; write any other brace twice: {{ and }}. The workflow adds the statement, and the proof is in proof.md.",
   convention: "The convention critic checks the proof once the critic has accepted it, before writing; its report goes to you and never changes the run. Keep {statement} where the statement goes, and write any other brace twice: {{ and }}.",
   final: "The request adds the supplied writing for this editor to polish into LaTeX.",
 };
 
-// The dialog's catalog (the server's, or the six role prompts of an older server: full false), whether it shows a
+// The dialog's catalog (the server's, or the five role prompts of an older server: full false), whether it shows a
 // job's texts (readOnly), the groups shown open, the search and the narrow screen's view.
 function promptStore() {
   return (promptStore.value ||= { catalog: [], groups: [], full: false, readOnly: false, open: new Set(), query: "",
     checking: false, note: "" });
 }
 
-// The six role prompts as catalog entries (an older server's defaults, or the role prompts a job saved).
+// The five role prompts as catalog entries (an older server's defaults, or the role prompts a job saved).
 function legacyPromptCatalog(texts = state.workflow?.settings?.prompts || {}) {
-  const groups = { review: "Statement review", author: "Author", coordinator: "Coordinator", critic: "Critic",
-    convention: "Critic", final: "Writer" };
-  const placeholders = { review: [], author: ["[STATEMENT]"], coordinator: ["[STATEMENT]", "{author_subagents}"],
-    critic: ["{count}"], convention: ["{statement}", "{instructions}"], final: [] };
+  const groups = { review: "Statement review", author: "Author", critic: "Critic", convention: "Critic",
+    final: "Writer" };
+  const placeholders = { review: [], author: ["[STATEMENT]"], critic: ["{count}"],
+    convention: ["{statement}", "{instructions}"], final: [] };
   return Object.keys(promptLabels).filter((name) => typeof texts[name] === "string").map((name) => ({
     name, group: groups[name], label: promptLabels[name], when: promptHelp[name], placeholders: placeholders[name],
     text: texts[name], emptyAllowed: false }));
@@ -1569,7 +1567,7 @@ function adoptPromptCatalog(answer) {
 }
 
 // Read the catalog again (the workflow files may have changed since): true with the server's, false when the server
-// has none (an older one: the six role prompts then, from /state), null when the page moved on meanwhile.
+// has none (an older one: the five role prompts then, from /state), null when the page moved on meanwhile.
 async function loadPromptCatalog() {
   const job = currentJob, batch = currentBatch, store = promptStore();
   let answer = null;
@@ -1604,7 +1602,7 @@ function promptEntry(name) {
   return promptStore().catalog.find((entry) => entry.name === name) || null;
 }
 
-// The names a form or a job has texts for: the catalog's, else the six role prompts.
+// The names a form or a job has texts for: the catalog's, else the five role prompts.
 function promptNames() {
   const catalog = promptStore().catalog;
   return catalog.length ? catalog.map((entry) => entry.name) : Object.keys(promptLabels);
@@ -1691,7 +1689,7 @@ function promptTextProblem(entry, text) {
       : "This text cannot be empty: write it, or reset it to the default.";
   }
   if (entry.placeholders.includes("[STATEMENT]") && (String(text).match(/\[STATEMENT\]/g) || []).length !== 1) {
-    const name = { author: "The author prompt", coordinator: "The coordinator prompt" }[entry.name] || "This text";
+    const name = entry.name === "author" ? "The author prompt" : "This text";
     return `${name} must contain exactly one [STATEMENT].`;
   }
   const allowed = entry.placeholders.filter((field) => /^\{[^{}]+\}$/.test(field)).map((field) => field.slice(1, -1));
@@ -1708,10 +1706,6 @@ function promptTextProblem(entry, text) {
   if (valid) return "";
   if (entry.name === "convention") {
     return "Keep {statement} where the statement goes, and write any other brace twice: {{ and }}.";
-  }
-  if (entry.name === "coordinator") {
-    return "Write {author_subagents} where the number of author subagents goes, and write any other brace twice: "
-      + "{{ and }}.";
   }
   const listed = allowed.map((field) => `{${field}}`);
   const names = listed.length > 1 ? `${listed.slice(0, -1).join(", ")} and ${listed.at(-1)}` : listed[0];
@@ -2014,7 +2008,7 @@ function renderPromptSetting() {
   if (!ui.promptSettingText) return;
   ui.promptSettingText.textContent = count
     ? `${count} text${count === 1 ? "" : "s"} edited for the next job; the others are the workflow files' defaults`
-    : "Every text the workflow sends its models, including the goal loop and the team's; edits apply to the next job";
+    : "Every text the workflow sends its models, including the goal loop's; edits apply to the next job";
 }
 
 // The list's keys: Up and Down move between the visible groups and texts, Home and End to the first and the last,
@@ -2093,12 +2087,9 @@ function importantEntry(entry) {
       && entry.root !== false && !entry.activityLabel) return true;
   // As on the server: the critic's independent critics requested, started or finished (the progress line reads them).
   if (entry.kind === "status" && entry.root !== false && entry.subagentProgress === true) return true;
-  // As on the server: the author coordinator's subagents started, finished or failed (a few lines per subagent,
-  // which its subagents' own events would otherwise push out of the window), its time checks and its replies that
-  // named no proof file.
+  // As on the server: the author's subagents started, finished or failed (a few lines per subagent, which its
+  // subagents' own events would otherwise push out of the window).
   if (entry.kind === "status" && entry.root !== false && entry.authorSubagent === true) return true;
-  if (entry.kind === "status" && entry.root !== false && entry.stage !== "conversation"
-      && ["Coordinator time check", "Coordinator report"].includes(entry.label)) return true;
   if (entry.kind !== "codex_event" || entry.root === false) return false;
   const event = entry.event || {};
   const item = event.params?.item || event.item || {};
@@ -2108,8 +2099,8 @@ function importantEntry(entry) {
 
 // Bound routine events while retaining every important event in order. As on the server (TRACE_LIMIT and
 // SUBAGENT_TRACE_LIMIT): the newest 1,500 records of the job itself and, apart, the newest 300 events of its
-// subagents' own conversations (codex events with root false), so a busy team of subagents never pushes the
-// author coordinator's own records out.
+// subagents' own conversations (codex events with root false), so busy subagents never push the author's or the
+// critic's own records out.
 function retainTrace(entries) {
   const kept = [], counts = { own: 0, subagents: 0 };
   for (let index = entries.length - 1; index >= 0; index -= 1) {
@@ -2130,8 +2121,9 @@ function describe(entry) {
   const activityLabel = entry.activityLabel || "";
   const rawItemId = params.itemId || item.id || "";
   const root = entry.root !== false;
-  // A member of the author's team names itself by its number: "Subagent 2 reasoning". Each of its assignments is a
-  // run of its own whose item ids start again, so they are kept apart by member and assignment.
+  // A seat with a number (the author's examiner, or a team member of a job from an earlier version) names itself by
+  // it: "Subagent 1 reasoning". Each of its assignments is a run of its own whose item ids start again, so they are
+  // kept apart by seat and assignment.
   const member = !root && Number.isInteger(entry.subagentMember) && entry.subagentMember >= 1
     ? entry.subagentMember : null;
   const scope = [activityLabel, member ? `member ${member}:${entry.subagentId ?? entry.conversationId ?? ""}` : ""]
@@ -2202,19 +2194,18 @@ function describe(entry) {
       time: entry.time, replace: true, pinned: true,
     };
   }
-  // The author coordinator's own records: its subagents, its time checks, a reply that named no proof file.
-  const coordinatorCard = entry.kind === "status" ? authorCoordinatorCard(entry) : null;
-  if (coordinatorCard) return coordinatorCard;
+  // The author's subagents (its examiner among them).
+  const subagentCard = entry.kind === "status" ? authorSubagentCard(entry) : null;
+  if (subagentCard) return subagentCard;
   // The author's update_goal call in TCS Prover's goal loop (a "Goal status" record): the status it reported, its
   // note, and what TCS Prover does next. Each call keeps its own row.
   if (entry.kind === "status" && entry.label === "Goal status" && typeof entry.goalStatus === "string") {
     const status = entry.goalStatus.trim() || "updated";
     const note = String(entry.note ?? "").trim();
-    // As goal_session decides when the turn ends: its final reply goes on as the answer, except a coordinator's
-    // reply that names no proof file (kept as a report) and a turn that ends without one.
+    // As goal_session decides when the turn ends: its final reply goes on as the answer, except a turn that ends
+    // without one.
     const next = status === "complete" ? "When this turn ends, TCS Prover hands its final reply on as the author's "
-        + "answer. A turn without a final reply, and a coordinator's reply that names no proof file (kept as a "
-        + "report), get the continuation instead."
+        + "answer. A turn without a final reply gets the continuation instead."
       : ["blocked", "paused"].includes(status)
         ? `TCS Prover does not stop for a ${status} goal: it records it and sends the continuation.` : "";
     return {
@@ -2342,17 +2333,11 @@ function describe(entry) {
   return null;
 }
 
-// The author coordinator's status records as tidy rows of the activity log (see describe), or null for any other
-// record. "Author coordinator" keeps them apart from the critic coordinator's rows. Each keeps a row of its own,
-// pinned as on the server:
-// - its subagents (authorSubagent: true): "Author subagent started", "… finished" or "… failed", then the reason
-//   of a failure (the record's text), the assignment's first line as recorded (the subagent's id when there is
-//   none) and how many run now, when the record says;
-// - the hourly time check (label "Coordinator time check"), with the job's working time when it was sent;
-// - a final reply that names no proof file (label "Coordinator report"): TCS Prover does not hand it to the critic
-//   but asks the coordinator to continue, which the row says; the reply itself is the Author row above it (the
-//   record's text, a shortened copy, is kept for the transcript).
-function authorCoordinatorCard(entry) {
+// The status records of the author's subagents (authorSubagent: true) as tidy rows of the activity log (see
+// describe), or null for any other record. Each keeps a row of its own, pinned as on the server: "Author subagent
+// started", "… finished" or "… failed", then the reason of a failure (the record's text), the assignment's first
+// line as recorded (the subagent's id when there is none) and how many run now, when the record says.
+function authorSubagentCard(entry) {
   if (entry.root === false) return null;
   const text = String(entry.text || "").trim();
   if (entry.authorSubagent === true) {
@@ -2363,7 +2348,8 @@ function authorCoordinatorCard(entry) {
     const task = String(entry.subagentTask ?? "").trim();
     const running = Number.isInteger(entry.subagentsRunning) && entry.subagentsRunning >= 0
       ? `${entry.subagentsRunning || "none"} running` : "";
-    // A member of TCS Prover's team: its number and model ("Author subagent 2 (Claude Opus 5.5) started").
+    // A seat with a number (the author's examiner, or a team member of a job from an earlier version): its number
+    // and model ("Author subagent 1 (Claude Opus 5.5) started").
     const member = Number.isInteger(entry.subagentMember) && entry.subagentMember >= 1 ? entry.subagentMember : null;
     const model = String(entry.subagentModel ?? "").trim();
     const who = [member ? `Author subagent ${member}` : "Author subagent", model ? `(${model})` : ""]
@@ -2375,26 +2361,6 @@ function authorCoordinatorCard(entry) {
     return {
       key: `author-subagent:${member ?? ""}:${id}:${status}:${entry.time}`, type: "status", label: `${who} ${status}`,
       text: line || text || "No details were recorded.", time: entry.time, replace: true, pinned: true,
-    };
-  }
-  if (entry.label === "Coordinator time check") {
-    // The working time as the time check states it: "45 min", "5 h", "5 h 12 min".
-    const minutes = Number.isFinite(entry.elapsedSeconds) ? Math.floor(entry.elapsedSeconds / 60) : NaN;
-    const elapsed = !(minutes >= 0) ? "" : minutes < 60 ? `${minutes} min`
-      : `${Math.floor(minutes / 60)} h${minutes % 60 ? ` ${minutes % 60} min` : ""}`;
-    return {
-      key: `coordinator-check:${entry.time}`, type: "status",
-      label: `Author coordinator time check${elapsed ? ` · ${elapsed}` : ""}`,
-      text: text || "TCS Prover sent the author coordinator its working time so far.",
-      time: entry.time, replace: true, pinned: true,
-    };
-  }
-  if (entry.label === "Coordinator report") {
-    return {
-      key: `coordinator-report:${entry.time}`, type: "status", label: "Author coordinator report",
-      text: "Not handed to the critic: this reply names no proof file, so TCS Prover asked the coordinator to "
-        + "continue. The reply is the Author row above.",
-      time: entry.time, replace: true, pinned: true,
     };
   }
   return null;
@@ -2969,27 +2935,6 @@ function jobSettingsWarning() {
   return [warning, ...missing].filter(Boolean).join(" ");
 }
 
-// The job's author subagents' models for Run settings: a list of names (each subagent's model chosen), null (all
-// run the coordinator's model), or undefined for a job without TCS Prover's team (authorTeam null: its author works
-// alone, or its subagents are the CLI's own: a job from before the team, or a web-cutoff job). The server's
-// authorTeam names each member's model as the job recorded it ("API connection …" programs get "(API)").
-function jobTeamLabels(job = state) {
-  if (!Array.isArray(job.authorTeam) || !job.authorTeam.length) return undefined;
-  if (!Array.isArray(job.authorSubagentModels) || !job.authorSubagentModels.length) return null;
-  return job.authorSubagentModels.map((item, index) => {
-    const member = job.authorTeam.find((entry) => Number(entry?.member) === index + 1) || {};
-    const api = Boolean(member.connection) || /^API connection/.test(String(member.program || ""))
-      || String(item?.model).startsWith("api:");
-    const name = member.modelLabel || teamModelLabel(item?.model || "");
-    return api && !/\(API\)$/.test(name) ? `${name} (API)` : name;
-  });
-}
-
-function jobTeamText(job = state) {
-  const count = Number.isInteger(job.authorSubagents) ? job.authorSubagents : job.authorTeam.length;
-  return teamText(count, jobTeamLabels(job));
-}
-
 // Whether a model source (roleModelSource()) runs through Claude Code: a Claude model, or an API model of the
 // Anthropic format. Claude Code has no goal mode of its own, so such an author always runs TCS Prover's goal loop,
 // whatever loop its job records (every job from before the setting records Codex built-in).
@@ -3053,7 +2998,8 @@ function renderRunOverview() {
   ui.runHealth.textContent = state.processAlive == null && state.workerActive == null ? "Unknown · telemetry unavailable"
     // The automatic progress summary at the time limit, queued or being written.
     : limitStop && limitSummaryWriting(state) && !state.readOnly ? "Time limit reached · writing progress summary"
-    : state.processAlive ? (state.phase === "paused" ? `${halted} · author replying` : "Running")
+    : state.processAlive ? (state.phase === "paused" ? `${halted} · author replying`
+      : state.phase === "done" ? "Finished · author replying" : "Running")
     : state.workerActive ? "Starting / closing"
     : state.runningElsewhere ? "Running in another process"
     : state.phase === "paused" ? `${halted} · ${userStop && state.activeNode !== "author" ? "saved step" : "saved conversation"}`
@@ -3119,11 +3065,18 @@ function renderRunOverview() {
   const tabTitle = ui.runProblemTitle.textContent;
   const pageTitle = `${ui.runStage.textContent} · ${tabTitle.length > 80 ? `${tabTitle.slice(0, 79)}…` : tabTitle} — TCS Prover`;
   if (document.title !== pageTitle) document.title = pageTitle;
+  const goalCount = Array.isArray(state.goals) ? state.goals.length : 0;
   ui.statementHeading.textContent = latex ? "Original writing"
     : state.phase === "reviewing" ? "Statement being reviewed"
-    : state.phase === "reviewed" ? "Reviewed statement · awaiting approval" : "Statement being solved";
+    : state.phase === "reviewed" ? "Reviewed statement · awaiting approval"
+    : goalCount ? `Goal ${goalCount + 1} · ${state.phase === "done" ? "statement" : "statement being solved"}`
+    : "Statement being solved";
   if (ui.runStatement.textContent !== statement) ui.runStatement.textContent = statement;
-  const changed = Boolean(original && original.trim() !== statement.trim());
+  // The original is shown apart only where a statement review can have changed it. With the Statement review stage
+  // off the author gets the statement as written, so there is no other text to show; and line ends never count as a
+  // change (the server reads the saved statement with "\n", whatever the file you gave had).
+  const plainText = (text) => String(text || "").replace(/\r\n?/g, "\n").trim();
+  const changed = Boolean(stages.review) && Boolean(original) && plainText(original) !== plainText(statement);
   show(ui.originalStatementDetails, changed);
   if (ui.runOriginalStatement.textContent !== (original || "")) ui.runOriginalStatement.textContent = original || "";
   // A role's row: its model and effort, then its own settings, then where the model runs.
@@ -3138,25 +3091,16 @@ function renderRunOverview() {
     ...(state.sourceFile ? [["Input file", state.sourceFile]] : []),
     ["Statement reviewer", stages.review ? roleRow("review", state.reviewModel, state.reviewEffort || state.reasoningEffort) : "Off"],
     ["Proof author", stages.author ? roleRow("author", state.authorModel, state.authorEffort || state.reasoningEffort,
-      // An older job, from before the Author subagents setting, is not described with it. With 1 or more, a job
-      // recorded in coordinator mode (authorMode) runs an author coordinator with that many author subagents, unless
-      // its runner said that its model has no subagent tool (authorModeEffective), so its author works alone; one
-      // recorded without the mode (every job from before coordinator mode) gave its author that many subagents.
-      state.authorSubagentsRecorded === false ? ""
+      // A job that ran in coordinator mode says so; an older job, from before the Author subagents setting, is not
+      // described with it.
+      state.coordinatorJob ? " · coordinator mode, from an earlier version of TCS Prover"
+        : state.authorSubagentsRecorded === false ? ""
         : !(Number.isInteger(state.authorSubagents) && state.authorSubagents > 0) ? " · works alone"
-        : state.authorMode === "coordinator" && state.authorModeEffective?.mode === "author"
-          ? ` · works alone: ${state.authorModeEffective.modelLabel || "its model"} has no subagent tool (coordinator `
-            + "mode needs one)"
-        // A coordinator with TCS Prover's team names each subagent's model, or says they all run its own.
-        : state.authorMode === "coordinator" && jobTeamLabels() !== undefined
-          ? ` · ${jobTeamText()}`
-        : state.authorMode === "coordinator"
-          ? ` · coordinator, up to ${state.authorSubagents} author subagent${state.authorSubagents === 1 ? "" : "s"} at a time`
           // Parallel agents: the author, and the subagents it may start itself.
           : ` · ${state.authorSubagents + 1} parallel agents: up to ${state.authorSubagents} subagent${
             state.authorSubagents === 1 ? "" : "s"} of its own at a time`) : "Off"],
-    // The author's examiner (the Examiner setting; a coordinator job has its team's examiner instead).
-    ...(stages.author && state.authorMode !== "coordinator" && typeof state.examiner === "boolean"
+    // The author's examiner (the Examiner setting; a job that ran in coordinator mode had none of this kind).
+    ...(stages.author && !state.coordinatorJob && typeof state.examiner === "boolean"
       ? [["Examiner", state.examiner ? "On: reports to the author after each compaction of its conversation" : "Off"]] : []),
     // How the author's turns follow one another (a job from before the setting records none).
     ...(stages.author && ["tcs", "codex"].includes(state.goalLoop) ? [["Goal loop", jobGoalLoopText()]] : []),
@@ -3189,6 +3133,7 @@ function renderRunOverview() {
     }));
   }
   renderCriticReviewHistory();
+  if (typeof renderCurrentProof === "function") renderCurrentProof();
   const final = state.resultKind === "final" || state.canDownloadTex;
   // Only a result is shown here; an unfinished run's own text is not (its progress summary says where it stands).
   const savedOutput = Boolean(state.output && ["done", "paused"].includes(state.phase)
@@ -3203,7 +3148,14 @@ function renderRunOverview() {
       : "The complete proof the author wrote. No critic reviewed it.")
     : state.revisionRequired ? "The critic found unresolved errors in this candidate."
     : "This run ended without a complete result; this is its failure report.";
-  if (savedOutput && ui.resultOutput.textContent !== state.output) ui.resultOutput.textContent = state.output;
+  // A proof is rendered for reading, with its source a click away; the LaTeX source and a failure report stay as written.
+  const renderable = savedOutput && !final && state.resultKind !== "failure";
+  if (typeof showProofDocument === "function" && ui.resultDoc) {
+    showProofDocument(resultDocument, savedOutput ? state.output : "", renderable,
+      { doc: ui.resultDoc, text: ui.resultOutput, button: ui.resultSource });
+  } else if (savedOutput && ui.resultOutput.textContent !== state.output) {
+    ui.resultOutput.textContent = state.output;
+  }
   // A LaTeX source published without its PDF says so; the activity log has the reason.
   if (final && state.canDownloadTex && !state.canDownloadPdf) {
     ui.resultDescription.textContent = "The complete saved LaTeX source is shown here. The PDF was not compiled; "
@@ -4102,13 +4054,8 @@ function renderWorkflow() {
       copy.append(mark);
     }
     const description = document.createElement("span");
-    // A job's author coordinator (authorMode, with 1 or more author subagents) does not build the proof itself; one
-    // whose model has no subagent tool works alone (authorModeEffective).
-    const coordinators = state.runId && state.authorMode === "coordinator" && state.authorModeEffective?.mode !== "author"
-      && Number.isInteger(state.authorSubagents) && state.authorSubagents > 0 ? state.authorSubagents : 0;
     const descriptions = {
-      author: coordinators ? `Coordinates up to ${coordinators} author subagent${coordinators === 1 ? "" : "s"} and `
-        + "checks that progress keeps growing." : "Explore approaches and build a proof.",
+      author: "Explore approaches and build a proof.",
       critic: stages.author === false
         ? "The critic starts independent critics on the supplied work and reports unresolved errors."
         : "The critic starts independent critics on the candidate and decides; rejected proofs return to the author.",
@@ -4430,7 +4377,8 @@ function renderClock() {
   }
   renderActivityAge();
   renderAuthorLimitHint();
-  // The working step's time counts up (see renderStepTimes).
+  // The chat's waiting lines count up (defined with the chat), and so does the working step's time.
+  if (typeof renderChatElapsed === "function") renderChatElapsed();
   if (typeof renderStepTimes === "function") renderStepTimes();
 }
 
@@ -4711,10 +4659,11 @@ function render(next) {
   renderWorkflow();
   renderClock();
   renderBatchNavigation();
-  // After the overview is shown, so the progress log and the chat can scroll to their newest text (the chat also
-  // places the author's question).
-  renderProgressLog();
+  // After the overview is shown, so the chat can scroll to its newest text (it also places the author's question).
+  renderAuthorMemory();
   renderAuthorConversation();
+  if (typeof renderNewGoal === "function") renderNewGoal();
+  if (typeof renderEarlierGoals === "function") renderEarlierGoals();
   renderRelatedWorksPanel();
   if (state.readOnly || state.runningElsewhere) {
     for (const control of [ui.stop, ui.pause, ui.resume, ui.authorSteerControl, ui.authorTimeLimitControl,
@@ -4728,6 +4677,16 @@ function render(next) {
     }
     // Another process owns the run: say so instead of offering its controls.
     if (state.runningElsewhere) ui.runDescription.textContent = state.runningElsewhere;
+  }
+  // A job that ran in coordinator mode stays readable, but nothing runs for it again: Stop alone stays, for a runner
+  // of an earlier version that still works.
+  if (state.coordinatorJob) {
+    for (const control of [ui.pause, ui.resume, ui.authorSteerControl, ui.authorTimeLimitControl, ui.approve,
+      ui.recheck, ui.reviewFeedbackControls]) show(control, false);
+    if (phase === "paused") ui.runTitle.textContent = timeLimitPause ? "Time limit reached" : userStop ? "Stopped" : "Paused";
+    if (!state.runningElsewhere) {
+      ui.runDescription.textContent = [COORDINATOR_JOB_NOTE, state.error].filter(Boolean).join(" ");
+    }
   }
   // Announce a new phase by moving focus to its heading, but never out of a field being typed in.
   const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName);
@@ -4915,6 +4874,26 @@ function chatDeliveryText(item, where) {
     : "Not delivered yet: the author receives it at its next turn, if it works again in this run.";
 }
 
+// A conversation time (epoch seconds, or an ISO date) in milliseconds; NaN when unknown.
+function conversationTime(value) {
+  return value ? new Date(typeof value === "number" ? value * 1000 : value).getTime() : NaN;
+}
+
+// How long a chat line has waited ("0m 42s"), from its start in milliseconds; "" when unknown. A server clock ahead of
+// this browser's reads as just now.
+function chatElapsedText(since) {
+  return since > 0 ? durationText(Math.max(0, (Date.now() - since) / 1000)) : "";
+}
+
+// The time on each waiting chat line, written every second while the job page's clock runs (renderClock), without
+// rebuilding a row.
+function renderChatElapsed() {
+  for (const node of ui.authorConversationList?.querySelectorAll?.(".conversation-elapsed") || []) {
+    const text = chatElapsedText(Number(node.dataset.since));
+    if (node.textContent !== text) node.textContent = text;
+  }
+}
+
 // One chat item and where it stands: your message with the author's answer, the author's question
 // (answered here while it is open), or a progress summary or a message to the paused author with its
 // reply. Every text is set as text: the author's answers are untrusted model output, never markup.
@@ -4930,11 +4909,44 @@ function conversationEntry(item, criticNote, where = chatWhere()) {
     row.append(node);
     return node;
   };
+  // A status line of something under way, so the chat never looks stuck: moving dots before its words and how long
+  // it has waited after them (renderChatElapsed). "queued" waits for the author; "working" is the author at it,
+  // behind the rule its answer will have. The words stay the line's text; the dots and the time are hidden from
+  // screen readers, so the polite list does not announce every second. Only what is really under way moves: a retry
+  // after a failure, a job paused, stopped or at another step, and a saved (read-only) batch keep a plain line.
+  const live = !state.readOnly;
+  const wait = (text, kind, since) => {
+    const node = line("conversation-status", text);
+    if (!live) return node;
+    node.dataset.wait = kind;
+    const dots = document.createElement("span"), elapsed = document.createElement("span");
+    dots.className = "conversation-dots";
+    dots.setAttribute("aria-hidden", "true");
+    dots.append(document.createElement("span"), document.createElement("span"), document.createElement("span"));
+    elapsed.className = "conversation-elapsed";
+    elapsed.setAttribute("aria-hidden", "true");
+    const start = conversationTime(since);
+    elapsed.dataset.since = Number.isFinite(start) ? String(start) : "";
+    elapsed.textContent = chatElapsedText(start);
+    node.append(dots, elapsed);
+    return node;
+  };
   if (item.kind === "instruction") {
     line("conversation-meta", ["You", conversationClock(item.createdAt)].filter(Boolean).join(" · "));
     line("conversation-text", item.text || "");
     if (!item.reply) {
-      line("conversation-status", chatDeliveryText(item, where));
+      const delivered = Boolean(item.deliveredAt || item.status === "delivered");
+      if (!delivered && where === "author") {
+        wait(chatDeliveryText(item, where), "queued", item.createdAt);
+      } else {
+        line("conversation-status", chatDeliveryText(item, where));
+      }
+      // Taken in by an author that replies to every message (replyExpected: an answer, or a short confirmation of an
+      // instruction): it is replying, until its reply replaces this line. A job with its own chat prompt may leave an
+      // instruction unanswered, so its messages, and any sent before the server said so, keep the plain line.
+      if (delivered && item.replyExpected === true && where === "author" && live) {
+        wait("The author is replying…", "working", item.deliveredAt || item.createdAt);
+      }
       return row;
     }
     line("conversation-meta", ["Author", conversationClock(item.finishedAt),
@@ -4996,24 +5008,29 @@ function conversationEntry(item, criticNote, where = chatWhere()) {
       : summary ? "The author is writing the summary…" : "The author is replying…")
     : item.status === "failed" ? (item.error ? `No reply: ${item.error}` : "No reply.")
     : item.status === "stopped" ? "Reply stopped." : "";
-  if (status) line("conversation-status", status);
+  // Waiting to start, or being written: under way (see wait), unless a failure waits to be tried again.
+  const under = item.status === "queued" ? !item.error && "queued"
+    : item.status === "running" && !item.retry?.text && "working";
+  if (status && under) wait(status, under, under === "working" ? item.startedAt || item.createdAt : item.createdAt);
+  else if (status) line("conversation-status", status);
   if (criticNote) {
     line("conversation-status", "The author has not seen the critic's latest report yet; it receives it when the run resumes.");
   }
   return row;
 }
 
-// Send works while the author works (a live instruction) and while it is paused or stopped at the proof
-// author (a reply in its saved conversation); otherwise it is off and the note says why and when. While a
-// message is on its way, Send stays off, also across polls.
+// Send works while the author works (a live instruction), while it is paused or stopped at the proof author and
+// once the job has finished (a reply in its saved conversation); otherwise it is off and the note says why and
+// when. While a message is on its way, Send stays off, also across polls.
 function renderChatSend() {
   const control = chatControl();
-  const open = ["author", "paused"].includes(control.mode);
+  const open = ["author", "paused", "finished"].includes(control.mode);
   ui.sendAuthorSteer.disabled = !open || chatSending;
   ui.sendAuthorSteer.title = open ? "" : control.note || control.reason || "";
   // The same words for every stop at the proof author: paused by you, stopped by you or at the time limit.
   const placeholder = control.legacy === "steer" ? "Tell the author what to try next."
     : control.mode === "paused" ? "Ask the author a question."
+    : control.mode === "finished" ? "Ask the author about its work or the paper."
     : "Ask a question, or tell the author what to try next.";
   if (ui.authorSteerInstruction.placeholder !== placeholder) ui.authorSteerInstruction.placeholder = placeholder;
 }
@@ -5029,7 +5046,10 @@ function renderAuthorConversation() {
   // A saved conversation too large to show is named instead of listed.
   const notice = typeof conversation.notice === "string" ? conversation.notice : "";
   const authorStage = state.workflowStages?.author !== false && state.problemMode !== "latex";
-  const closed = state.phase === "done" || Boolean(state.readOnly) || Boolean(state.runningElsewhere);
+  // A finished job keeps its box while its author can still answer (state.conversation.mode "finished", or "busy"
+  // while a reply is written).
+  const answering = state.phase === "done" && ["finished", "busy"].includes(conversation.mode);
+  const closed = (state.phase === "done" && !answering) || Boolean(state.readOnly) || Boolean(state.runningElsewhere);
   const visible = authorStage && (!closed || items.length > 0 || Boolean(notice));
   show(ui.authorConversation, visible);
   show(ui.authorSteerControl, visible && !closed);
@@ -5058,7 +5078,7 @@ function renderAuthorConversation() {
     : summary === "queue" ? `The author writes a progress summary here once it has ${stoppedByUser(state) ? "stopped"
       : "paused"}.`
     : summary === "now" ? "The author writes a progress summary here." : conversation.summaryNote || "";
-  show(ui.stopReply, state.phase === "paused" && Boolean(conversation.busy) && !state.readOnly);
+  show(ui.stopReply, ["paused", "done"].includes(state.phase) && Boolean(conversation.busy) && !state.readOnly);
   // The question form may be in a row about to be rebuilt: an answer being typed keeps its focus.
   const active = typeof document !== "undefined" ? document.activeElement : null;
   const typing = active && ui.authorQuestionForm?.contains?.(active) ? active : null;
@@ -5163,7 +5183,6 @@ function renderRelatedWorksPanel() {
   const heading = count ? `Related works · ${count}` : "Related works";
   if (ui.relatedWorksHeading.textContent !== heading) ui.relatedWorksHeading.textContent = heading;
   const jobPhase = state.phase;
-  // A job of a folder run adds works for every job of the run on the batch page.
   const note = !works.available ? works.reason || ""
     : (!state.goalThreadId && ["reviewing", "reviewed", "prepared"].includes(jobPhase) ? "The author's first prompt points to these files."
       : jobPhase === "running" ? "Saved in the author's related-works folder. The author is told about new files at its next step."
@@ -5173,9 +5192,7 @@ function renderRelatedWorksPanel() {
       + (items.some((item) => item.sharedFrom === "batch" && !item.noLongerShared) ? " Works marked “from the batch” "
         + "are shared with every problem in this batch; add or remove them on the batch page." : "")
       + (items.some((item) => item.sharedFrom === "batch" && item.noLongerShared) ? " Works marked “from the batch, "
-        + "no longer shared” were removed from the batch's shared works; this job keeps its copy." : "")
-      + (state.folderBatch ? " Works for every problem of this folder run are added under Shared with a folder run "
-        + "on the batch page." : "");
+        + "no longer shared” were removed from the batch's shared works; this job keeps its copy." : "");
   if (ui.relatedWorksNote.textContent !== note) ui.relatedWorksNote.textContent = note;
   show(ui.relatedWorksNote, Boolean(note));
   show(ui.relatedWorksEmpty, !items.length);
@@ -5191,121 +5208,552 @@ function renderRelatedWorksPanel() {
   if (!actions) show(ui.relatedNoteForm, false);
 }
 
-// The author coordinator's progress log, for a job recorded in coordinator mode (authorMode) with the Author stage
-// on: memory/progress.md in the author's working folder as the server last read it. The job's state says when it
-// changed and how long it is (state.coordinatorProgress, {updatedAt, truncated, chars, bytes, version}; null until
-// the file exists); its text comes apart (loadProgressLog), when the job page opens and whenever its version changes.
-// The text is set as plain text, never markup. The box opens at the end of the log and stays there as the log grows,
-// unless the reader scrolled up in it. When the server kept only the end of a longer file, a note says so, how large
-// the whole file is and where it is. Written only on change. When the job's runner said that its model has no
-// subagent tool (authorModeEffective), the author works alone and writes no log: one line says so instead. Under the
-// log, "Saved 5 times, last at 14:50:46" opens the time of each saved version (state.coordinatorProgressVersions,
-// oldest first), as the coordinator dates none of its entries by itself.
-let progressLogRun = null;
-// The text on screen ({job, version, asked, text}: its version, and the state's version it was fetched for), the job
-// whose text is being fetched, and when a failed fetch may be tried again.
-let progressLogCopy = null, progressLogLoading = "", progressLogRetryAt = 0;
-function renderProgressLog() {
-  const visible = state.authorMode === "coordinator" && state.workflowStages?.author !== false;
-  show(ui.progressLog, visible);
-  const alone = visible && state.authorModeEffective?.mode === "author";
-  const aloneText = alone ? `The author works alone, without a progress log: ${state.authorModeEffective.modelLabel
-    || "its model"} has no subagent tool (coordinator mode needs one).` : "";
-  if (ui.progressLogAlone.textContent !== aloneText) ui.progressLogAlone.textContent = aloneText;
-  show(ui.progressLogAlone, alone);
-  show(ui.progressLogHeading, !alone);
-  if (!visible || alone) {
-    for (const part of [ui.progressLogMeta, ui.progressLogText, ui.progressLogNote, ui.progressLogEmpty,
-      ui.progressLogVersions]) show(part, false);
-    progressLogRun = null;
+// A proof shown for reading: ``view`` keeps what is on screen ({key, source}); ``parts`` are the document element,
+// the plain text element and the source switch. With ``renderable`` (and the renderer loaded) the Markdown is rendered
+// (TCSMarkdown, markdown.js: the model's raw HTML is shown as text, never run), unless the reader asked for the
+// source; otherwise, and for a document that cannot be rendered, the text is set as plain text. Each part is written
+// only when it changes.
+const resultDocument = { key: "", source: false };
+function showProofDocument(view, text, renderable, parts) {
+  const can = renderable && Boolean(text) && typeof TCSMarkdown !== "undefined";
+  const rendered = can && !view.source;
+  show(parts.doc, rendered);
+  show(parts.text, Boolean(text) && !rendered);
+  show(parts.button, can);
+  parts.button.textContent = view.source ? "Show rendered" : "Show source";
+  parts.button.setAttribute("aria-pressed", String(view.source));
+  if (!rendered) {
+    if (parts.text.textContent !== text) parts.text.textContent = text;
+    if (view.key) {
+      if (typeof TCSMarkdown !== "undefined") TCSMarkdown.clear(parts.doc);
+      view.key = "";
+    }
     return;
   }
-  const progress = state.coordinatorProgress && typeof state.coordinatorProgress === "object"
-    ? state.coordinatorProgress : null;
-  const job = `${state.batchId || ""}:${state.runId || ""}`;
-  // The job page opened: its text is fetched again (the copy shown meanwhile, when there is one of this job). Each
-  // version the state names is fetched at most once.
-  if (progressLogRun !== job) {
-    progressLogCopy = progressLogCopy?.job === job ? { ...progressLogCopy, version: null, asked: null } : null;
-    progressLogRetryAt = 0;
-  }
-  if (progress && progressLogCopy?.version !== progress.version && progressLogCopy?.asked !== progress.version
-      && progressLogLoading !== job && Date.now() >= progressLogRetryAt) loadProgressLog(job, progress.version);
-  const copy = progress && progressLogCopy?.job === job ? progressLogCopy : null;
-  const text = copy ? copy.text : "";
-  const written = text.trim() !== "";
-  // When the coordinator last changed the file: epoch seconds (or milliseconds), or an ISO time.
-  const raw = progress?.updatedAt;
-  const updated = typeof raw === "number" ? (raw > 1e11 ? raw : raw * 1000) : Date.parse(raw ?? "");
-  const seconds = Number.isFinite(updated) ? Math.max(0, Date.now() - updated) / 1000 : NaN;
-  const ago = Number.isFinite(seconds) ? `updated ${ageText(seconds, { minutes: true })}` : "";
-  const meta = ["Written by the author coordinator in memory/progress.md", ago].filter(Boolean).join(" · ");
-  if (ui.progressLogMeta.textContent !== meta) ui.progressLogMeta.textContent = meta;
-  show(ui.progressLogMeta, Boolean(progress));
-  // Not written yet: no file, or a blank one (not while the text of a file is on its way).
-  show(ui.progressLogEmpty, !progress || (copy !== null && !written));
-  const box = ui.progressLogText;
-  show(box, written);
-  // Measured before the text changes: a reader who scrolled up keeps their place; another job opens at the end.
-  const atEnd = progressLogRun !== job || box.scrollHeight - box.scrollTop - box.clientHeight < 24;
-  progressLogRun = job;
-  if (box.textContent !== text) box.textContent = text;
-  if (written && atEnd) box.scrollTop = box.scrollHeight;
-  // Of a longer file the server keeps the end: "chars" is how many characters "text" holds (the last 100,000 at
-  // most) and "bytes" the size of the whole file.
-  const workspace = String(state.goalWorkspace || "").replace(/[\\/]+$/, "");
-  const separator = workspace.includes("\\") && !workspace.includes("/") ? "\\" : "/";
-  const where = workspace ? `${workspace}${separator}memory${separator}progress.md`
-    : "memory/progress.md in the author's working folder";
-  const shown = Number.isInteger(progress?.chars) && progress.chars > 0 ? progress.chars : text.length;
-  const size = Number.isInteger(progress?.bytes) && progress.bytes > 0 ? ` (${chatSizeText(progress.bytes)})` : "";
-  const note = written && progress.truncated === true
-    ? `Showing the last ${shown.toLocaleString("en-US")} characters; the whole file${size} is ${where}.` : "";
-  if (ui.progressLogNote.textContent !== note) ui.progressLogNote.textContent = note;
-  show(ui.progressLogNote, Boolean(note));
-  // The server keeps the newest 500 times: its first entry counts the versions saved before it ("earlier"), and says
-  // when the log already existed as TCS Prover first read it ("existed"), so that earlier saves are not counted.
-  const saved = Array.isArray(state.coordinatorProgressVersions) ? state.coordinatorProgressVersions : [];
-  const versions = progressLogVersionTimes(saved);
-  const earlier = Number.isInteger(saved[0]?.earlier) && saved[0].earlier > 0 ? saved[0].earlier : 0;
-  const existed = saved[0]?.existed === true;
-  const count = versions.length + earlier;
-  const summary = versions.length ? `Saved ${existed ? "at least " : ""}${count === 1 ? "once"
-    : `${count.toLocaleString("en-US")} times`}, last at ${versions[versions.length - 1]}` : "";
-  if (ui.progressLogVersionsSummary.textContent !== summary) ui.progressLogVersionsSummary.textContent = summary;
-  const times = !versions.length ? "" : [earlier
-    ? `Only the newest ${versions.length.toLocaleString("en-US")} times are kept, oldest first: ${versions.join(", ")}.`
-    : `Each saved version, oldest first: ${versions.join(", ")}.`,
-  existed ? "The log already existed when TCS Prover first read it, so earlier saves are not counted." : ""]
-    .filter(Boolean).join(" ");
-  if (ui.progressLogVersionsText.textContent !== times) ui.progressLogVersionsText.textContent = times;
-  show(ui.progressLogVersions, Boolean(progress && versions.length));
-}
-
-// The local times at which the versions of the progress log were saved ({at: an ISO time}, oldest first): "14:45:35",
-// or "13 Nov 23:10:02" for a day other than today. An entry without a readable time is left out.
-function progressLogVersionTimes(versions) {
-  return (Array.isArray(versions) ? versions : []).map((entry) => Date.parse(entry?.at ?? ""))
-    .filter((time) => Number.isFinite(time)).map((time) => timeText(time, { seconds: true }));
-}
-
-// Fetch the text of the progress log of ``job`` (the job on screen), whose state names version ``asked``, then draw
-// it. A failed fetch is tried again 10 s later, at a later update; nothing is shown that belongs to another job.
-async function loadProgressLog(job, asked) {
-  progressLogLoading = job;
+  if (view.key === text) return;
   try {
-    const log = await request(jobPath("/progress-log"));
-    if (job !== `${state.batchId || ""}:${state.runId || ""}`) return;
-    progressLogCopy = { job, asked, version: log?.version ?? null,
-      text: typeof log?.text === "string" ? log.text : "" };
-    progressLogRetryAt = 0;
+    TCSMarkdown.render(text, parts.doc);
+    view.key = text;
   } catch (_) {
-    progressLogRetryAt = Date.now() + 10000;
-  } finally {
-    if (progressLogLoading === job) progressLogLoading = "";
+    view.source = true;
+    showProofDocument(view, text, renderable, parts);
   }
-  renderProgressLog();
 }
+ui.resultSource.onclick = () => {
+  resultDocument.source = !resultDocument.source;
+  showProofDocument(resultDocument, state.output || "", true,
+    { doc: ui.resultDoc, text: ui.resultOutput, button: ui.resultSource });
+};
+
+// The current proof, while the critic checks it or the paper is written from it, before the job has its result:
+// the proof the critic accepted once there is one, else the saved candidate (the author's hand-in, with the critic's
+// fixes after each round). The job's state says which and when it changed (state.currentProof, {source, bytes,
+// updatedAt, version}); its text comes apart from GET /current-proof when the version changes or the job page opens.
+// ``job``: the job on screen; ``copy``: what was read ({version, text, chars, truncated}); ``loading``: the version
+// being read; ``retryAt``: when a failed read may be tried again.
+const currentProof = { job: "", copy: null, loading: "", retryAt: 0, view: { key: "", source: false } };
+const WRITING_NODES = ["latex_editor", "latex_compile", "latex_repair"];
+function renderCurrentProof() {
+  const mark = state.currentProof && typeof state.currentProof === "object" ? state.currentProof : null;
+  const node = state.activeNode || "";
+  const step = node === "critic" ? "critic" : WRITING_NODES.includes(node) ? "writing" : "";
+  const active = ["running", "pausing", "paused", "stopping"].includes(state.phase);
+  const visible = Boolean(mark && step && active && state.runId);
+  show(ui.currentProofPanel, visible);
+  if (!visible) return;
+  const job = `${state.batchId || ""}:${state.runId}`;
+  if (currentProof.job !== job) {
+    Object.assign(currentProof, { job, copy: null, loading: "", retryAt: 0 });
+    currentProof.view = { key: "", source: false };
+  }
+  if (currentProof.copy?.version !== mark.version && currentProof.loading !== mark.version
+      && Date.now() >= currentProof.retryAt) loadCurrentProof(job, mark.version);
+  const copy = currentProof.copy;
+  const changed = timeText(mark.updatedAt ?? "");
+  const held = state.phase === "paused" ? " The job is paused here." : "";
+  const description = (mark.source === "accepted"
+    ? (step === "writing" ? "Accepted by the critic. The paper is being written from this proof."
+      : "Accepted by the critic.")
+    : "The proof as handed in by the author, with the critic's fixes after each round. The critic is checking it; "
+      + "it is not accepted yet.")
+    + (changed ? ` Last changed ${changed}.` : "") + held;
+  if (ui.currentProofDescription.textContent !== description) ui.currentProofDescription.textContent = description;
+  const text = copy?.text || "";
+  showProofDocument(currentProof.view, text, true,
+    { doc: ui.currentProofDoc, text: ui.currentProofText, button: ui.currentProofSource });
+  const note = !copy ? "Reading the proof…"
+    : copy.truncated ? `Showing the first ${text.length.toLocaleString("en-US")} of `
+      + `${Number(copy.chars).toLocaleString("en-US")} characters.` : "";
+  if (ui.currentProofNote.textContent !== note) ui.currentProofNote.textContent = note;
+}
+
+async function loadCurrentProof(job, version) {
+  currentProof.loading = version;
+  try {
+    const proof = await request(jobPath("/current-proof"));
+    if (currentProof.job === job && typeof proof?.text === "string") {
+      currentProof.copy = { version: proof.version, text: proof.text, chars: proof.chars, truncated: proof.truncated };
+      currentProof.retryAt = 0;
+    }
+  } catch (_) {
+    // A server older than this page has no such route; a later update tries again in a minute.
+    if (currentProof.job === job) currentProof.retryAt = Date.now() + 60000;
+  } finally {
+    if (currentProof.loading === version) currentProof.loading = "";
+  }
+  if (currentProof.job === job) renderCurrentProof();
+}
+ui.currentProofSource.onclick = () => {
+  currentProof.view.source = !currentProof.view.source;
+  renderCurrentProof();
+};
+
+// A new goal for a finished job (state.newGoal: {available, reason}): "Set a new goal…" opens a form with the goal and
+// the job's time limit (which counts the whole job's active time: one used up must be raised, or set to 0, with the
+// goal). Start sends POST /new-goal; the job then runs again from the proof author, in the same conversation and run
+// folder, and this goal's results move under Earlier goals. What you typed stays across polls, per job.
+let newGoalJob = "";
+function renderNewGoal() {
+  const offer = state.newGoal && typeof state.newGoal === "object" ? state.newGoal : null;
+  const busy = offer && !offer.available && offer.reason === "The author is replying. Wait for the reply or stop it.";
+  const visible = state.phase === "done" && !state.readOnly && Boolean(offer?.available || busy);
+  show(ui.newGoalControl, visible);
+  const job = `${state.batchId || ""}:${state.runId || ""}`;
+  if (newGoalJob !== job) {
+    newGoalJob = job;
+    ui.newGoalText.value = "";
+    show(ui.newGoalForm, false);
+    ui.newGoalOpen.setAttribute("aria-expanded", "false");
+    ui.newGoalHours.value = "";
+  }
+  if (!visible) return;
+  const open = !ui.newGoalForm.hidden;
+  show(ui.newGoalOpen, !open);
+  ui.newGoalOpen.disabled = Boolean(busy);
+  const reason = busy ? offer.reason : "";
+  if (ui.newGoalReason.textContent !== reason) ui.newGoalReason.textContent = reason;
+  show(ui.newGoalReason, Boolean(reason));
+  ui.newGoalStart.disabled = Boolean(busy) || newGoalSending;
+  if (open && ui.newGoalHours.value === "") ui.newGoalHours.value = String(Number(state.thinkingHours ?? 0));
+  const hours = Number(ui.newGoalHours.value), used = runElapsedSeconds();
+  const help = `${durationText(used)} of active work so far.`
+    + (hours > 0 && hours * 3600 <= used + 60 ? " This limit is used up: raise it, or set 0 for none, to start the goal."
+      : "");
+  if (ui.newGoalLimitHelp.textContent !== help) ui.newGoalLimitHelp.textContent = help;
+}
+let newGoalSending = false;
+ui.newGoalOpen.onclick = () => {
+  show(ui.newGoalForm, true);
+  ui.newGoalOpen.setAttribute("aria-expanded", "true");
+  renderNewGoal();
+  ui.newGoalText.focus();
+};
+ui.newGoalCancel.onclick = () => {
+  show(ui.newGoalForm, false);
+  ui.newGoalOpen.setAttribute("aria-expanded", "false");
+  renderNewGoal();
+  ui.newGoalOpen.focus();
+};
+ui.newGoalHours.oninput = () => renderNewGoal();
+ui.newGoalStart.onclick = async () => {
+  const goal = ui.newGoalText.value.trim();
+  if (!goal) {
+    ui.notice.textContent = "Write the new goal: the statement the author should now prove.";
+    show(ui.notice, true);
+    ui.newGoalText.focus();
+    return;
+  }
+  newGoalSending = true;
+  renderNewGoal();
+  const hours = ui.newGoalHours.value.trim();
+  const done = await act("/new-goal", { goal, ...(hours === "" ? {} : { thinkingHours: Number(hours) }) });
+  newGoalSending = false;
+  if (done) {
+    ui.newGoalText.value = "";
+    ui.newGoalHours.value = "";
+    show(ui.newGoalForm, false);
+    ui.newGoalOpen.setAttribute("aria-expanded", "false");
+  }
+  renderNewGoal();
+};
+
+// The earlier goals of a job continued with new goals (state.goals: {number, statement, resultKind, startedAt,
+// finishedAt, files}), newest first: how each ended and when, its statement, and its files (GET /goal-file): its proof
+// (or failure report) opens under the list, rendered like the current proof; its paper downloads. Rows are rebuilt
+// only when the goals change.
+const earlierGoals = { signature: "", job: "", open: null, text: "", view: { key: "", source: false } };
+const EARLIER_GOAL_RESULTS = { proof: "Accepted proof", final: "Accepted proof and paper", "needs-revision":
+  "Proof needs revision", failure: "No complete result" };
+function renderEarlierGoals() {
+  const goals = Array.isArray(state.goals) ? state.goals : [];
+  show(ui.earlierGoalsPanel, goals.length > 0);
+  const job = `${state.batchId || ""}:${state.runId || ""}`;
+  if (earlierGoals.job !== job) {
+    Object.assign(earlierGoals, { job, signature: "", open: null, text: "", view: { key: "", source: false } });
+  }
+  if (!goals.length) return;
+  const heading = `Earlier goals (${goals.length})`;
+  if (ui.earlierGoalsHeading.textContent !== heading) ui.earlierGoalsHeading.textContent = heading;
+  const signature = JSON.stringify(goals);
+  if (signature !== earlierGoals.signature) {
+    earlierGoals.signature = signature;
+    ui.earlierGoalsList.replaceChildren(...[...goals].reverse().map((goal) => {
+      const row = document.createElement("li"), title = document.createElement("p"), meta = document.createElement("p");
+      const statement = document.createElement("pre"), actions = document.createElement("div");
+      row.className = "earlier-goal";
+      title.className = "earlier-goal-title";
+      title.textContent = `Goal ${goal.number}`;
+      meta.className = "earlier-goal-meta";
+      meta.textContent = [EARLIER_GOAL_RESULTS[goal.resultKind] || "Ended",
+        goal.finishedAt ? `finished ${timeText(goal.finishedAt)}` : ""].filter(Boolean).join(" · ");
+      statement.className = "statement-copy earlier-goal-statement";
+      statement.textContent = goal.statement || "";
+      actions.className = "earlier-goal-actions";
+      const files = Array.isArray(goal.files) ? goal.files : [];
+      const readable = ["proof-output.md", "failure-summary.md", "partial-output.md"].find((name) => files.includes(name));
+      const button = (text, onclick) => {
+        const element = document.createElement("button");
+        element.type = "button";
+        element.className = "ghost compact";
+        element.textContent = text;
+        element.onclick = () => onclick(element);
+        return element;
+      };
+      if (readable) {
+        actions.append(button(readable === "proof-output.md" ? "Read the proof" : "Read the report",
+          () => openEarlierGoalFile(goal.number, readable)));
+      }
+      for (const [name, text] of [["final.pdf", "Download PDF"], ["final.tex", "Download .tex"],
+        ["proof-output.md", "Download .md"]]) {
+        if (files.includes(name)) {
+          actions.append(button(text, (element) => downloadArtifact(element, "", `goal-${goal.number}-${name}`,
+            "/goal-file", { goal: String(goal.number), name })));
+        }
+      }
+      row.append(title, meta, statement, actions);
+      return row;
+    }));
+  }
+  const open = earlierGoals.open;
+  show(ui.earlierGoalView, Boolean(open));
+  if (!open) return;
+  const title = `Goal ${open.goal} · ${open.name === "proof-output.md" ? "proof" : "report"}`;
+  if (ui.earlierGoalViewTitle.textContent !== title) ui.earlierGoalViewTitle.textContent = title;
+  showProofDocument(earlierGoals.view, earlierGoals.text, true,
+    { doc: ui.earlierGoalDoc, text: ui.earlierGoalText, button: ui.earlierGoalSource });
+  const note = open.loading ? "Reading the file…" : open.error || "";
+  if (ui.earlierGoalNote.textContent !== note) ui.earlierGoalNote.textContent = note;
+}
+
+async function openEarlierGoalFile(goal, name) {
+  const job = earlierGoals.job;
+  Object.assign(earlierGoals, { open: { goal, name, loading: true, error: "" }, text: "",
+    view: { key: "", source: false } });
+  renderEarlierGoals();
+  ui.earlierGoalView.scrollIntoView?.({ block: "nearest" });
+  try {
+    const response = await fetch(jobPath("/goal-file", { goal: String(goal), name }),
+      { headers: { "X-TCS-Prover-Token": sessionToken } });
+    if (!response.ok) throw new Error((await response.json()).error || "The file could not be read.");
+    const text = await response.text();
+    if (earlierGoals.job === job && earlierGoals.open?.goal === goal) {
+      earlierGoals.text = text;
+      earlierGoals.open = { goal, name, loading: false, error: "" };
+    }
+  } catch (error) {
+    if (earlierGoals.job === job && earlierGoals.open?.goal === goal) {
+      earlierGoals.open = { goal, name, loading: false, error: error.message };
+    }
+  }
+  renderEarlierGoals();
+  ui.earlierGoalViewTitle.focus?.({ preventScroll: true });
+}
+ui.earlierGoalSource.onclick = () => {
+  earlierGoals.view.source = !earlierGoals.view.source;
+  renderEarlierGoals();
+};
+ui.earlierGoalClose.onclick = () => {
+  Object.assign(earlierGoals, { open: null, text: "", view: { key: "", source: false } });
+  if (typeof TCSMarkdown !== "undefined") TCSMarkdown.clear(ui.earlierGoalDoc);
+  renderEarlierGoals();
+};
+
+// The author's memory, for every job with the Author stage: every file of the memory folder in the author's working
+// folder, which its prompt asks it to keep so that nothing is lost when its conversation is compacted. GET
+// /memory-files lists them ({folder, exists, files: [{path, bytes, updatedAt}], count, bytes, truncated}): read when
+// the job page opens, then every 10 seconds while the section is open and every minute while it is closed (for its
+// line, which counts the files and names the note changed last). The section shows once the folder holds a file,
+// closed. The first time it is opened for a job, the Markdown note changed last opens with it. The file you open
+// comes from GET /memory-file ({path, text, chars, truncated, binary, bytes, updatedAt}) and is read again when the
+// list says it changed. A Markdown note is rendered for reading (TCSMarkdown, markdown.js: the model's raw HTML is
+// shown as text, never run), with "Show source" for its text as written; any other file's text is set as plain text,
+// never markup. The rows are rebuilt only when what they show changes. A server older than this page has no such
+// route (404 "Not found."): one line says so in place of the section, and to restart TCS Prover.
+// ``job`` and ``run``: the job on screen (with its batch) and its run folder. ``loading``: the job whose list is being
+// read. ``older``: the server has no list. ``path``: the open file, ``file`` what was read of it, ``fileAsked`` the
+// size and change time the list gave when it was asked for. ``opened``: the section was opened for this job already
+// (the newest note opens only the first time). ``source``: the open note is shown as written, not rendered.
+const authorMemory = { job: "", run: "", listing: null, loadedAt: 0, loading: "", older: false, path: "", file: null,
+  fileError: "", fileLoading: "", fileAsked: "", signature: "", opened: false, source: false, rendered: "" };
+
+// Whether a file of the memory is a Markdown note, which is rendered for reading.
+function authorMemoryNote(path) {
+  return /\.(md|markdown)$/i.test(String(path || ""));
+}
+
+// The Markdown note changed last ({path, bytes, updatedAt}), or null.
+function authorMemoryNewest(files) {
+  let newest = null;
+  for (const file of files) {
+    if (!authorMemoryNote(file.path)) continue;
+    if (!newest || (Date.parse(file.updatedAt) || 0) > (Date.parse(newest.updatedAt) || 0)) newest = file;
+  }
+  return newest;
+}
+
+// When a file last changed: "14:05", or "14 Nov 21:00" for a day other than today; "" when unknown.
+function authorMemoryTime(value) {
+  return timeText(value ?? "");
+}
+
+// What the list says of a file now: its size and when it changed.
+function authorMemoryMark(file) {
+  return file ? `${file.bytes}|${file.updatedAt}` : "";
+}
+
+function authorMemoryRow(file, open) {
+  const row = document.createElement("li"), button = document.createElement("button");
+  const name = document.createElement("span"), folder = document.createElement("span");
+  const base = document.createElement("span"), size = document.createElement("span");
+  const time = document.createElement("span");
+  const cut = file.path.lastIndexOf("/") + 1;
+  button.type = "button";
+  button.className = "author-memory-row";
+  button.dataset.memoryPath = file.path;
+  if (open) button.setAttribute("aria-current", "true");
+  name.className = "author-memory-name";
+  folder.className = "author-memory-folder";
+  folder.textContent = file.path.slice(0, cut);
+  base.textContent = file.path.slice(cut);
+  name.append(...(cut ? [folder, base] : [base]));
+  size.className = "author-memory-size";
+  size.textContent = chatSizeText(file.bytes);
+  time.className = "author-memory-time";
+  time.textContent = authorMemoryTime(file.updatedAt);
+  button.append(name, size, time);
+  button.onclick = () => openAuthorMemoryFile(file.path);
+  row.append(button);
+  return row;
+}
+
+function renderAuthorMemory() {
+  const author = state.workflowStages?.author !== false && Boolean(state.runId);
+  if (!author) {
+    show(ui.authorMemory, false);
+    show(ui.authorMemoryOlder, false);
+    return;
+  }
+  const job = `${state.batchId || ""}:${state.runId}`;
+  if (authorMemory.job !== job) {
+    // Another job: its own files, the section closed and no file open.
+    Object.assign(authorMemory, { job, run: state.runId, listing: null, loadedAt: 0, older: false, path: "", file: null,
+      fileError: "", fileAsked: "", signature: "", opened: false, source: false, rendered: "" });
+    ui.authorMemory.open = false;
+    ui.authorMemoryFilter.value = "";
+  }
+  if (authorMemory.loading !== job && Date.now() - authorMemory.loadedAt >= (ui.authorMemory.open ? 10000 : 60000)) {
+    loadAuthorMemory(job);
+  }
+  const listing = authorMemory.listing;
+  const files = Array.isArray(listing?.files) ? listing.files : [];
+  show(ui.authorMemory, files.length > 0);
+  // A server older than this page: where the files are meanwhile, and what updating it costs a running job.
+  const older = authorMemory.older && !files.length;
+  if (older) {
+    const workspace = String(state.goalWorkspace || "").replace(/[\\/]+$/, "");
+    const separator = workspace.includes("\\") && !workspace.includes("/") ? "\\" : "/";
+    const where = workspace ? `${workspace}${separator}memory` : "the memory folder of the author's working folder";
+    const text = `Memory: this TCS Prover server cannot list the files the author keeps in its memory folder. They `
+      + `are in ${where}. To see them here, restart TCS Prover when it suits you: a running job pauses at the restart `
+      + "and continues by itself about a minute later.";
+    if (ui.authorMemoryOlder.textContent !== text) ui.authorMemoryOlder.textContent = text;
+  }
+  show(ui.authorMemoryOlder, older);
+  if (!files.length) return;
+  const newest = authorMemoryNewest(files);
+  const count = `${files.length.toLocaleString("en-US")} file${files.length === 1 ? "" : "s"} · `
+    + chatSizeText(listing.bytes)
+    + (newest ? ` · latest: ${newest.path}${authorMemoryTime(newest.updatedAt) ? `, ${authorMemoryTime(newest.updatedAt)}` : ""}` : "");
+  if (ui.authorMemoryCount.textContent !== count) ui.authorMemoryCount.textContent = count;
+  const filter = ui.authorMemoryFilter.value.trim().toLowerCase();
+  // By name (folders and files in one order, as the server lists them), or the newest change first: what the author
+  // works on now, the files of one moment by name.
+  const shown = files.filter((file) => !filter || file.path.toLowerCase().includes(filter));
+  const byName = (one, other) => (one.path < other.path ? -1 : one.path > other.path ? 1 : 0);
+  shown.sort(ui.authorMemorySort.value === "name" ? byName
+    : (one, other) => (Date.parse(other.updatedAt) || 0) - (Date.parse(one.updatedAt) || 0) || byName(one, other));
+  const note = [filter ? (shown.length ? `${shown.length.toLocaleString("en-US")} of ${files.length.toLocaleString("en-US")} `
+      + "files match." : "No file's name matches.") : "",
+  listing.truncated ? `The folder holds more than is listed here; all of it is in ${listing.folder || "the memory folder"}.`
+    : ""].filter(Boolean).join(" ");
+  if (ui.authorMemoryNote.textContent !== note) ui.authorMemoryNote.textContent = note;
+  const signature = JSON.stringify([shown.map((file) => [file.path, file.bytes, file.updatedAt]), authorMemory.path,
+    new Date().toDateString()]);
+  if (signature !== authorMemory.signature) {
+    authorMemory.signature = signature;
+    const list = ui.authorMemoryList;
+    // A row that has the focus keeps it, and the list its place.
+    const active = typeof document !== "undefined" ? document.activeElement : null;
+    const focused = list.contains?.(active) ? active.dataset?.memoryPath : "";
+    const place = list.scrollTop;
+    const rows = shown.map((file) => authorMemoryRow(file, file.path === authorMemory.path));
+    list.replaceChildren(...rows);
+    list.scrollTop = place;
+    if (focused) rows.find((row) => row.children[0].dataset.memoryPath === focused)?.children[0].focus({ preventScroll: true });
+  }
+  renderAuthorMemoryFile(listing, files);
+}
+
+// The file you opened, under the list: its name, size and last change, then its text, or why it has none.
+function renderAuthorMemoryFile(listing, files) {
+  const path = authorMemory.path;
+  show(ui.authorMemoryFile, Boolean(path));
+  if (!path) return;
+  const listed = files.find((file) => file.path === path) || null;
+  const file = authorMemory.file?.path === path ? authorMemory.file : null;
+  // Changed since it was asked for: read again, the text on screen kept meanwhile.
+  if (file && listed && authorMemoryMark(listed) !== authorMemory.fileAsked && authorMemory.fileLoading !== path) {
+    loadAuthorMemoryFile(authorMemory.job, path, authorMemoryMark(listed));
+  }
+  if (ui.authorMemoryFileName.textContent !== path) ui.authorMemoryFileName.textContent = path;
+  const known = file || listed;
+  const size = known ? chatSizeText(known.bytes) : "";
+  const meta = [size, known && authorMemoryTime(known.updatedAt) ? `changed ${authorMemoryTime(known.updatedAt)}` : "",
+    listed ? "" : "no longer in the memory folder"].filter(Boolean).join(" · ");
+  if (ui.authorMemoryFileMeta.textContent !== meta) ui.authorMemoryFileMeta.textContent = meta;
+  const text = file && !file.binary ? file.text || "" : "";
+  const note = authorMemoryNote(path) && typeof TCSMarkdown !== "undefined";
+  const rendered = Boolean(text) && note && !authorMemory.source;
+  const box = ui.authorMemoryFileText, doc = ui.authorMemoryFileDoc;
+  show(box, Boolean(text) && !rendered);
+  show(doc, rendered);
+  if (!rendered && box.textContent !== text) box.textContent = text;
+  if (rendered && authorMemory.rendered !== `${path}\n${text}`) {
+    // Rendered again only when the note changed; a note that cannot be rendered is shown as written.
+    try {
+      TCSMarkdown.render(text, doc);
+      authorMemory.rendered = `${path}\n${text}`;
+    } catch (_) {
+      authorMemory.source = true;
+      return renderAuthorMemoryFile(listing, files);
+    }
+  }
+  if (!rendered && authorMemory.rendered) {
+    if (typeof TCSMarkdown !== "undefined") TCSMarkdown.clear(doc);
+    authorMemory.rendered = "";
+  }
+  show(ui.authorMemorySource, Boolean(text) && note);
+  ui.authorMemorySource.textContent = authorMemory.source ? "Show rendered" : "Show source";
+  ui.authorMemorySource.setAttribute("aria-pressed", String(authorMemory.source));
+  // A saved batch only shows the files.
+  const download = !state.readOnly;
+  show(ui.authorMemoryDownload, download);
+  const folder = String(listing.folder || "").replace(/[\\/]+$/, "");
+  const separator = folder.includes("\\") && !folder.includes("/") ? "\\" : "/";
+  const where = folder ? `${folder}${separator}${path.split("/").join(separator)}` : `memory/${path} in the author's working folder`;
+  const shownChars = Number.isInteger(file?.chars) && file.chars > 0 ? file.chars : text.length;
+  const status = authorMemory.fileError ? authorMemory.fileError
+    : !file ? "Reading the file…"
+    : file.binary ? `This file is not text, so it is not shown here. ${download ? "Download it, or open" : "Open"} ${where}.`
+    : file.truncated ? `Showing the first ${shownChars.toLocaleString("en-US")} characters; the whole file (${size}) is `
+      + `${where}.`
+    : text ? "" : "This file is empty.";
+  if (ui.authorMemoryFileNote.textContent !== status) ui.authorMemoryFileNote.textContent = status;
+}
+
+// Read the list of files of ``job`` (the job on screen), then draw it. A read that fails leaves what is listed; the
+// next one follows as for any other.
+async function loadAuthorMemory(job) {
+  authorMemory.loading = job;
+  try {
+    const listing = await request(jobPath("/memory-files", {}, authorMemory.run));
+    if (authorMemory.job === job) Object.assign(authorMemory, { listing, older: false });
+  } catch (error) {
+    // Nothing new to show; a server from before this list answers that it has no such route.
+    if (authorMemory.job === job) authorMemory.older = error?.status === 404 && error.message === "Not found.";
+  } finally {
+    if (authorMemory.loading === job) authorMemory.loading = "";
+    if (authorMemory.job === job) authorMemory.loadedAt = Date.now();
+  }
+  if (authorMemory.job === job && job === `${state.batchId || ""}:${state.runId}`) {
+    renderAuthorMemory();
+    openNewestAuthorMemoryNote();
+  }
+}
+
+// Read the file ``path`` of ``job``, which the list gave the size and change time ``mark``, then draw it.
+async function loadAuthorMemoryFile(job, path, mark) {
+  const open = () => authorMemory.job === job && authorMemory.path === path;
+  authorMemory.fileLoading = path;
+  authorMemory.fileAsked = mark;
+  try {
+    const file = await request(jobPath("/memory-file", { path }, authorMemory.run));
+    if (open()) Object.assign(authorMemory, { file, fileError: "" });
+  } catch (error) {
+    if (open()) authorMemory.fileError = error.message;
+  } finally {
+    if (authorMemory.fileLoading === path) authorMemory.fileLoading = "";
+  }
+  if (open()) renderAuthorMemory();
+}
+
+// ``focus``: move the focus to the file's name (a file you click); the newest note that opens with the section
+// leaves the focus on the section's line.
+function openAuthorMemoryFile(path, focus = true) {
+  const listed = authorMemory.listing?.files?.find((file) => file.path === path);
+  Object.assign(authorMemory, { path, file: null, fileError: "", signature: "", source: false });
+  loadAuthorMemoryFile(authorMemory.job, path, authorMemoryMark(listed));
+  renderAuthorMemory();
+  // The file opens at its start, in view, and is announced by its name.
+  ui.authorMemoryFileText.scrollTop = 0;
+  ui.authorMemoryFileDoc.scrollTop = 0;
+  if (!focus) return;
+  ui.authorMemoryFile.scrollIntoView?.({ block: "nearest" });
+  ui.authorMemoryFileName.focus?.({ preventScroll: true });
+}
+
+// The first time the section opens for a job, the note changed last opens with it (once the list is read).
+function openNewestAuthorMemoryNote() {
+  if (!ui.authorMemory.open || authorMemory.opened || authorMemory.path) return;
+  const newest = authorMemoryNewest(Array.isArray(authorMemory.listing?.files) ? authorMemory.listing.files : []);
+  if (!newest) return;
+  authorMemory.opened = true;
+  openAuthorMemoryFile(newest.path, false);
+}
+
+// Opening the section reads the list at once when it is older than 2 seconds.
+ui.authorMemory.ontoggle = () => {
+  if (ui.authorMemory.open && Date.now() - authorMemory.loadedAt > 2000) authorMemory.loadedAt = 0;
+  renderAuthorMemory();
+  openNewestAuthorMemoryNote();
+};
+ui.authorMemorySource.onclick = () => {
+  authorMemory.source = !authorMemory.source;
+  renderAuthorMemory();
+};
+ui.authorMemoryFilter.oninput = ui.authorMemorySort.onchange = () => renderAuthorMemory();
+ui.authorMemoryDownload.onclick = () => {
+  const path = authorMemory.path;
+  if (path) downloadArtifact(ui.authorMemoryDownload, "", path.split("/").at(-1), "/memory-file/download", { path });
+};
+ui.authorMemoryClose.onclick = () => {
+  const path = authorMemory.path;
+  Object.assign(authorMemory, { path: "", file: null, fileError: "", fileAsked: "", signature: "" });
+  renderAuthorMemory();
+  // Back to the row it was opened from.
+  [...(ui.authorMemoryList.children || [])].find((row) => row.children?.[0]?.dataset?.memoryPath === path)
+    ?.children[0].focus?.({ preventScroll: true });
+};
 
 // The running author's open question (state.authorQuestion; the server closes it by its rules), in its row
 // of the chat: each question with its options, the first preselected, and a field whose text replaces the
@@ -6203,7 +6651,6 @@ async function sendFolderBatch(chosen) {
       history.pushState(null, "", batchUrl(currentBatch));
       renderBatchNavigation();
       renderJobs(result.jobs || []);
-      if (typeof renderBatchRelatedWorks === "function") renderBatchRelatedWorks(result.jobs || []);
     }
     // The result sits at the top of the batch list (or of the job page that started the run).
     ui.batchStatus.scrollIntoView({ block: "nearest", behavior: "smooth" });
@@ -6409,6 +6856,8 @@ ui.sendAuthorSteer.onclick = async () => {
   const legacy = typeof chatControl === "function" ? chatControl().legacy : "";
   chatSending = true;
   ui.sendAuthorSteer.disabled = true;
+  // Until the server has the message, the button says so; the chat then lists it as under way.
+  ui.sendAuthorSteerText.textContent = "Sending…";
   try {
     const sent = await (legacy === "steer" ? act("/steer-author", { instruction: text })
       : legacy === "ask" ? act("/ask-author", { text }) : act("/chat", { text }));
@@ -6423,6 +6872,7 @@ ui.sendAuthorSteer.onclick = async () => {
     }
   } finally {
     chatSending = false;
+    ui.sendAuthorSteerText.textContent = "Send";
     renderChatSend();
   }
 };
@@ -6665,9 +7115,9 @@ if (composerFooter && "ResizeObserver" in window) {
 }
 
 // Related works on the run page and on the batch page. A file uploads in its own request (with the
-// launch token, outside request()); one request then adds every staged upload to the job, or to a
-// folder run's store, which the server links into each job of the run. Uploads that end up unused
-// are discarded at once.
+// launch token, outside request()); one request then adds every staged upload to the job, or to the
+// batch's shared works, which the server links into each problem of the batch. Uploads that end up
+// unused are discarded at once.
 function setNoteForm(form, button, open) {
   show(form, open);
   button?.setAttribute("aria-expanded", String(open));
@@ -6766,172 +7216,6 @@ async function addRelatedNote() {
     }
   } finally {
     setRelatedWorksBusy(false);
-  }
-}
-
-// The batch page: one group per folder run of this batch (each /jobs row names its folderBatch) whose jobs can
-// still take related works, with what the store holds (GET /batch-related-works, read again every 10
-// seconds while the page polls, every minute while the store takes none) and Add files… and Add a note
-// for every job of that run. A finished folder run is not listed: its jobs list their related works on
-// their own pages.
-const batchRelated = { jobs: [], listings: new Map(), target: "", busy: false, signature: "" };
-
-function folderRunText(members) {
-  const names = members.map((job) => job.sourceFile || job.title || job.runId);
-  return `${members.length} problem${members.length === 1 ? "" : "s"}: `
-    + (names.length > 4 ? `${names.slice(0, 4).join(", ")} and ${names.length - 4} more` : names.join(", "));
-}
-
-async function loadBatchListing(id, force = false) {
-  const entry = batchRelated.listings.get(id) || {};
-  const wait = entry.listing && !entry.listing.available ? 60000 : 10000;
-  if (entry.loading || (!force && Date.now() - (entry.loadedAt || 0) < wait)) return;
-  batchRelated.listings.set(id, { ...entry, loading: true });
-  let next;
-  try {
-    next = { listing: await request(`/batch-related-works?batch=${encodeURIComponent(id)}`), loadedAt: Date.now() };
-  } catch (error) {
-    next = { listing: entry.listing, error: error.message, loadedAt: Date.now() };
-  }
-  batchRelated.listings.set(id, next);
-  renderBatchRelatedWorks();
-}
-
-function batchRelatedGroup(id, members) {
-  const { listing, error } = batchRelated.listings.get(id);
-  const run = folderRunText(members);
-  const group = document.createElement("li"), head = document.createElement("div");
-  const title = document.createElement("strong"), count = document.createElement("span");
-  const about = document.createElement("p"), actions = document.createElement("div");
-  const files = document.createElement("button"), note = document.createElement("button");
-  group.className = "batch-related-group";
-  group.dataset.batch = id;
-  head.className = "batch-related-head";
-  title.textContent = "Folder run";
-  count.className = "chip";
-  count.textContent = relatedWorksCount(Number(listing.count || 0));
-  head.append(title, count);
-  about.className = "help";
-  about.textContent = [run, error].filter(Boolean).join(". ");
-  group.append(head, about);
-  if (listing.items?.length) {
-    const list = document.createElement("ul");
-    list.className = "related-works-list";
-    list.append(...listing.items.map((item) => relatedWorkRow(item)));
-    group.append(list);
-  }
-  actions.className = "related-works-actions";
-  files.type = note.type = "button";
-  files.className = "secondary compact";
-  files.textContent = "Add files…";
-  files.setAttribute("aria-label", `Add files for every job of the folder run of ${run}`);
-  note.className = "ghost compact";
-  note.textContent = "Add a note";
-  note.setAttribute("aria-controls", "batchNoteForm");
-  note.setAttribute("aria-label", `Add a note for every job of the folder run of ${run}`);
-  files.disabled = note.disabled = batchRelated.busy;
-  files.onclick = () => {
-    batchRelated.target = id;
-    ui.batchRelatedFiles.value = "";
-    ui.batchRelatedFiles.click();
-  };
-  note.onclick = () => {
-    batchRelated.target = id;
-    ui.batchNoteTarget.textContent = `For every job of the folder run of ${run}.`;
-    setNoteForm(ui.batchNoteForm, null, true);
-  };
-  actions.append(files, note);
-  group.append(actions);
-  return group;
-}
-
-// Called with the batch page's /jobs rows; without folder runs (or on a saved batch) it only hides.
-function renderBatchRelatedWorks(jobs = batchRelated.jobs) {
-  batchRelated.jobs = jobs;
-  const runs = new Map();
-  for (const job of selectedBatch()?.readOnly ? [] : jobs) {
-    if (job.folderBatch) runs.set(job.folderBatch, [...(runs.get(job.folderBatch) || []), job]);
-  }
-  // Only a folder run with a job that has not finished can take related works: only those are read.
-  const live = [...runs].filter(([, members]) => members.some((job) => job.phase !== "done"));
-  for (const [id] of live) loadBatchListing(id);
-  const shown = live.filter(([id]) => batchRelated.listings.get(id)?.listing?.available);
-  show(ui.batchRelatedWorks, shown.length > 0);
-  if (!shown.some(([id]) => id === batchRelated.target)) setNoteForm(ui.batchNoteForm, null, false);
-  const signature = JSON.stringify([shown.map(([id, members]) => [id, folderRunText(members),
-    batchRelated.listings.get(id)?.listing || null, batchRelated.listings.get(id)?.error || ""]), batchRelated.busy]);
-  if (signature === batchRelated.signature) return;
-  batchRelated.signature = signature;
-  ui.batchRelatedGroups.replaceChildren(...shown.map(([id, members]) => batchRelatedGroup(id, members)));
-}
-
-function setBatchRelatedBusy(busy) {
-  batchRelated.busy = busy;
-  ui.batchSaveNote.disabled = busy;
-  batchRelated.signature = "";
-  renderBatchRelatedWorks();
-}
-
-// Adds staged uploads to a folder run's store; the reply is the store's new listing.
-async function addToBatch(id, tokens) {
-  const listing = await request(`/batch-related-works/add?batch=${encodeURIComponent(id)}`, { uploads: tokens });
-  batchRelated.listings.set(id, { listing, loadedAt: Date.now() });
-  return listing;
-}
-
-async function addBatchRelatedFiles(files) {
-  const chosen = [...(files || [])], id = batchRelated.target;
-  if (!chosen.length || !id || batchRelated.busy) return;
-  const batch = currentBatch, here = () => batch === currentBatch && !currentJob;
-  setBatchRelatedBusy(true);
-  let text = "";
-  try {
-    const { tokens, problems } = await stageRelatedFiles(chosen,
-      (line) => { if (here()) ui.batchRelatedStatus.textContent = line; }, here);
-    let added = "";
-    if (tokens.length) {
-      try {
-        const listing = await addToBatch(id, tokens);
-        added = `Added ${relatedWorksCount(tokens.length)} to the folder run.${listing.notice ? ` ${listing.notice}` : ""}`;
-      } catch (error) {
-        tokens.forEach(discardUpload);
-        added = error.message;
-      }
-    }
-    text = [added, ...problems].filter(Boolean).join(" ");
-  } finally {
-    setBatchRelatedBusy(false);
-    if (here()) ui.batchRelatedStatus.textContent = text;
-  }
-}
-
-async function addBatchNote() {
-  const id = batchRelated.target, title = ui.batchNoteTitle.value.trim(), text = ui.batchNoteText.value;
-  if (!id || batchRelated.busy) return;
-  if (!text.trim()) {
-    ui.batchRelatedStatus.textContent = "Enter the note's text.";
-    ui.batchNoteText.focus();
-    return;
-  }
-  setBatchRelatedBusy(true);
-  ui.batchRelatedStatus.textContent = "Adding the note…";
-  let status = "";
-  try {
-    const token = (await request("/uploads/note", { title, text })).upload?.token;
-    try {
-      const listing = await addToBatch(id, [token]);
-      status = `Added ${relatedWorksCount(1)} to the folder run.${listing.notice ? ` ${listing.notice}` : ""}`;
-      ui.batchNoteTitle.value = ui.batchNoteText.value = "";
-      setNoteForm(ui.batchNoteForm, null, false);
-    } catch (error) {
-      discardUpload(token);
-      status = error.message;
-    }
-  } catch (error) {
-    status = error.message;
-  } finally {
-    setBatchRelatedBusy(false);
-    ui.batchRelatedStatus.textContent = status;
   }
 }
 
@@ -7124,9 +7408,6 @@ ui.relatedFilesInput.onchange = () => addRelatedFiles(ui.relatedFilesInput.files
 ui.addRelatedNote.onclick = () => setNoteForm(ui.relatedNoteForm, ui.addRelatedNote, ui.relatedNoteForm.hidden);
 ui.saveRelatedNote.onclick = addRelatedNote;
 ui.cancelRelatedNote.onclick = () => setNoteForm(ui.relatedNoteForm, ui.addRelatedNote, false);
-ui.batchRelatedFiles.onchange = () => addBatchRelatedFiles(ui.batchRelatedFiles.files);
-ui.batchSaveNote.onclick = addBatchNote;
-ui.batchCancelNote.onclick = () => setNoteForm(ui.batchNoteForm, null, false);
 ui.batchSharedAddFiles.onclick = () => {
   ui.batchSharedFiles.value = "";
   ui.batchSharedFiles.click();
@@ -7320,10 +7601,11 @@ function apiModelRow(connection) {
   }
   item.append(glyph, copy, format, status, actions);
   if (test && !test.ok) item.append(apiElement("p", "api-test-result error", apiTestText(test)));
-  // Its last Test reached the models but not with TCS Prover's team tools (a coordinator could not use its team), or
-  // could not tell (ok null: the answer said nothing about them).
+  // Its last Test reached the models but not with TCS Prover's tools (an author could not end its goal with
+  // update_goal), or could not tell (ok null: the answer said nothing about them).
   else if (test?.teamTools && test.teamTools.ok !== true) {
-    item.append(apiElement("p", "api-test-warning", test.teamTools.message || "Team tools did not reach the model."));
+    item.append(apiElement("p", "api-test-warning",
+      test.teamTools.message || "TCS Prover's tools did not reach the model."));
   }
   return item;
 }
@@ -7536,8 +7818,8 @@ async function testApiForm() {
   setApiBusy(false); renderApiForm(); renderApiModels(); restoreApiFocus(apiUi.test);
   if (edits !== apiFormEdits) return showApiResult("stale", "Connection details changed", "Test this connection again.");
   if (keyRequired) askApiKey();
-  // An OpenAI-format connection's Test also sends a request shaped as runs send TCS Prover's team tools
-  // (result.teamTools): its sentence follows, as a warning when they do not reach the model.
+  // An OpenAI-format connection's Test also sends a request shaped as runs send TCS Prover's tools (update_goal;
+  // result.teamTools): its sentence follows, as a warning when they do not reach the model.
   const team = result?.ok && result.teamTools ? result.teamTools : null;
   showApiResult(result?.ok ? "ok" : "error", result ? apiTestText(result) : "Connection failed",
     result?.ok ? [result.message, team?.ok ? team.message : ""].filter(Boolean).join(" ") : failure,
@@ -8694,9 +8976,9 @@ function setupModelRow(catalog, role, model, on, label = "") {
     signIn: provider === "codex" || provider === "claude", connection: provider === "api" ? row?.sourceLabel || "" : "" };
 }
 
-// A role's name in Setup's sentences ("Proof author"), or an author subagent's ("Author subagent 2").
+// A role's name in Setup's sentences ("Proof author").
 function setupRoleName(row) {
-  return setupWords().roles[row.role] || (row.member ? `Author subagent ${row.member}` : String(row.role));
+  return setupWords().roles[row.role] || String(row.role);
 }
 
 // Per program, what uses it now: the New problem roles (the form in this tab while it is open, else your Default
@@ -8767,12 +9049,7 @@ function setupRoleGroups(rows) {
   }
   return [...groups.values()].map((members) => {
     const row = members[0];
-    // The four roles, then the author subagents of the same model by number ("Author subagents 1, 3").
-    const roles = members.filter((item) => !item.member), team = members.filter((item) => item.member);
-    const subagents = team.length > 1 ? `Author subagents ${team.map((item) => item.member).join(", ")}`
-      : team.length ? setupRoleName(team[0]) : "";
-    const names = setupJoin([...(roles.length === 4 ? ["all four roles"] : roles.map(setupRoleName)),
-      ...(subagents ? [subagents] : [])]);
+    const names = members.length === 4 ? "all four roles" : setupJoin(members.map(setupRoleName));
     return row.signIn ? `${names} (${row.modelLabel})`
       : `${names} (API connection “${row.connection || row.modelLabel}”, no sign-in needed)`;
   }).join("; ");
@@ -8878,7 +9155,7 @@ function renderSetupHints() {
   const needs = setupNeeds(), words = setupWords();
   const roleNames = (rows) => `the ${setupJoin(rows.map((row) => setupRoleName(row).toLowerCase()))
     .replace("latex writer", "LaTeX writer")}`;
-  // Each sentence with the form's rows it is about: a role's, or an author subagent's (row.member).
+  // Each sentence with the form's role rows it is about.
   const sentences = !needs.codex.form ? [] : setupProblems(needs).flatMap((problem) => {
     if (problem.kind === "none") return [];  // A role that uses a program gets that program's own line instead.
     const need = needs[problem.program], info = setupStore().data.programs[problem.program], name = words.the[problem.program];
@@ -8902,15 +9179,8 @@ function renderSetupHints() {
       ? `${name} is not installed on this computer; ${roleNames(need.roles)} ${verb} it.`
       : `${name} does not run on this computer; ${roleNames(need.roles)} ${verb} it.` }];
   });
-  // Beside Start: a role's model call is retried every minute once the job runs; an author subagent's assignment is
-  // not, as a missing program, login or model is no failure a retry helps: it comes back to the coordinator.
-  const rows = sentences.flatMap((sentence) => sentence.rows);
-  const roles = rows.some((row) => !row.member);
-  const members = [...new Set(rows.filter((row) => row.member).map((row) => row.member))].sort((a, b) => a - b);
-  const assignments = members.length ? `the coordinator's assignments to author subagent${members.length === 1 ? "" : "s"} `
-    + `${setupJoin(members.map(String))} fail and come back to it with the reason` : "";
-  const start = roles ? ` You can start now: the job retries every minute until it works${assignments
-    ? `, and until then ${assignments}` : ""}.` : assignments ? ` You can start now, but until this is fixed ${assignments}.` : "";
+  // Beside Start: a role's model call is retried every minute once the job runs.
+  const start = sentences.length ? " You can start now: the job retries every minute until it works." : "";
   for (const [element, extra] of [[els.modelHint, ""], [els.startHint, start]]) {
     if (!element) continue;
     const text = sentences.length ? `${sentences.map((sentence) => sentence.text).join(" ")}${extra}` : "";
@@ -9998,7 +10268,7 @@ function applyPreset(preset) {
   const missing = [], roles = ["review", "author", "critic", "writer"];
   for (const role of roles) {
     const model = String(settings[`${role}Model`] || "");
-    const listed = (preset.unavailable || []).find((item) => item.role === role && !item.member);
+    const listed = (preset.unavailable || []).find((item) => item.role === role);
     const gone = listed || (model.startsWith("api:") && Array.isArray(catalog) && !catalog.some((row) => row.id === model));
     if (!gone) continue;
     settings[`${role}Model`] = "gpt-6.2-sol";
@@ -11318,7 +11588,8 @@ async function refreshCall(id) {
   }
 }
 
-// The roles the filter groups: the author's own turns, its team's and subagents' calls, and the critics'.
+// The roles the filter groups: the author's own turns, its examiner's and subagents' calls, and the critics' (a job
+// that ran in coordinator mode records "coordinator" for its author and "member" for its team).
 const CALL_GROUPS = {
   author: ["author", "coordinator", "reply", "summary"],
   members: ["member", "subagent"],
@@ -11477,7 +11748,7 @@ function renderCallsHead() {
 function renderCallsList() {
   const store = callsStore(), els = callsEls();
   const shown = callsShown();
-  // The author group's button names the coordinator when the job has one.
+  // The author group's button names the coordinator of a job that ran in coordinator mode.
   const coordinator = store.rows.some((row) => row.role === "coordinator");
   for (const button of els.filter.querySelectorAll("[data-calls]")) {
     const key = button.dataset.calls;

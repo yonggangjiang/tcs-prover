@@ -90,47 +90,26 @@ _GOAL_LIFECYCLE = ("goal", "continuation", "compaction", "repair", "resume")
 # controller refused its last submission, the note on the subagents it may
 # start, and the note that tells it of its examiner (appended to the first
 # prompt while the run's examiner is on).
-_GOAL_OPTIONAL_LIFECYCLE = ("pause", "reopen", "summary", "conversation", "chat", "related_works", "handoff_refused",
-                            "subagents", "examiner_note")
-# The lifecycle prompts a goal node's coordinator binding may replace (the author coordinator, see author_mode()),
-# and "report", the answer to a reply that is not a hand-in (the continuation when absent), which only a
-# coordinator binding has. The chat framing (rendered by the controller) and the subagents note of an author that
-# works alone stay the author's.
-_COORDINATOR_LIFECYCLE = (*_GOAL_LIFECYCLE, "reopen", "summary", "conversation", "related_works", "handoff_refused",
-                          "report")
-# How the proof author works (--author-mode): "coordinator" runs the node's coordinator binding, "author" the author
-# alone; "auto", the default, runs the coordinator when Author subagents is 1 or more.
-AUTHOR_MODES = ("auto", "coordinator", "author")
-# Who runs the goal loop of a Codex author or coordinator (--goal-loop): "tcs", the command line's default, TCS
-# Prover itself (it starts every turn and the model ends its goal with TCS Prover's update_goal tool, see
-# goal_session()); "codex", Codex's built-in goal mode, which every job from before keeps. Claude Code authors always
-# run TCS Prover's loop. Options without the setting (a caller that does not choose) run "codex", as before.
+_GOAL_OPTIONAL_LIFECYCLE = ("pause", "reopen", "new_goal", "summary", "conversation", "chat", "related_works",
+                            "handoff_refused", "subagents", "examiner_note")
+# Who runs the goal loop of a Codex author (--goal-loop): "tcs", the command line's default, TCS Prover itself (it
+# starts every turn and the model ends its goal with TCS Prover's update_goal tool, see goal_session()); "codex",
+# Codex's built-in goal mode, which every job from before keeps. Claude Code authors always run TCS Prover's loop.
+# Options without the setting (a caller that does not choose) run "codex", as before.
 GOAL_LOOPS = ("tcs", "codex")
-# Who are the author coordinator's subagents (--author-team): "tcs", the command line's default, TCS Prover's team
-# (runner/team.py, its tools through TCS Prover's MCP server); "builtin", the CLI's own subagent tool, which jobs
-# from before and web-cutoff runs keep. Options without the setting run "builtin", as before.
-AUTHOR_TEAMS = ("tcs", "builtin")
 # TCS Prover's own texts in the workflow's prompts that no node binds (the goal loop, update_goal, Claude Code's
-# goal note, Codex's compaction summary, the note for a Codex coordinator, the team), with the placeholders each
-# may use; None: used as written.
+# goal note, Codex's compaction summary, the author's examiner), with the placeholders each may use; None: used as
+# written.
 HARNESS_TEXTS = {
     "goal_continuation": {"continuation", "objective", "elapsed", "limit"},
     "goal_tool_update_goal": None, "goal_tool_update_goal_status": None, "goal_tool_update_goal_note": None,
     "claude_goal_harness": {"objective"},
-    "codex_compact_prompt": None, "codex_coordinator_note": None,
-    "team_note": {"members"}, "team_member": {"assignment"},
-    "team_examiner": None, "team_examiner_note": None,
+    "codex_compact_prompt": None,
     "author_examiner": None, "author_examiner_report": {"report"},
-    "team_tool_members": None, "team_tool_assign": None, "team_tool_assign_member": None,
-    "team_tool_assign_assignment": None, "team_tool_wait": None, "team_tool_wait_timeout_minutes": None,
-    "team_tool_followup": None, "team_tool_followup_member": None, "team_tool_followup_message": None,
-    "team_tool_stop": None, "team_tool_stop_member": None,
 }
-# The prompts that may be empty: Codex's compact_prompt (empty: Codex's own summary instructions), the note for
-# a Codex coordinator (empty: none is sent), the examiner's instruction and what the coordinator is told of it
-# (no instruction: the team has no examiner), and a lone author's examiner (empty: none).
-EMPTY_ALLOWED_PROMPTS = ("codex_compact_prompt", "codex_coordinator_note", "team_examiner", "team_examiner_note",
-                         "author_examiner")
+# The prompts that may be empty: Codex's compact_prompt (empty: Codex's own summary instructions) and the author's
+# examiner (empty: none).
+EMPTY_ALLOWED_PROMPTS = ("codex_compact_prompt", "author_examiner")
 _GOAL_STAGES = {"initial": "solve", "resume": "repair", "failure": "failure"}
 # Where TCS Prover cannot read the author's proof file safely (Windows; see
 # proof_handoff.file_handoff_supported()), the runner adds this note after the
@@ -261,41 +240,10 @@ AUTHOR_RESUME_REFUSALS = 3
 # turn, or after this long.
 STEER_RETRY_SECONDS = 60
 
-# The author coordinator (see author_mode()). The runner creates MEMORY_FOLDER
-# in its working directory, where its prompt asks it to keep the team's memory
-# and the dated log PROGRESS_LOG, which the job page shows. TCS Prover sends it
-# nothing on a schedule: what it examines, and when, is its prompt's business.
-# A final reply that names no proof file
-# is not handed to the critic: its first COORDINATOR_REPORT_CHARS characters
-# are shown as a "Coordinator report" status (the whole reply stays in the
-# activity log as the coordinator's message), and the coordinator continues.
+# The memory folder that the author's prompt asks it to keep in its working directory, and the progress log in it,
+# which the job page reads (ui/server.py). TCS Prover creates neither: the author makes its memory folder when it
+# first writes there.
 MEMORY_FOLDER = "memory"
-PROGRESS_LOG = "progress.md"
-COORDINATOR_REPORT_CHARS = 1600
-# The status of a time check, which jobs from before 15 Nov 2026 have in their transcripts (none is sent now).
-COORDINATOR_CHECKIN_LABEL = "Coordinator time check"
-COORDINATOR_REPORT_LABEL = "Coordinator report"
-# A coordinator that cannot use TCS Prover's team fails loudly without stopping the run (CoordinatorWatch): its
-# job is listed under Needs your attention (ui/server.py App.attention()) while the work goes on, when the
-# coordinator with TCS Prover's team makes COORDINATOR_TEAMLESS_CALLS model calls, or works
-# COORDINATOR_TEAMLESS_SECONDS (not counting a team call that runs), without any team call; when Codex refuses a team
-# tool call ("unsupported call", also for a tool name the server does not list); and when a coordinator under TCS
-# Prover's goal loop ends COORDINATOR_UNTAKEN_HANDINS turns with a reply that names the proof file while its goal
-# stays incomplete (no update_goal "complete": the reply is not handed in). Each warning is a pinned diagnostic
-# (coordinatorWarning, its kind in COORDINATOR_WARNINGS) and stays listed until a status with
-# coordinatorWarningCleared ends it: the next team call, the next team call that reaches TCS Prover, the next
-# hand-in. A coordinator one of whose team calls has already worked has its team tools, so its "teamless" warning
-# names what it does instead: while a member works on an assignment, it checks on its members between team calls
-# (COORDINATOR_CHECKING_LABEL; seen in real runs of 14 Nov 2026: Codex's sleep tool, then a script reading a
-# member's transcript, again and again) instead of waiting with team_wait; while no member works, it does the work
-# itself instead of giving it to a member.
-COORDINATOR_TEAMLESS_CALLS = 10
-COORDINATOR_TEAMLESS_SECONDS = 20 * 60
-COORDINATOR_UNTAKEN_HANDINS = 3
-COORDINATOR_WARNINGS = {"teamless": "Coordinator works without its team", "refused": "Team tool call refused",
-                        "handin": "Proof not handed in"}
-COORDINATOR_CHECKING_LABEL = "Coordinator keeps checking on its team instead of waiting"
-COORDINATOR_WARNING_CLEARED_LABEL = "Coordinator warning cleared"
 # The status records of the author's own subagents (see AuthorSubagents), by
 # state; a started record names the first line of the subagent's assignment,
 # at most AUTHOR_SUBAGENT_TASK_CHARS characters of it.
@@ -981,9 +929,8 @@ def context_cache_arguments():
     ]
 
 
-# The per-job prompts a launch passes as --<role>-prompt-file, and the workflow prompt each replaces (the
-# coordinator's is the first prompt of the author coordinator, see author_mode()).
-PROMPT_FILE_OPTIONS = {"author": "author", "critic": "critic", "final": "final", "coordinator": "coordinator"}
+# The per-job prompts a launch passes as --<role>-prompt-file, and the workflow prompt each replaces.
+PROMPT_FILE_OPTIONS = {"author": "author", "critic": "critic", "final": "final"}
 
 
 def prompt_file(path, default):
@@ -1003,25 +950,6 @@ def prompt_set(path):
                                               for name, text in value.items()):
         raise Error(f"The job's saved prompts {path} must map prompt names to text.")
     return value
-
-
-def author_subagent_models(value):
-    """The coordinator team's models (--author-subagent-models): a JSON list of {"model", "effort"}, or None.
-
-    The number of entries is checked against Author subagents when the team starts (team.validated_team()).
-    """
-
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except ValueError as exc:
-            raise argparse.ArgumentTypeError("Give the subagent models as a JSON list.") from exc
-    if value is None:
-        return None
-    try:
-        return team_module.validated_team(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 # The program each CLI is, as the source menus name it: in a title ("Claude Code missing or
@@ -2357,7 +2285,7 @@ def _confined_call(writable, model, environment, policy, workspace, live=None):
         finally:
             retrieval_runtime.remove_private_temp(policy, environment)
         return
-    # A team member's run passes the network rule of the author's working folder (``live``).
+    # The examiner's run passes the network rule of the author's working folder (``live``).
     live = live_network() if live is None else live
     flags = private_permission_arguments(
         ":workspace" if writable else ":read-only", model, codex_home=(environment or {}).get("CODEX_HOME"),
@@ -2512,22 +2440,6 @@ def output_schema_arguments(model, schema_path):
 # same number.
 SUBAGENT_HINT = ("Multi-agent delegation is allowed for this task: the root agent may start up to {count} independent "
                  "subagent{s} at a time without asking the user. Subagents do not start subagents of their own.")
-# The delegation hint of the author coordinator's Codex app-server (author_limits()), in place of SUBAGENT_HINT;
-# the critic keeps SUBAGENT_HINT.
-COORDINATOR_HINT = ("Multi-agent delegation is the purpose of this task: the root agent is a coordinator that hands "
-                    "the problem-solving to up to {count} subagent{s} at a time without asking the user, and waiting "
-                    "for them is part of its normal work. Start each subagent fresh, without the root's conversation "
-                    "history (set spawn_agent's fork_turns to \"none\", or fork_context to false, where the option "
-                    "exists), with a self-contained assignment; wait for subagents with waits of up to 30 minutes; "
-                    "where close_agent exists, close each finished subagent after recording its outcome. Subagents do "
-                    "not start subagents of their own.")
-# How long a wait for its subagents lasts when the coordinator names no timeout (Codex's own default is 30 s):
-# features.multi_agent_v2.default_wait_timeout_ms, which models of multi-agent version 2 read (Codex 0.160 has the
-# key; version 1 has no such setting). A web-cutoff run does not set it: its audit compares the app-server's
-# agent settings with Codex's effective settings (config/read) exactly, and whether Codex reports this key there
-# has not been verified, so a web-cutoff coordinator waits Codex's default unless it names a longer wait, as
-# its hint (COORDINATOR_HINT) asks.
-COORDINATOR_WAIT_MS = 30 * 60 * 1000
 
 
 # Codex 0.160's multi-agent version of each model (`codex debug models`, checked with its binary against a local
@@ -2561,30 +2473,18 @@ def note_unobservable_subagents(stage, model, count, policy):
               "and whether one of their model calls failed, is not known, so the critic's answer is used as given.")
 
 
-def note_no_subagent_tool(stage, model, count, coordinator=False, bare=False):
-    """Say that ``model`` works without the ``count`` subagents its setting allows, when Codex gives it none.
+def note_no_subagent_tool(stage, model, count):
+    """Say that ``model`` works without the ``count`` subagents its setting allows, when Codex gives it none."""
 
-    With ``coordinator`` the author was to coordinate them and works alone instead (see _execute): the status
-    then says so as the author mode the run has (authorModeEffective "author", with the model's label), which
-    the server shows in place of the job's recorded coordinator mode until a later launch coordinates (see
-    goal_session()). With ``bare`` the cause is Claude Code's --bare mode, which offers no subagent tool
-    (claude_cli.goal_session()).
-    """
-
-    if not count or (not bare and multi_agent_version(model) != 0):
+    if not count or multi_agent_version(model) != 0:
         return
     s = "" if count == 1 else "s"
     who = (f"the critic reviews alone, without its {count} independent critic{s}" if stage == "critic"
-           else f"the author works alone instead of coordinating up to {count} author subagent{s}"
-           if stage == "solve" and coordinator
            else f"the author works without the {count} subagent{s} that Author subagents allows" if stage == "solve"
            else f"this step works without the {count} subagent{s} it may start")
     label = providers.model_label(chosen_model(model))
-    cause = (f"Claude Code runs {label} in --bare mode here, which offers no subagent tool" if bare
-             else f"{label} gets no subagent tool from Codex")
     emit("status", stage, label="No subagents with this model", noSubagentTool=True, subagentCount=count,
-         **({"authorModeEffective": "author", "modelLabel": label} if coordinator and stage == "solve" else {}),
-         text=f"{cause}, so {who}." + ("" if bare else " Choose another model to have them."))
+         text=f"{label} gets no subagent tool from Codex, so {who}. Choose another model to have them.")
 
 
 NO_WEB_SEARCH_LABEL = "No web search"
@@ -2670,10 +2570,9 @@ def failed_search_text(count, model):
             "error and may search again.")
 
 
-def note_no_web_search(stage, node, model, members=(), *, coordinator=False, directory=None):
-    """Warn once, as the author's run starts, when its search is live but Codex gives the author's ``model``, or a
-    team member's (``members``, team.team_members()), no web search tool on the connection it runs through
-    (codex_web_search_tool()); the run goes on without it. Each such model is named once, with who runs it. A pinned
+def note_no_web_search(stage, node, model, *, directory=None):
+    """Warn once, as the author's run starts, when its search is live but Codex gives the author's ``model`` no web
+    search tool on the connection it runs through (codex_web_search_tool()); the run goes on without it. A pinned
     diagnostic, shown like the job's other warnings. The provider's settings are not changed here."""
 
     try:
@@ -2681,60 +2580,29 @@ def note_no_web_search(stage, node, model, members=(), *, coordinator=False, dir
             return
     except Error:
         return  # The launch itself says what is wrong with the run's search settings.
-    users = {}  # Each model without search: whether the author runs it, and the members that do.
-    for chosen, number in ((model, None), *((member["model"], member["member"]) for member in members)):
-        if codex_web_search_tool(chosen) is False:
-            entry = users.setdefault(chosen, {"author": False, "members": []})
-            if number is None:
-                entry["author"] = True
-            else:
-                entry["members"].append(number)
-    if not users:
+    if codex_web_search_tool(model) is not False:
         return
-
-    def runs(entry):
-        roles = [f"the {'author coordinator' if coordinator else 'proof author'}"] if entry["author"] else []
-        numbers = [str(number) for number in entry["members"]]
-        if numbers:
-            listed = ", ".join(numbers[:-1]) + " and " + numbers[-1] if len(numbers) > 1 else numbers[0]
-            roles.append(f"author subagent{'s' if len(numbers) > 1 else ''} {listed}")
-        return (f"{roles[0]}'s model" if entry["author"] + len(entry["members"]) == 1
-                else f"the model of {' and '.join(roles)}")
-
-    named = [(runs(entry), team_module.member_description(chosen)) for chosen, entry in users.items()]
-    if len(named) == 1:
-        whose, found = named[0]
-        start = f"{whose} has no web search on its connection: {found['modelLabel']} ({found['program']})"
-    else:
-        start = "these models have no web search on their connection: " + "; ".join(
-            f"{whose}, {found['modelLabel']} ({found['program']})" for whose, found in named)
-    which = "this model" if len(named) == 1 else "these models"
-    emit("diagnostic", stage, node=node, label=NO_WEB_SEARCH_LABEL, noWebSearch=True,
-         models=[found["modelLabel"] for _, found in named],
-         text=f"Web search is on for this job, but {start}. Codex gives {which} no search tool through an API "
+    found = team_module.member_description(model)
+    emit("diagnostic", stage, node=node, label=NO_WEB_SEARCH_LABEL, noWebSearch=True, models=[found["modelLabel"]],
+         text=f"Web search is on for this job, but the proof author's model has no web search on its connection: "
+              f"{found['modelLabel']} ({found['program']}). Codex gives this model no search tool through an API "
               f"connection, and web search only through its built-in OpenAI provider (the Codex CLI source). The run "
               f"goes on without web search.")
 
 
-def subagent_limits(features, subagents, coordinator=None, long_waits=True):
+def subagent_limits(features, subagents):
     """The Codex settings that bound one process's subagents (retrieval_runtime.agent_limits()).
 
     A process without the multi_agent feature gets none: Codex 0.160 still lists its collaboration tools to
     models of multi-agent version 2 with multi_agent off, so a session limit of one thread (the root) refuses
     every spawn. With multi_agent, ``subagents`` (1 or more) is the most that may run at once, which the hint
-    states too; None keeps Codex's own limits (a node that declares no number). ``coordinator``, the model of
-    the author coordinator, gives COORDINATOR_HINT instead of SUBAGENT_HINT and, for a model of multi-agent
-    version 2 and with ``long_waits`` (not in a web-cutoff run), COORDINATOR_WAIT_MS as its default wait.
+    states too; None keeps Codex's own limits (a node that declares no number).
     """
     if "multi_agent" not in features:
         return retrieval_runtime.agent_limits(0)
     if subagents is None:
         return {}
     s = "" if subagents == 1 else "s"
-    if coordinator is not None:
-        return retrieval_runtime.agent_limits(
-            subagents, COORDINATOR_HINT.format(count=subagents, s=s),
-            wait_ms=COORDINATOR_WAIT_MS if long_waits and multi_agent_version(coordinator) == 2 else None)
     return retrieval_runtime.agent_limits(subagents, SUBAGENT_HINT.format(count=subagents, s=s))
 
 
@@ -2754,13 +2622,9 @@ def structured_limits(features, subagents=None):
 
 
 def author_limits(features, settings):
-    """subagent_limits() of the author's Codex app-server: a coordinator (``settings["coordinator"]``) gets its own
-    hint and, unless the run is a web-cutoff run (``settings["web_cutoff"]``, see COORDINATOR_WAIT_MS), its
-    default wait; every other author, and every other role, the shared ones."""
+    """subagent_limits() of the author's Codex app-server, for its ``settings["subagents"]``."""
 
-    return subagent_limits(features, settings.get("subagents"),
-                           settings["model"] if settings.get("coordinator") else None,
-                           long_waits=not settings.get("web_cutoff"))
+    return subagent_limits(features, settings.get("subagents"))
 
 
 def structured_tool_arguments(stage, features=(), policy=None, subagents=None):
@@ -2914,7 +2778,7 @@ def _assignment_line(text):
 _SUBAGENT_ENDED = {"completed": None, "shutdown": None, "errored": "", "interrupted": "It was interrupted.",
                    "notfound": "Codex no longer has it."}
 _SUBAGENT_WORKING = {"running", "pendinginit"}
-# The collaboration tools that give a subagent the coordinator started earlier new work (Codex 0.160: send_input of
+# The collaboration tools that give a subagent the root started earlier new work (Codex 0.160: send_input of
 # multi-agent version 1, followup_task of version 2), so that one that had ended runs again, and the one that only
 # reopens one it closed (resume_agent, version 1), which works again once it is given work.
 _SUBAGENT_REASSIGNED = {"sendinput", "followuptask"}
@@ -2933,7 +2797,7 @@ class AuthorSubagents:
       new subagent thread in receiverThreadIds; a sendInput or followupTask that gives one that ended new
       work, or a running state of one that ended, starts it again (a resumeAgent only reopens it); the
       agentsStates of later items say when one completed or errored (those of an item that gives a subagent
-      new work or reopens it are neither its start nor its end); one the coordinator closed has ended;
+      new work or reopens it are neither its start nor its end); one the root closed has ended;
     - Codex, the root's saved session (CodexRollout, source "session"), which alone shows the subagents of
       multi-agent version 2: each one's start (named by its task, Codex's agent path such as /root/lemma2,
       since the session does not hold the assignment) and end;
@@ -3070,194 +2934,6 @@ class _SessionSubagents:
         elif status in ("completed", "failed"):
             self.subagents.finished(identity, None if status == "completed" else str(message or ""),
                                     source="session")
-
-
-# Codex 0.160's words in its app-server's error output for a tool call it cannot route (core/src/tools/router.rs):
-# "ERROR codex_core::tools::router: error=unsupported call: mcp__tcs__team_members" for the flattened name, and the
-# namespace and name run together for a tool its namespace does not have ("mcp__tcsteam_status") or a namespace no
-# server has ("mcp__teamteam_wait"); the model gets "unsupported call: <name>" as the call's output, and the
-# app-server sends no notification of it (the real Codex against a scripted model server, 14 Nov 2026).
-_UNSUPPORTED_CALL = re.compile(r"\bunsupported (?:custom tool )?call: *([^\s,;]+)")
-_TEAM_TOOL_NAME = re.compile(r"mcp__tcs|team_|update_goal")
-_TERMINAL_STYLE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-
-
-def refused_team_call(line):
-    """The tool call that a line of Codex's error output says it refused, when it names a team tool, else ""."""
-
-    found = _UNSUPPORTED_CALL.search(_TERMINAL_STYLE.sub("", str(line or "")))
-    return found.group(0) if found and _TEAM_TOOL_NAME.search(found.group(1)) else ""
-
-
-def team_call_worked(item):
-    """Whether a Codex mcpToolCall item that completed is a call TCS Prover answered without an error.
-
-    Codex 0.160 marks a call whose answer is an error result "failed" (a team_assign of a busy member, recorded by the
-    real Codex), and a call it could not run carries an error."""
-
-    if not isinstance(item, dict) or item.get("status") != "completed" or item.get("error"):
-        return False
-    result = item.get("result")
-    return not (isinstance(result, dict) and result.get("isError"))
-
-
-class CoordinatorWatch:
-    """Whether the author coordinator works without TCS Prover's team: warnings that list its job under Needs your
-    attention while the run goes on (see COORDINATOR_TEAMLESS_CALLS).
-
-    The goal session reports each model call of the coordinator (model_call()), each of its team tool calls as it
-    starts and ends (team_call()), the end of each turn (turn_ended(): a call that never ended is over), a team tool
-    call its CLI refused (refused()), a turn that ended with a reply naming the proof file while the goal stayed
-    incomplete (untaken_handin()) and each hand-in (handed_in()); tick(active) keeps the time without team calls,
-    which runs only while the goal is active and no team call runs. ``team`` says whether the coordinator has TCS
-    Prover's team (without it only the hand-ins are watched). ``emit(kind, **fields)`` records each warning and the
-    status that clears it. ``warned`` holds the warnings that an earlier attempt of the same runner showed and did
-    not clear (its retry details carry shown()): the server lists them until a status clears them, so this watch
-    clears them as its own. ``worked`` says that a team call of an earlier attempt worked (its retry details carry
-    team_worked). ``working()`` is the team's own count of members working on an assignment or with a report not yet
-    collected (team.Team.busy()), read when a "teamless" warning fires; a watch without it takes the members to be
-    working. Thread-safe: Codex's error output is read on a thread of its own.
-    """
-
-    def __init__(self, emit, team=True, clock=time.monotonic, warned=(), worked=False, working=None):
-        self.emit, self.team, self.clock = emit, team, clock
-        self.lock = threading.Lock()
-        self.calls, self.since = 0, clock()
-        self.running = set()
-        self.handins = 0
-        self.warned = {kind for kind in (warned if isinstance(warned, (list, tuple, set)) else ())
-                       if kind in COORDINATOR_WARNINGS}
-        # Whether a team tool call of this coordinator has worked (TCS Prover's team answered it without an error):
-        # then its team tools reach the model, and model calls without a team call are the coordinator checking on its
-        # members (sleeping, reading their files) instead of waiting with team_wait, which the "teamless" warning
-        # says (COORDINATOR_CHECKING_LABEL) in place of tools that may never reach the model. It counts across the
-        # job's attempts while its team works, not only in this coordinator session: a retry after a model-call
-        # failure, also one in a new conversation, starts the same program with the same settings and the same team,
-        # whose members work on through it (goal_session() keeps the team for the next attempt), so the tools that
-        # reached the model still do, and a coordinator that resumes its conversation goes on checking as it did; a
-        # watch that forgot it would blame dropped tools again after every retry. The retry details carry it
-        # (team_worked, through _goal_step()). A pause, a stop, the time limit or a restart stops the members with
-        # the coordinator: the next runner's watch starts without it, and the team call that hands out work again
-        # shows it again.
-        self.team_worked = worked is True
-        self.working = working
-
-    def shown(self):
-        """The warnings shown and not cleared, oldest name first: what the next attempt's watch takes over."""
-
-        with self.lock:
-            return sorted(self.warned)
-
-    def model_call(self):
-        with self.lock:
-            if not self.team:
-                return
-            self.calls += 1
-            due = self.calls >= COORDINATOR_TEAMLESS_CALLS and not self.running and "teamless" not in self.warned
-            calls, seconds, worked = self.calls, self.clock() - self.since, self.team_worked
-        if due:
-            self._teamless(calls, seconds, worked)
-
-    def team_call(self, key, finished=False, worked=False):
-        """A team tool call starts, or ends (``finished``): ``worked`` when TCS Prover's team answered it without an
-        error."""
-
-        with self.lock:
-            if finished:
-                self.running.discard(key)
-                self.team_worked = self.team_worked or worked is True
-            else:
-                self.running.add(key)
-            self.calls, self.since = 0, self.clock()
-        self._clear("teamless", "The coordinator called a team tool again.")
-        self._clear("refused", "A team tool call of the coordinator reached TCS Prover's team.")
-
-    def turn_ended(self):
-        with self.lock:
-            self.running.clear()
-
-    def tick(self, active=True):
-        with self.lock:
-            now = self.clock()
-            if not self.team or not active or self.running:
-                self.since = now  # The time without team calls runs only while the coordinator works without one.
-                return
-            due = now - self.since >= COORDINATOR_TEAMLESS_SECONDS and "teamless" not in self.warned
-            calls, seconds, worked = self.calls, now - self.since, self.team_worked
-        if due:
-            self._teamless(calls, seconds, worked)
-
-    def refused(self, detail):
-        # Without TCS Prover's team no team call could ever clear it (a refused update_goal is watched by its
-        # hand-ins).
-        if self.team and self._warn("refused"):
-            self.emit("diagnostic", label=COORDINATOR_WARNINGS["refused"], coordinatorWarning="refused",
-                      needsAttention=True,
-                      text=f"Codex refused a team tool call of the coordinator ({_clipped(detail, 300)}): the call "
-                           "never reached TCS Prover's team, so its work is not delegated. The run goes on, and the "
-                           "job is listed under Needs your attention until a team tool call of the coordinator works.")
-
-    def untaken_handin(self):
-        with self.lock:
-            self.handins += 1
-            count = self.handins
-        if count >= COORDINATOR_UNTAKEN_HANDINS and self._warn("handin"):
-            self.emit("diagnostic", label=COORDINATOR_WARNINGS["handin"], coordinatorWarning="handin",
-                      needsAttention=True,
-                      text=f"The coordinator has ended {count} turns with a reply that names its proof file while "
-                           "its goal stayed incomplete (it did not call update_goal with the status complete), so "
-                           "the proof was not handed to the critic. The run goes on, and the job is listed under "
-                           "Needs your attention until the coordinator hands its proof in (listed after "
-                           f"{COORDINATOR_UNTAKEN_HANDINS} such replies).")
-
-    def handed_in(self):
-        with self.lock:
-            self.handins = 0
-        self._clear("handin", "The coordinator handed its proof in.")
-
-    def _teamless(self, calls, seconds, worked=False):
-        if not self._warn("teamless"):
-            return
-        counts = (f"The coordinator has made {calls} model {'call' if calls == 1 else 'calls'} in "
-                  f"{_span_text(seconds)} without calling any team tool")
-        if not worked:
-            # (a) No team call has worked yet: its team tools may never reach the model.
-            self.emit("diagnostic", label=COORDINATOR_WARNINGS["teamless"], coordinatorWarning="teamless",
-                      needsAttention=True, modelCalls=calls,
-                      text=f"{counts}: its requests may reach the model without TCS Prover's team tools (an API "
-                           "connection or proxy that drops them, for example), so the work is not delegated. The run "
-                           "goes on, and the job is listed under Needs your attention until the coordinator calls a "
-                           f"team tool (listed after {COORDINATOR_TEAMLESS_CALLS} model calls or "
-                           f"{_span_text(COORDINATOR_TEAMLESS_SECONDS)} without one).")
-        elif self.working is None or self.working():
-            # (b) Its team tools work (self.team_worked) and a member works on an assignment now (the team's own
-            # state, Team.busy(): a member stopping counts, its report is still to come, and so does a report that
-            # waits for team_wait): it checks on its members instead of waiting for them.
-            self.emit("diagnostic", label=COORDINATOR_CHECKING_LABEL, coordinatorWarning="teamless",
-                      needsAttention=True, modelCalls=calls, teamWorked=True,
-                      text=f"{counts}. It is checking on its members between team calls (for example by sleeping "
-                           "and reading files) instead of waiting with team_wait, each check sends its whole "
-                           "conversation to the model again, and the run goes on.")
-        else:
-            # (c) Its team tools work, and no member works on an assignment: it does the work itself.
-            self.emit("diagnostic", label=COORDINATOR_WARNINGS["teamless"], coordinatorWarning="teamless",
-                      needsAttention=True, modelCalls=calls, teamWorked=True,
-                      text=f"{counts} while no member is working: it is doing the work itself instead of giving it "
-                           "to a member. The run goes on.")
-
-    def _warn(self, kind):
-        with self.lock:
-            if kind in self.warned:
-                return False
-            self.warned.add(kind)
-            return True
-
-    def _clear(self, kind, text):
-        with self.lock:
-            if kind not in self.warned:
-                return
-            self.warned.discard(kind)
-        self.emit("status", label=COORDINATOR_WARNING_CLEARED_LABEL, coordinatorWarningCleared=kind, text=text)
 
 
 class StructuredConversation:
@@ -3585,7 +3261,7 @@ class RequestMonitor:
     def __init__(self, process, stage, model, effort, *, timeout, activity_label, cli="Codex", redact=None,
                  deadline=None, heartbeat=True):
         self.process, self.stage, self.model, self.effort = process, stage, model, effort
-        # A team member's run (heartbeat False) shows its own events instead of the liveness heartbeat.
+        # The examiner's run (heartbeat False) shows its own events instead of the liveness heartbeat.
         self.heartbeat = heartbeat
         self.timeout = float(STRUCTURED_STALL_SECONDS if timeout is None else timeout)
         self.deadline = None if deadline is None else float(deadline)
@@ -4201,8 +3877,8 @@ def _finish_trace(trace):
 
 
 def _copy_author_thread(environment, thread):
-    """Copy the author's or coordinator's Codex thread (the files that are new or changed, its subagents' included)
-    into the job's record; Codex keeps the thread itself."""
+    """Copy the author's Codex thread (the files that are new or changed, its subagents' included) into the job's
+    record; Codex keeps the thread itself."""
 
     recorder = records.recorder()
     if recorder is not None and thread:
@@ -4440,13 +4116,13 @@ def _run_structured_process(
         return output
 
 class MemberConversation:
-    """The conversation of one attempt of a team member's assignment (runner/team.py), as its transport reports it.
+    """The conversation of one attempt of an examination of the author's examiner (runner/team.py), as its transport
+    reports it.
 
-    ``fork_from`` is the saved session the attempt continues (a follow-up, or a retry after an attempt that worked):
-    Codex forks it (`codex exec fork <id>`), Claude Code resumes a fork of it (--resume <id> --fork-session).
-    ``session_id``, ``confirmed`` and ``output`` say what the attempt started and whether the model worked in it;
-    every session the attempt saved is registered with ``sessions`` (MemberSessions), which removes them when the
-    team ends.
+    ``fork_from`` is the saved session the attempt continues (a retry after an attempt that worked): Codex forks it
+    (`codex exec fork <id>`), Claude Code resumes a fork of it (--resume <id> --fork-session). ``session_id``,
+    ``confirmed`` and ``output`` say what the attempt started and whether the model worked in it; every session the
+    attempt saved is registered with ``sessions`` (MemberSessions), which removes them when the examiner stops.
     """
 
     resumable = True
@@ -4459,11 +4135,11 @@ class MemberConversation:
         self.sessions.add(session_id, deleter)
 
     def subagent(self, *_):
-        pass  # Members start no subagents.
+        pass  # The examiner starts no subagents.
 
 
 class MemberSessions:
-    """The saved sessions of a team's members, removed together when the team ends (Team.close())."""
+    """The saved sessions of the examiner's attempts, removed together when it stops (Team.close())."""
 
     def __init__(self):
         self.items, self.lock = {}, threading.Lock()
@@ -4474,7 +4150,7 @@ class MemberSessions:
 
     def discard(self):
         """Delete every saved session, newest first and twice over: Codex refuses to delete a session that a fork
-        of it (a follow-up or retry) still references, so a chain goes from its newest fork back to its base."""
+        of it (a retry) still references, so a chain goes from its newest fork back to its base."""
 
         with self.lock:
             items, self.items = dict(self.items), {}
@@ -4488,21 +4164,18 @@ class MemberSessions:
 
 
 def member_problem(error, model):
-    """Why a team member's failed attempt ends its assignment at once, else None (it is retried every minute).
+    """Why the examiner's failed attempt ends its examination at once, else None (it is retried every minute).
 
     A missing program, a login or key the model cannot use, a model the account or catalog does not have, an
-    endpoint that refuses the request, and any other configuration error. When the member's API connection refused
-    the request (its endpoint rejects it as invalid, says the model does not exist or that its key cannot use it, or
-    refuses its key) it is a team.Refusal, whose report tells the coordinator in the service's words that the problem
-    may pass (team.REFUSED_REPORT); the member's record says what failed and ends with the service's words, without
-    the advice of a paused job (that a retry cannot fix it, or that a job waiting for it continues once its settings
-    change). A built-in model's refused login or unavailable model (its program's sign-in, no API connection) stays
-    plain text.
+    endpoint that refuses the request, and any other configuration error. When its API connection refused the
+    request (its endpoint rejects it as invalid, says the model does not exist or that its key cannot use it, or
+    refuses its key) the text says what failed and ends with the service's words, without the advice of a paused job
+    (that a retry cannot fix it, or that a job waiting for it continues once its settings change).
     """
 
     failure = settings_failure(error, model)
     if isinstance(failure, RequestRejected) or (isinstance(failure, ModelUnavailable) and providers.is_api_id(model)):
-        return team_module.Refusal(failure.summary, failure.reason)
+        return failure.summary
     if failure is not None:
         return str(failure)
     if isinstance(error, (FinalError, providers.ProviderError)):
@@ -4510,23 +4183,21 @@ def member_problem(error, model):
     if _cli_problem(error):
         return _failure_reason(redact(str(error)), 600) or str(error)
     if _plain_failure(redact(str(error))) == "authentication failed":
-        reason = _failure_reason(redact(str(error)), 300) or str(error)
-        if providers.is_api_id(model):
-            return team_module.Refusal(f"authentication failed: {reason}", reason)
-        return f"authentication failed: {reason}"  # A built-in model's login.
+        return f"authentication failed: {_failure_reason(redact(str(error)), 300) or str(error)}"
     return None
 
 
 def member_attempt(member, prompt, conversation, started, *, directory, settings, compact_prompt, record,
                    retried=None, noted=None):
-    """One attempt of a team member's assignment: a one-shot run of its model in the author's working folder.
+    """One attempt of an examination of the author's examiner: a one-shot run of its model in the author's working
+    folder.
 
     Codex models run `codex exec --json` and Claude models `claude -p` (as the critic's calls do), each with the
     author's sandbox: workspace writes in ``directory`` (whose controller files stay read-only), the network rule
     of the author's search mode there, the same environment filtering and credentials, no subagents. The reply is
-    the member's final message. ``started(process)`` registers the CLI process (a stop ends it); ``record(event,
+    the examiner's final message. ``started(process)`` registers the CLI process (a stop ends it); ``record(event,
     root)`` receives its public events; ``retried(text)`` the retries Claude Code makes of a failed API request
-    within the run (claude_cli.run_structured()); ``noted(text)`` a line the activity log shows of the member (its
+    within the run (claude_cli.run_structured()); ``noted(text)`` a line the activity log shows of the examiner (its
     web searches that failed); ``settings`` holds the job's speed and reasoning summary.
     """
 
@@ -4553,7 +4224,7 @@ def member_attempt(member, prompt, conversation, started, *, directory, settings
 
 def _codex_member_attempt(prompt, model, effort, summary, *, directory, conversation, record, started, speed,
                           compact_prompt, noted=None):
-    """A Codex team member's attempt (member_attempt()): `codex exec --json`, its session saved for a follow-up."""
+    """A Codex examiner's attempt (member_attempt()): `codex exec --json`, its session saved for a retry."""
 
     child_environment = environment(model)
     live = live_network(directory)
@@ -4659,11 +4330,11 @@ def _codex_member_attempt(prompt, model, effort, summary, *, directory, conversa
 
 
 def member_usage(event, trace):
-    """A team member's turn.completed (`codex exec --json`) with the usage of its own model calls, as the job's record
-    holds them (records.TraceProcess.usage()): a follow-up or retry continues the member's conversation with `exec
-    fork`, whose turn.completed counts the whole conversation's tokens (Codex 0.160: a fourth assignment reported
-    539,386 input tokens, its own 3 calls 102,763), which the event keeps as conversationUsage. Without the record's
-    usage (no record, a call without usage) the event stays as Codex wrote it."""
+    """The examiner's turn.completed (`codex exec --json`) with the usage of its own model calls, as the job's record
+    holds them (records.TraceProcess.usage()): a retry continues its conversation with `exec fork`, whose
+    turn.completed counts the whole conversation's tokens (Codex 0.160: a fourth attempt reported 539,386 input
+    tokens, its own 3 calls 102,763), which the event keeps as conversationUsage. Without the record's usage (no
+    record, a call without usage) the event stays as Codex wrote it."""
 
     own = trace.usage() if trace is not None and hasattr(trace, "usage") else None
     usage = event.get("usage")
@@ -4683,21 +4354,18 @@ def examine_after_compaction(examiner, emit, thread):
                                 "run; no new examination starts.", threadId=thread)
 
 
-def start_team(members, *, prompts, directory, settings, stage, node_name, examiner=None, lone=False):
-    """The author coordinator's team (runner/team.Team) of ``members`` (team.team_members()), ready for its tools.
+def start_team(members, *, prompts, directory, settings, stage, node_name, examiner=None, lone=True):
+    """The author's examiner (runner/team.Team): ``members`` is empty and ``lone`` true, ``examiner`` its seat
+    (team.team_members()). It examines the run each time the author's conversation is compacted (goal_session's
+    examiner).
 
-    ``examiner`` is the examiner's seat (an entry like a member's), which the team starts itself (team.Team). With
-    ``lone`` it is a lone author's examiner: no members, an examination each time the author's conversation is
-    compacted (goal_session's examiner).
-
-    Its members' records and events go to the run's records as the coordinator's subagents (stage ``stage``, node
-    ``node_name``), each with its member's number and model and its assignment's id (subagentId,
-    team_module.assignment_id()).
+    Its records and events go to the run's records as the author's subagents (stage ``stage``, node ``node_name``),
+    each with its seat's number and model and its examination's id (subagentId, team_module.assignment_id()).
     """
 
     sessions = MemberSessions()
-    # How many retries of a failed API request each assignment's CLI has reported (by assignment id): each note
-    # carries its number as its attempt, so that only the first two stay pinned on the job page through a long outage.
+    # How many retries of a failed API request each examination's CLI has reported (by its id): each note carries its
+    # number as its attempt, so that only the first two stay pinned on the job page through a long outage.
     retries = {}
 
     def emit_member(kind, **fields):
@@ -5127,8 +4795,6 @@ class RPC:
         self.stderr_reader = None
         self.pending_call = None
         self.notice = None
-        # Called with each line of the app-server's error output (goal_session(): a team tool call Codex refused).
-        self.stderr_watch = None
         self.answered = set()
         if getattr(process, "stderr", None) is not None:
             def drain_errors():
@@ -5146,12 +4812,6 @@ class RPC:
                             if log is not None:
                                 log.write(value + "\n")
                                 log.flush()
-                            watch = self.stderr_watch
-                            if watch is not None:
-                                try:
-                                    watch(value)
-                                except Exception:  # noqa: BLE001 - reading the output matters more than a warning.
-                                    pass
                 except (OSError, ValueError):
                     pass
                 finally:
@@ -5393,8 +5053,8 @@ def _author_app_server(runtime, *, directory, policy, role, model, settings, fea
     web-cutoff author gets the private temp folder of its verified
     environment instead (retrieval_runtime.preflight()); the caller removes
     it when the process ends (retrieval_runtime.remove_private_temp()). Its
-    subagent limits (author_limits(), from ``features``,
-    settings["subagents"] and settings["coordinator"]) are session flags,
+    subagent limits (author_limits(), from ``features`` and
+    settings["subagents"]) are session flags,
     which a web-cutoff run's checks verify exactly. ``stage`` ("solve", or "conversation" for a reply
     of the paused author) words the message of a Codex that is not installed
     (missing_cli()). ``goals`` False (TCS Prover's goal loop) starts it
@@ -5493,9 +5153,9 @@ def _author_thread_options(runtime, rpc, *, directory, policy, role, model, sett
     itself (team.Service.codex_server()), kept on while the user's are off;
     a nonempty ``compact_prompt`` is Codex's compact_prompt setting.
     ``builtin_agents`` False (a process that starts no subagent of Codex:
-    an author without the multi_agent feature, such as one that works alone
-    or a coordinator with TCS Prover's team) turns Codex's agents off in its
-    thread (agents.enabled): without the multi_agent feature, Codex 0.160
+    an author without the multi_agent feature, one that works alone) turns
+    Codex's agents off in its thread (agents.enabled): without the
+    multi_agent feature, Codex 0.160
     still gives a model of multi-agent version 2 its collaboration tools
     (spawn_agent, wait_agent, ...) and tells it that it is the root of a
     team that can spawn sub-agents, also with a web-cutoff run's settings
@@ -5560,7 +5220,7 @@ def _author_thread_options(runtime, rpc, *, directory, policy, role, model, sett
     if compact_prompt and compact_prompt.strip():
         thread_options["config"]["compact_prompt"] = compact_prompt
     if not builtin_agents:
-        # No subagent of Codex's own (an author alone, TCS Prover's team): none of its collaboration tools.
+        # No subagent of Codex's own (an author alone): none of its collaboration tools.
         thread_options["config"]["agents"] = {"enabled": False}
     thread_options["config"]["features"].update(apps=False, plugins=False, view_image=False)
     # The confined profile where Codex supports one, selected exactly as the historical profile is; none of
@@ -5591,19 +5251,6 @@ def asks_user(item):
     return isinstance(item, dict) and (item.get("delivery") == "async" or bool(item.get("questions")))
 
 
-def names_proof_file(reply):
-    """Whether an author's final reply names a proof file, as proof_handoff.extract_proof_reference() reads it.
-
-    A pointer it cannot use (two different files, a mixed format) counts too: the critic step refuses that
-    submission and tells the author why (see _prepare_node_files).
-    """
-
-    try:
-        return proof_handoff.extract_proof_reference(reply) is not None
-    except proof_handoff.ProofHandoffError:
-        return True
-
-
 def _root_message(message, thread):
     """Whether an app-server message belongs to the root thread `thread`, not to a subagent's thread."""
 
@@ -5624,8 +5271,8 @@ def _root_message(message, thread):
 
 
 def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
-                 node_name="author", stages=None, initial_instruction="", handoff_note="", coordinator=False,
-                 texts=None, team=None, service=None, examiner=None):
+                 node_name="author", stages=None, initial_instruction="", handoff_note="",
+                 texts=None, service=None, examiner=None):
     """Run one goal-enabled thread with lifecycle instructions supplied by YAML.
 
     ``examiner`` is a lone author's examiner (start_team(lone=True)): it examines the run each time the author's
@@ -5654,7 +5301,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     prompt plus any open critic feedback. A thread that is reopened receives
     the short "reopen" prompt (when the workflow defines one) instead of the
     full resume prompt, unless the ``goal_reanchor`` option says that a
-    conversation turn of the paused author compacted its context; critic
+    conversation turn of the paused author compacted its context, or the
+    "new_goal" prompt when the ``goal_new_goal`` option says that the user set
+    a new goal for the finished job (its statement is the new goal); critic
     feedback it already received (``author_repair_delivered``) is not sent
     again. ``handoff_note``, the controller's note on a submission it could not
     hand to the critic, follows any critic feedback in the first instruction,
@@ -5669,38 +5318,24 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     The root's collabAgentToolCall items become the status records of its
     subagents (AuthorSubagents).
 
-    With ``coordinator`` the thread is the author coordinator (author_mode()),
-    which its "Goal started" or "Goal resumed" status says (authorModeEffective
-    "coordinator"): its app-server gets the coordinator's hint and, outside a web-cutoff run,
-    its default wait (author_limits()); and where proof files can be read
-    (proof_handoff.file_handoff_supported()) a final reply that names no
-    proof file (names_proof_file()) is not handed on: it is recorded as a
-    "Coordinator report" status, and the continuation prompt follows.
-
     Who runs the goal loop is the ``goal_loop`` option (GOAL_LOOPS). "codex"
     is Codex's goal mode, as described above. "tcs" (a live run only; a
     web-cutoff run keeps Codex's goal mode, see team.Service) starts the
     app-server without Codex's goals feature, so TCS Prover starts every turn:
     after a turn that did not end the goal it sends the next one at once, the
-    ``texts`` goal_continuation text with the continuation prompt (or, after a
-    reply the hand-in guard kept, the report prompt) placed first. The model
-    ends the goal with TCS Prover's update_goal tool (team.GoalTool, an MCP
-    tool of TCS Prover's server, served by ``service`` or by a service of this
-    session): "complete" with the turn's final reply hands that reply on,
-    exactly as a complete goal does in Codex's goal mode; "blocked" and
-    "paused" are recorded ("Goal status") and the continuation follows. Every
-    other duty (time limit, pause, stop, resume, live instructions, chat,
-    compaction re-anchor, hand-in guard, retries, records) stays as
+    ``texts`` goal_continuation text with the continuation prompt placed
+    first. The model ends the goal with TCS Prover's update_goal tool
+    (team.GoalTool, an MCP tool of TCS Prover's server, served by ``service``
+    or by a service of this session): "complete" with the turn's final reply
+    hands that reply on, exactly as a complete goal does in Codex's goal mode;
+    "blocked" and "paused" are recorded ("Goal status") and the continuation
+    follows. Every other duty (time limit, pause, stop, resume, live
+    instructions, chat, compaction re-anchor, retries, records) stays as
     above; no thread/goal request is sent.
 
-    A coordinator with ``team`` (team.Team: TCS Prover's team in place of
-    Codex's subagent tool, see _execute) gets its team tools from the same
-    server; a live instruction sent to it ends a running
-    team_wait early (Team.attention()), and an end that is not retried
-    (pause, stop, time limit, the end of the work) stops the team's members.
-    An author or coordinator without the multi_agent feature (one that works
-    alone, or one with ``team``) has Codex's agents off in its thread: none
-    of Codex's collaboration tools (_author_thread_options()).
+    An author without the multi_agent feature (one that works alone) has
+    Codex's agents off in its thread: none of Codex's collaboration tools
+    (_author_thread_options()).
     """
     directory = os.path.abspath(os.fspath(options.get("goal_cwd") or os.getcwd()))
     policy = retrieval_policy(directory, features)
@@ -5727,8 +5362,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
 
     settings = dict(settings)
     model = settings["model"]
-    settings["coordinator"] = bool(coordinator)
-    settings["web_cutoff"] = bool(policy)  # Its coordinator keeps Codex's default wait (COORDINATOR_WAIT_MS).
     settings["effort"] = runtime.effective_effort(model, settings["effort"])
     settings["speed"] = runtime.effective_speed(model, settings["speed"])
     summary = settings["summary"] = runtime.reasoning_summary(model, settings["summary"])
@@ -5783,23 +5416,15 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     # and why the subagents still running end with this attempt (its app-server stops, and they with it).
     subagents, rollout = AuthorSubagents(emit), None
     ending = {"reason": "It stopped when the author's Codex session ended."}
-    # Where proof files can be read, a final reply of the coordinator must name one to be handed on.
-    guarded = bool(coordinator) and proof_handoff.file_handoff_supported()
-    # TCS Prover's MCP server: its update_goal (TCS Prover's goal loop) and the coordinator's team tools.
+    # TCS Prover's MCP server: its update_goal (TCS Prover's goal loop).
     goal_tool = own_service = None
-    # Whether the coordinator works without TCS Prover's team, or replies with its proof file without handing it in:
-    # warnings while the run goes on (CoordinatorWatch).
-    team_watch = (CoordinatorWatch(lambda kind, **fields: emit(kind, threadId=thread, **fields), team=team is not None,
-                                   warned=continued.get("warned") or (), worked=continued.get("team_worked") is True,
-                                   working=getattr(team, "busy", None))
-                  if coordinator and (team is not None or tcs) else None)
 
     def start_service():
         nonlocal service, goal_tool, own_service
-        if not tcs and team is None:
+        if not tcs:
             return
-        missing = [name for name in (("goal_continuation", "goal_tool_update_goal", "goal_tool_update_goal_status",
-                                      "goal_tool_update_goal_note") if tcs else ()) if name not in texts]
+        missing = [name for name in ("goal_continuation", "goal_tool_update_goal", "goal_tool_update_goal_status",
+                                     "goal_tool_update_goal_note") if name not in texts]
         if missing:
             raise ConfigurationError(f"The workflow has no {', '.join(missing)} text, which TCS Prover's goal loop "
                                      "needs; add it to the workflow's prompts or choose Codex's goal loop.")
@@ -5807,13 +5432,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             service = own_service = team_module.Service()
         # The bridge's token never shows in a record (Codex may echo the thread's settings).
         getattr(runtime, "register_secret", lambda value: None)(service.token)
-        if tcs:
-            goal_tool = team_module.GoalTool(
-                texts, lambda kind, **fields: emit(kind, threadId=thread, **fields),
-                lambda: goal.get("objective", ""), lambda: getattr(runtime, "workflow_elapsed", workflow_elapsed)(options))
-            service.add(goal_tool)
-        if team is not None:
-            service.add(team)
+        goal_tool = team_module.GoalTool(
+            texts, lambda kind, **fields: emit(kind, threadId=thread, **fields),
+            lambda: goal.get("objective", ""), lambda: getattr(runtime, "workflow_elapsed", workflow_elapsed)(options))
+        service.add(goal_tool)
 
     def count_request(token_usage):
         """Add one model request's tokens (a thread/tokenUsage/updated) to its turn's; whether it was a new one.
@@ -5831,16 +5453,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         usage["requests"] += 1
         return True
 
-    def error_output(line):
-        """One line of the app-server's error output: a team tool call Codex refused warns (CoordinatorWatch)."""
-
-        refused = refused_team_call(line)
-        if refused:
-            team_watch.refused(refused)
-
     def continue_with(name):
-        """The next turn after one that did not end the goal: the prompt ``name`` (the continuation or the report
-        prompt), and under TCS Prover's goal loop the goal continuation text around it."""
+        """The next turn after one that did not end the goal: the prompt ``name`` (the continuation), and under TCS
+        Prover's goal loop the goal continuation text around it."""
 
         text = render(name)
         if not tcs:
@@ -5918,9 +5533,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             raise
         if kind != "steer":
             state["steered"] = True
-        if team is not None and kind == "steer":
-            # A running team_wait returns now, so that the instruction is not held up behind it.
-            team.attention("a live instruction")
         if kind == "compaction":
             emit("request", label="Author context re-anchor after compaction", text=instruction, threadId=thread)
         elif kind == "steer":
@@ -5991,8 +5603,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     emit("diagnostic", text="Codex did not acknowledge the pause; keeping its saved session and the last saved work.")
                     runtime.stop_process(process)
                     return
-                if team_watch is not None:
-                    team_watch.tick(active=False)
                 continue
             if runtime.workflow_remaining(options) <= 0:
                 expired.set()
@@ -6012,12 +5622,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 if not stop.wait(grace):
                     runtime.stop_process(process)
                 return
-            if team_watch is not None and team_watch.team:
-                try:
-                    team_watch.tick(active=state["active"] and not pausing.is_set())
-                except Exception as exc:  # noqa: BLE001 - a warning must never stop the watcher.
-                    team_watch.team = False
-                    emit("diagnostic", text=f"The coordinator's team warnings stopped: {exc}", threadId=thread)
             if not state["active"]:
                 continue
             stall = liveness(time.monotonic())
@@ -6106,8 +5710,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             runtime, directory=directory, policy=policy, role=retrieval_role, model=model, settings=settings,
             features=features, classic=classic, sandbox=sandbox, goals=not tcs)
         child_environment, trace = _record_codex(
-            child_environment, policy, role="coordinator" if coordinator else "author", node=node_name,
-            label="Coordinator" if coordinator else "Author", model=model, stage=stage)
+            child_environment, policy, role="author", node=node_name, label="Author", model=model, stage=stage)
         process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=str(directory),
             env=child_environment)
@@ -6116,8 +5719,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         rpc = runtime.RPC(process, record, **({"stderr_log": log} if log else {}))
         rpc.web_cutoff = bool(policy)
         rpc.notice = lambda text: emit("diagnostic", text=text, threadId=thread)
-        if team_watch is not None:
-            rpc.stderr_watch = error_output
         watcher = threading.Thread(target=watch, daemon=True)
         watcher.start()
         _initialize_author_rpc(runtime, rpc, policy=policy, role=retrieval_role, child_environment=child_environment,
@@ -6127,16 +5728,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             summary=summary, features=features, classic=classic, emit=emit, environment=child_environment,
             goals=not tcs, servers={team_module.SERVER_NAME: service.codex_server()} if service is not None else None,
             compact_prompt=texts.get("codex_compact_prompt", ""), builtin_agents="multi_agent" in features)
-        note = texts.get("codex_coordinator_note", "") if coordinator and team is not None else ""
-        if isinstance(note, str) and note.strip():
-            # A developer message after Codex's own instructions, at thread/start and at every thread/resume.
-            # Codex 0.160's instructions tell the model not to leave the user without a commentary update for more
-            # than 60 seconds and to avoid blocking waits longer than 60 seconds; a coordinator that follows them
-            # wakes every minute while its team works (four 14-hour runs: every one of 1,190 team_wait calls asked
-            # for 1 minute, and 41-53% of the coordinator's model calls only waited). With the default note, which
-            # says that neither applies to an unattended run, coordinators chose waits of 5 to 15 minutes
-            # themselves. Not for a coordinator without TCS Prover's team (a web-cutoff run, a job from before).
-            thread_options["developerInstructions"] = note
         if sandbox is not None and hasattr(runtime, "author_confinement_check"):
             runtime.author_confinement_check(rpc, sandbox=sandbox, directory=directory, emit=emit)
         if classic:
@@ -6201,9 +5792,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                      threadId=thread)
         saved_goal = (rpc.call("thread/goal/get", {"threadId": thread}).get("goal") or {}) if resumed and not tcs else {}
         goal = {"threadId": thread, "objective": saved_goal.get("objective") or render("goal")}
-        # A coordinator says so with each start: the run's author mode (see note_no_subagent_tool()).
-        emit("status", label="Goal resumed" if resumed else "Goal started", threadId=thread,
-             text=f"Thread {thread}", **({"authorModeEffective": "coordinator"} if coordinator else {}))
+        emit("status", label="Goal resumed" if resumed else "Goal started", threadId=thread, text=f"Thread {thread}")
         if replaced:
             emit("status", label="Conversation replaced", threadId=thread, text=_replacement_notice(replaced))
             instruction = replacement_instruction()
@@ -6212,8 +5801,11 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             instruction = continued["instruction"]
         else:
             # A thread that is reopened holds the task already: the short reopen prompt, unless a
-            # conversation turn compacted its context (goal_reanchor), which the full resume prompt restores.
-            instruction = (render("reopen") if resumed and "reopen" in prompts and not options.get("goal_reanchor")
+            # conversation turn compacted its context (goal_reanchor), which the full resume prompt restores. A new
+            # goal the user set for the finished job (goal_new_goal) gets the new_goal prompt, which carries the new
+            # task in full.
+            instruction = (render("new_goal") if options.get("goal_new_goal") and "new_goal" in prompts
+                           else render("reopen") if resumed and "reopen" in prompts and not options.get("goal_reanchor")
                            else render("resume") if options.get("goal_resume") or options.get("goal_thread_id")
                            else prompt)
             if initial_instruction and not (resumed and received(initial_instruction)):
@@ -6265,10 +5857,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     state["output"] = True  # The model worked in this turn.
                 if method == "item/completed" and item.get("type") in {"collabAgentToolCall", "collab_agent_tool_call"}:
                     subagents.codex_item(item)
-                if (team_watch is not None and item.get("type") in {"mcpToolCall", "mcp_tool_call"}
-                        and item.get("server") == team_module.SERVER_NAME and item.get("tool") in team_module.TEAM_TOOLS):
-                    team_watch.team_call(item.get("id"), finished=method == "item/completed",
-                                         worked=method == "item/completed" and team_call_worked(item))
                 searches.item(method, item)
             if method == "turn/started":
                 running, answers = True, []
@@ -6301,17 +5889,13 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             elif method == "thread/goal/updated":
                 status = (params.get("goal") or {}).get("status")
             elif method == "thread/tokenUsage/updated":
-                if count_request(params.get("tokenUsage")) and team_watch is not None:
-                    team_watch.model_call()
+                count_request(params.get("tokenUsage"))
             elif method == "turn/completed":
                 running, state["turn"] = False, None
-                if team_watch is not None:
-                    team_watch.turn_ended()
                 failed_searches = searches.failed()
                 if failed_searches and turn.get("status") == "completed":
                     emit("diagnostic", label=SEARCH_FAILED_LABEL, threadId=thread, failedSearches=failed_searches,
-                         text=f"{'The author coordinator' if coordinator else 'The proof author'}: "
-                              f"{failed_search_text(failed_searches, model)}")
+                         text=f"The proof author: {failed_search_text(failed_searches, model)}")
                 if usage["turn"] and hasattr(runtime, "emit_cache_usage"):
                     runtime.emit_cache_usage(stage, usage["turn"], label="Author cache usage",
                                              requests=usage["requests"])
@@ -6344,17 +5928,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 raise runtime.Error("Author paused at the current turn boundary.")
             if status in {"usageLimited", "budgetLimited"}:
                 raise runtime.Error(f"Author stopped: {status}.")
-            if not running and status == "complete" and answers and guarded and not names_proof_file(answers[-1]):
-                # The coordinator's reply names no proof file: a report on its work, never a submission.
-                emit("status", label=COORDINATOR_REPORT_LABEL, threadId=thread,
-                     text=_clipped(answers[-1], getattr(runtime, "COORDINATOR_REPORT_CHARS", COORDINATOR_REPORT_CHARS)))
-                start_turn(continue_with("report" if "report" in prompts else "continuation"))
-                status, running, answers = None, True, []
-            elif not running and status == "complete" and answers:
+            if not running and status == "complete" and answers:
                 state["active"] = False
                 solution = answers[-1]
-                if team_watch is not None:
-                    team_watch.handed_in()
                 emit("status", label="Goal complete", threadId=thread, text=f"Thread {thread}")
                 emit("author_result", label="Author solution", text=solution, threadId=thread)
                 rejection = yield {"outcome": "done", "output": solution}
@@ -6367,9 +5943,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 start_turn(render("repair"))
                 status, running, answers = None, True, []
             elif not running and (status in {"blocked", "complete"} or (tcs and status is not None)):
-                if (tcs and team_watch is not None and status != "complete" and answers
-                        and names_proof_file(answers[-1])):
-                    team_watch.untaken_handin()  # A proof file named, the goal incomplete: no hand-in.
                 # TCS Prover's goal loop continues every turn that did not end the goal, at once.
                 start_turn(continue_with("continuation"))
                 status, running, answers = None, True, []
@@ -6427,9 +6000,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                                   "output": state["output"], "rewound": state["rewound"],
                                   "rewind": {"turn": state["turn_id"]} if reverted else None,
                                   "steer": state["steer"], "pending_compaction": pending_compaction,
-                                  "refusal": final["refusal"], "classic_shell": classic or (tools and not policy),
-                                  "warned": team_watch.shown() if team_watch is not None else [],
-                                  "team_worked": team_watch.team_worked if team_watch is not None else False}
+                                  "refusal": final["refusal"], "classic_shell": classic or (tools and not policy)}
                 if thread and _context_window_failure(failure):
                     # The same conversation would fail again: continue in a new one.
                     final["retry"].update(
@@ -6439,20 +6010,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     finally:
         stop.set()
         if service is not None:
-            for provider in (goal_tool, team):
-                if provider is not None:
-                    service.remove(provider)
+            if goal_tool is not None:
+                service.remove(goal_tool)
             if own_service is not None:
                 own_service.close()
-        if team is not None and not final.get("retry"):
-            # Pause, stop, the time limit or the end of the work: the members stop with the coordinator. A failed
-            # model call keeps them working for the next attempt, which reads their reports.
-            team.close(ending["reason"])
-        elif team is not None:
-            # A team_wait that this attempt's CLI was running ends without taking those reports (or an attention):
-            # its caller is gone, and they are the next attempt's. The team left the service above, so no late call
-            # of this attempt starts another.
-            team.release_waits()
         if examiner is not None and not final.get("retry"):
             examiner.close(ending["reason"])
         if rpc and thread and state["active"] and not tcs:
@@ -6615,8 +6176,8 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
                                api_model=api_model,
                                agent_limits=subagent_limits(launch_features, settings.get("subagents")))
         # No agents setting: Codex keeps agents.enabled = false with the thread for good, so a reply turn with it
-        # would take Codex's own subagents from an author that has them (a web-cutoff coordinator, the coordinator
-        # of a job from before TCS Prover's team, --author-mode author with subagents) for the rest of the job.
+        # would take Codex's own subagents from an author that has them (Author subagents 1 or more) for the rest of
+        # the job.
         thread_options = _author_thread_options(
             runtime, rpc, directory=directory, policy=policy, role="author", model=model, settings=settings,
             summary=summary, features=launch_features, classic=classic, emit=emit, read_only=restricted,
@@ -7586,7 +7147,7 @@ def load_workflow(path):
               "workflow_stage", "skip"}
     specific = {
         "structured": {"instructions", "inputs", "schema", "features", "require", "error", "subagents", "attempts", "provider_options", "request_label", "activity_label", "normalize", "proof_handoff", "edit"},
-        "goal": {"task", "marker", "lifecycle", "resume", "stages", "recovery", "features", "subagents", "coordinator"},
+        "goal": {"task", "marker", "lifecycle", "resume", "stages", "recovery", "features", "subagents"},
         "command": {"command", "require", "error"},
     }
     for name, node in nodes.items():
@@ -7686,21 +7247,6 @@ def load_workflow(path):
                 isinstance(ref, str) and ref in prompts for ref in lifecycle.values()
             ):
                 raise ValueError(f"Goal node {name} must bind its lifecycle prompts.")
-            if "coordinator" in node:
-                # The author coordinator (see author_mode()): its first prompt, and the lifecycle prompts that
-                # replace the author's; it runs with the node's subagents only.
-                binding = node["coordinator"]
-                bound = binding.get("lifecycle") if isinstance(binding, dict) else None
-                if isinstance(bound, list) and all(isinstance(key, str) for key in bound):
-                    bound = _lifecycle_map(bound)
-                if (not isinstance(binding, dict) or set(binding) != {"prompt", "lifecycle"}
-                        or not isinstance(binding["prompt"], str) or binding["prompt"] not in prompts
-                        or not isinstance(bound, dict) or set(bound) - set(_COORDINATOR_LIFECYCLE)
-                        or not all(isinstance(ref, str) and ref in prompts for ref in bound.values())):
-                    raise ValueError(f"Goal node {name} coordinator needs a prompt and the lifecycle prompts it "
-                                     "replaces.")
-                if "subagents" not in node:
-                    raise ValueError(f"Goal node {name} needs subagents for its coordinator.")
             stages = node["stages"]
             if not isinstance(stages, dict) or set(stages) != {"initial", "resume", "failure"} or not all(isinstance(stage, str) and stage for stage in stages.values()):
                 raise ValueError(f"Invalid goal stages in node {name}.")
@@ -7883,31 +7429,6 @@ def _lifecycle_map(lifecycle):
     return {key: key for key in lifecycle} if isinstance(lifecycle, list) else dict(lifecycle)
 
 
-def author_mode(node, options):
-    """How a goal node's author works in this run: "coordinator" or "author".
-
-    The author works on the statement itself: alone, or, with 1 or more subagents (subagent_count(), the run's
-    Parallel agents setting less one), with its program's own subagent tool and the subagents note. The author
-    coordinator, the earlier team design, runs the node's coordinator binding (author_critic.yaml) instead: it
-    does not prove the statement itself but delegates the work to its subagents. The run's ``author_mode``
-    option says which (AUTHOR_MODES): "author", and "auto", the default, run the author; "coordinator" runs the
-    coordinator and needs that binding and 1 or more subagents (the server always passes the mode a job
-    recorded at its start, so a job that started with a coordinator keeps it). A mode the run cannot have is a
-    ConfigurationError, which no retry changes.
-    """
-
-    mode = options.get("author_mode", "auto")
-    if mode not in AUTHOR_MODES:
-        raise ConfigurationError("Choose auto, coordinator or author as the author mode.")
-    count = subagent_count(node, options)
-    if node.get("coordinator") is None or not count:
-        if mode == "coordinator":
-            raise ConfigurationError("The author coordinator needs Author subagents 1 or more."
-                                     if node.get("coordinator") else "This workflow's author has no coordinator prompts.")
-        return "author"
-    return "coordinator" if mode == "coordinator" else "author"
-
-
 def _settings(node, options):
     role = node.get("role", "")
     return {
@@ -7963,10 +7484,6 @@ def _node_prompt_names(node):
     names.update([instructions] if isinstance(instructions, str) else instructions)
     lifecycle = node.get("lifecycle", {})
     names.update(lifecycle if isinstance(lifecycle, list) else lifecycle.values())
-    if isinstance(node.get("coordinator"), dict):
-        # The author coordinator's first prompt and lifecycle prompts (see author_mode()).
-        names.add(node["coordinator"]["prompt"])
-        names.update(_lifecycle_map(node["coordinator"]["lifecycle"]).values())
     if node.get("recovery"):
         names.add(node["recovery"]["prompt"])
     branches = node.get("next")
@@ -8031,16 +7548,6 @@ def prepare(workflow, options):
 
             for key, reference in _lifecycle_map(node["lifecycle"]).items():
                 check(key, reference)
-            # The run's author mode, for every goal node: one the run cannot have (a coordinator without a
-            # coordinator binding or without subagents) stops the launch here, before any model starts.
-            if author_mode(node, options) == "coordinator":
-                binding = node["coordinator"]
-                # The coordinator's first prompt: the statement once, and its number of subagents.
-                if options.get("author_input") is None and prompts[binding["prompt"]].count(node["marker"]) != 1:
-                    raise ValueError(f"The coordinator prompt must contain exactly one {node['marker']}.")
-                _template_parts(prompts[binding["prompt"]], {"author_subagents"})
-                for key, reference in _lifecycle_map(binding["lifecycle"]).items():
-                    check(key, reference)
     return prompts
 
 
@@ -8065,8 +7572,8 @@ def prompt_rules(workflow):
 
     ``fields`` is the set of placeholders the text may use, or None for a text that is used as written (never
     rendered, so a brace is plain text); ``marker`` is the statement marker the text must hold exactly once, or
-    None. It follows prepare() with every stage on and the coordinator's prompts included; a text two uses render
-    may use only the placeholders both allow. The Prompts dialog checks edits with it (runner/prompt_catalog.py).
+    None. It follows prepare() with every stage on; a text two uses render may use only the placeholders both
+    allow. The Prompts dialog checks edits with it (runner/prompt_catalog.py).
     """
 
     rules = {name: [None, None] for name in workflow["prompts"]}
@@ -8096,10 +7603,6 @@ def prompt_rules(workflow):
                 allow(node["recovery"]["prompt"], fields)
             for key, reference in _lifecycle_map(node["lifecycle"]).items():
                 allow(reference, _lifecycle_fields(key, fields))
-            if isinstance(node.get("coordinator"), dict):
-                allow(node["coordinator"]["prompt"], {"author_subagents"}, node["marker"])
-                for key, reference in _lifecycle_map(node["coordinator"]["lifecycle"]).items():
-                    allow(reference, _lifecycle_fields(key, fields))
     return {name: (rule[0], rule[1]) for name, rule in rules.items()}
 
 
@@ -8209,24 +7712,6 @@ def goal_limit_text(hours, remaining):
         return "none"
     left = f"about {_clock_text(remaining)} left" if remaining >= 60 else "less than 1 min left"
     return f"{_clock_text(hours * 3600)}, {left}"
-
-
-def prepare_memory_folder(directory, stage):
-    """Create MEMORY_FOLDER, the author coordinator's memory, in its working directory ``directory``.
-
-    The folder is owner-only where the system has such permissions. An entry of that name that is already
-    there is left exactly as it is, whatever it holds. A folder that cannot be made is said in a diagnostic;
-    the coordinator can still make it itself. An author that works on the statement itself makes its memory
-    folder when it first writes there (its prompt asks it to keep one): TCS Prover creates no file for it.
-    """
-
-    try:
-        os.mkdir(Path(directory) / MEMORY_FOLDER, 0o700)
-    except FileExistsError:
-        pass
-    except OSError as exc:
-        emit("diagnostic", stage, text=f"Could not create the coordinator's {MEMORY_FOLDER} folder ({exc}); the "
-                                       "coordinator can still create it itself.")
 
 
 def _after_submission(options):
@@ -9214,8 +8699,7 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
     # The latest known way to continue; a session that fails early reports less.
     known = {"thread": options.get("goal_thread_id"), "stage": stage, "values": None, "steer": None,
              "pending_compaction": None, "anchor": None, "instruction": None, "rewind": None,
-             "replace": None, "refusal": None, "classic_shell": False, "warned": [],
-             "team_worked": False}
+             "replace": None, "refusal": None, "classic_shell": False}
     failing_since = None
     with retry_clock(options).call(stage):
         while True:
@@ -9231,10 +8715,6 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
                 for key in ("thread", "stage", "values", "steer", "pending_compaction", "anchor"):
                     if retry.get(key):
                         known[key] = retry[key]
-                if isinstance(retry.get("warned"), list):
-                    known["warned"] = retry["warned"]  # The coordinator's warnings still listed (CoordinatorWatch).
-                # A team call of the coordinator worked in an earlier attempt: its team runs on (CoordinatorWatch).
-                known["team_worked"] = known["team_worked"] or retry.get("team_worked") is True
                 # Consecutive identical refusals to reopen the thread; any other outcome resets the count.
                 known["refusal"] = retry.get("refusal")
                 known["classic_shell"] = known["classic_shell"] or bool(retry.get("classic_shell"))
@@ -9273,9 +8753,7 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
                 continued = {"stage": known["stage"], "values": known["values"] or {},
                              "instruction": known["instruction"], "rewind": known["rewind"],
                              "pending_compaction": known["pending_compaction"], "anchor": known["anchor"],
-                             "attempt": attempt, "refusal": known["refusal"], "classic_shell": known["classic_shell"],
-                             "warned": known["warned"],
-                             "team_worked": known["team_worked"]}
+                             "attempt": attempt, "refusal": known["refusal"], "classic_shell": known["classic_shell"]}
                 if rewind.get("fresh") or known["replace"]:
                     # The conversation's first turn produced nothing (a new
                     # conversation with the same first instruction loses
@@ -9344,10 +8822,10 @@ def _execute(workflow, state, options, prompts):
         _capture_unreviewed_proof(workflow, state, options)
         return state
     sessions, revisions, launchers = {}, {}, {}
-    # TCS Prover's MCP service of this runner (team.Service) and the author coordinator's team, by node: made when
-    # an author needs them, ended with the run's steps.
-    services, teams = [], {}
-    # A lone author's examiner by node (start_team(lone=True)), kept across the author's attempts like a team.
+    # TCS Prover's MCP service of this runner (team.Service): made when an author needs it, ended with the run's
+    # steps.
+    services = []
+    # The author's examiner by node (start_team(lone=True)), kept across the author's attempts.
     examiners = {}
     options.setdefault("_workflow_started", _now())
     retry_clock(options)
@@ -9426,27 +8904,20 @@ def _execute(workflow, state, options, prompts):
                     inline = "\n\n" + INLINE_PROOF_NOTE if not proof_handoff.file_handoff_supported() else ""
                     directory = options.get("goal_cwd") or str(Path.cwd())
 
-                    def plan(coordinating, appendix, note="", examined=False):
+                    def plan(examined=False):
                         """How the author starts: its first prompt, its lifecycle prompts and any recovered critic
-                        feedback, as the author coordinator (``coordinating``, the node's coordinator binding) or
-                        as the author alone, with the subagents note when ``appendix`` says so; ``note`` is the
-                        team note of a coordinator with TCS Prover's team. ``examined``: the author has an examiner
-                        (see ``examined`` below), which the examiner note tells it."""
+                        feedback, with the subagents note when it may start subagents. ``examined``: the author has
+                        an examiner (see ``examined`` below), which the examiner note tells it."""
 
-                        bound = ({**lifecycle, **_lifecycle_map(node["coordinator"]["lifecycle"])} if coordinating
-                                 else lifecycle)
+                        bound = lifecycle
                         prompt = options.get("author_input")
                         if prompt is None:
-                            # The coordinator prompt is a template ({author_subagents}), filled in before the
-                            # statement goes in, so that no brace of the statement is read as a field.
-                            first = (render_template(prompts[node["coordinator"]["prompt"]], {"author_subagents": count})
-                                     if coordinating else prompts[node["prompt"]])
-                            prompt = first.replace(node["marker"], task, 1)
+                            prompt = prompts[node["prompt"]].replace(node["marker"], task, 1)
                         if options.get("related_works") and "related_works" in bound:
                             # The run has related works: the first prompt points to them, and
                             # {original_prompt} carries the pointer into the later prompts.
                             prompt += "\n\n" + prompts[bound["related_works"]]
-                        if appendix and count and "subagents" in bound:
+                        if count and "subagents" in bound:
                             # The author may start subagents: the first prompt says how many, like the related
                             # works, and {original_prompt} carries it into the later prompts.
                             prompt += "\n\n" + render_template(prompts[bound["subagents"]], {"author_subagents": count})
@@ -9454,106 +8925,37 @@ def _execute(workflow, state, options, prompts):
                             # An examiner reports to the author: the first prompt says so, as written, and
                             # {original_prompt} carries it into the later prompts.
                             prompt += "\n\n" + prompts[bound["examiner_note"]]
-                        if note:
-                            # The coordinator's team, after the related works and before the inline proof note;
-                            # {original_prompt} carries it into the later prompts.
-                            prompt += "\n\n" + note
                         prompt += inline
                         session_prompts = {key: prompts[ref] + (inline if key in INLINE_PROOF_PROMPTS else "")
                                            for key, ref in bound.items() if key not in ("subagents", "examiner_note")}
                         recovery = node.get("recovery")
                         instruction = ""
                         if recovery and evaluate(recovery["when"], context):
-                            # The coordinator gets the critic's feedback in its own prompt for the same lifecycle key.
-                            reference = next((bound[key] for key, ref in lifecycle.items() if ref == recovery["prompt"]),
-                                             recovery["prompt"])
                             feedback = {key: evaluate(expression, context) for key, expression in node["resume"].items()}
-                            instruction = render_template(prompts[reference] + inline, {
+                            instruction = render_template(prompts[recovery["prompt"]] + inline, {
                                 "original_prompt": prompt, "directory": str(directory),
                                 "instruction": "", "revision_number": 1, **feedback,
                             })
                         return {"prompt": prompt, "prompts": session_prompts, "recovery": instruction, "bound": bound}
 
-                    coordinator, alone, stage_name = author_mode(node, options) == "coordinator", None, node.get("stage", "solve")
+                    stage_name = node.get("stage", "solve")
                     if count is not None:
                         # The most subagents at once (Codex's own limits, see subagent_limits()).
                         settings["subagents"] = count
                     texts = {name: prompts[name] for name in HARNESS_TEXTS if name in prompts}
-                    # Whether an author that proves the statement itself gets an examiner: the run's ``examiner``
-                    # option (the job's Examiner setting; on unless it says otherwise) with an author_examiner text.
+                    # Whether the author gets an examiner: the run's ``examiner`` option (the job's Examiner
+                    # setting; on unless it says otherwise) with an author_examiner text.
                     examined = (options.get("examiner", True) is not False
                                 and bool(str(texts.get("author_examiner") or "").strip()))
-                    crew, members = None, []
-                    if coordinator and options.get("author_team", "builtin") == "tcs":
-                        if retrieval_policy(directory, features):
-                            # A web-cutoff run's audited configuration has no place for TCS Prover's server: its
-                            # coordinator keeps the CLI's own subagents (docs/developers.md).
-                            emit("status", stage_name, node=current, label="Built-in subagents",
-                                 text="Web-cutoff runs keep the CLI's own subagent tool for the coordinator, with "
-                                      "the coordinator's model; TCS Prover's team is used in live runs only.")
-                        else:
-                            missing = [name for name in ("team_note", "team_member", *(
-                                name for name in HARNESS_TEXTS if name.startswith("team_tool_"))) if name not in texts]
-                            if missing:
-                                raise ConfigurationError(f"The workflow has no {', '.join(missing)} text, which the "
-                                                         "coordinator's team needs.")
-                            models = options.get("author_subagent_models")
-                            try:
-                                models = team_module.validated_team(models, count)
-                            except ValueError as exc:
-                                raise ConfigurationError(str(exc)) from exc
-                            members = team_module.team_members(models, settings["model"], settings["effort"], count)
-                            crew = teams.get(current)
-                            if crew is None or crew.closed is not None:
-                                # The examiner's seat, with the coordinator's model, numbered after the members
-                                # (only with a team_examiner text: a job from before has none).
-                                examiner = None
-                                if str(texts.get("team_examiner") or "").strip():
-                                    examiner = {**team_module.team_members(
-                                        None, settings["model"], settings["effort"], 1)[0], "member": len(members) + 1}
-                                crew = teams[current] = start_team(members, prompts=texts, directory=directory,
-                                                                   settings=settings, stage=stage_name,
-                                                                   node_name=current, examiner=examiner)
-                                # What a pause kept of the previous runner's team at this step (Team.carry()).
-                                carried = state.get(team_module.TEAM_CARRY)
-                                if isinstance(carried, dict):
-                                    crew.restore(carried.pop(current, None))
-                                    if not carried:
-                                        state.pop(team_module.TEAM_CARRY, None)
-                            # Its members are TCS Prover's: the coordinator gets no subagent tool of its CLI.
-                            features = [feature for feature in features if feature != "multi_agent"]
-                            note = team_module.team_note(texts["team_note"], members, render_template)
-                    if crew is not None:
-                        # Claude Code keeps the team's MCP server in --bare mode too (claude_cli.goal_session), so a
-                        # Claude coordinator never needs the plan of an author alone.
-                        start = plan(True, False, note)
-                        prepare_memory_folder(directory, stage_name)
-                    elif coordinator and multi_agent_version(settings["model"]) == 0:
-                        # Codex gives this model no subagent tool: the author works alone, without the subagent
-                        # feature and the subagents note, as with Author subagents 0.
-                        coordinator = False
-                        features = [feature for feature in features if feature != "multi_agent"]
-                        note_no_subagent_tool(stage_name, settings["model"], count, coordinator=True)
-                        start = plan(False, False, examined=examined)
-                    elif coordinator:
-                        start = plan(True, False)
-                        prepare_memory_folder(directory, stage_name)
-                        if claude:
-                            # Claude Code offers no subagent tool in --bare mode, which it learns only as it starts
-                            # (claude_cli.goal_session): the author then works alone like this.
-                            alone = plan(False, False)
-                    else:
-                        start = plan(False, True, examined=examined)
-                        if count is not None:
-                            note_no_subagent_tool(stage_name, settings["model"], count)
+                    start = plan(examined)
+                    if count is not None:
+                        note_no_subagent_tool(stage_name, settings["model"], count)
                     prompt, session_prompts, instruction = start["prompt"], start["prompts"], start["recovery"]
-                    if alone is not None:
-                        alone.pop("bound")
                     # The author's examiner (``examined`` above): TCS Prover starts it each time the author's
                     # conversation is compacted and its reports go into the author's running turn (the goal
-                    # session's ``examiner``). The earlier team design has the team's own examiner instead.
+                    # session's ``examiner``).
                     lone_examiner = None
-                    if crew is None and not coordinator and examined:
+                    if examined:
                         lone_examiner = examiners.get(current)
                         if lone_examiner is None or lone_examiner.closed is not None:
                             seat = {**team_module.team_members(None, settings["model"], settings["effort"], 1)[0],
@@ -9562,13 +8964,12 @@ def _execute(workflow, state, options, prompts):
                                 [], prompts={**texts, "team_examiner": texts["author_examiner"]},
                                 directory=directory, settings=settings, stage=stage_name, node_name=current,
                                 examiner=seat, lone=True)
-                    # A live run whose author's model, or a team member's, gets no web search tool from Codex says so
-                    # as it starts (the run goes on without it).
-                    note_no_web_search(stage_name, current, settings["model"], members if crew is not None else (),
-                                       coordinator=coordinator, directory=directory)
+                    # A live run whose author's model gets no web search tool from Codex says so as it starts (the
+                    # run goes on without it).
+                    note_no_web_search(stage_name, current, settings["model"], directory=directory)
                     service = None
-                    if crew is not None or (not claude and options.get("goal_loop", "codex") == "tcs"
-                                            and not retrieval_policy(directory, features)):
+                    if (not claude and options.get("goal_loop", "codex") == "tcs"
+                            and not retrieval_policy(directory, features)):
                         if not services:
                             services.append(team_module.Service())
                             register_secret(services[0].token)  # Never shown in a record.
@@ -9577,8 +8978,6 @@ def _execute(workflow, state, options, prompts):
                         claude_cli.goal_session if claude else goal_session, sys.modules[__name__], prompt,
                         prompts=session_prompts, settings=settings, features=features,
                         stages=node.get("stages"), node_name=current, texts=texts,
-                        **({"coordinator": True} if coordinator else {}), **({"alone": alone} if alone else {}),
-                        **({"team": crew} if crew is not None else {}),
                         **({"examiner": lone_examiner} if lone_examiner is not None else {}),
                         **({"service": service} if service is not None else {}),
                     )
@@ -9677,15 +9076,6 @@ def _execute(workflow, state, options, prompts):
             _step_visit(state, current, visits, verify)
         state["paused"] = True
         state.pop("failed", None)
-        # The coordinator's team at this step: its authors' conversations and the assignments the pause stopped go
-        # with the saved state to the next runner, whose team takes them over (Team.carry(), Team.restore()).
-        state.pop(team_module.TEAM_CARRY, None)
-        crew = teams.get(current)
-        if crew is not None:
-            crew.close("It stopped when the run paused.")
-            kept = crew.carry()
-            if kept:
-                state[team_module.TEAM_CARRY] = {current: kept}
         thread_id = getattr(exc, "thread_id", None) or options.get("goal_thread_id")
         emit("workflow_paused", node.get("stage", current), node=current, state=state,
              reason=reason, threadId=thread_id,
@@ -9696,8 +9086,8 @@ def _execute(workflow, state, options, prompts):
     finally:
         for session in sessions.values():
             session.close()
-        for crew in (*teams.values(), *examiners.values()):
-            crew.close("It stopped when the run's steps ended.")
+        for examiner in examiners.values():
+            examiner.close("It stopped when the run's steps ended.")
         for service in services:
             service.close()
 
@@ -9870,8 +9260,7 @@ def run_author_conversation(workflow_path, options, request):
     """One conversation turn of a paused proof author (`--converse`); return the exit code 0.
 
     ``request`` comes from conversation_request(): a progress summary (the
-    YAML ``summary`` prompt, the coordinator binding's for an author
-    coordinator, see author_mode()) or a reply to the user's message
+    YAML ``summary`` prompt) or a reply to the user's message
     (``conversation``), led by its notice. Only the author node is prepared, so only its model and
     credentials are checked, and the turn runs outside the time budget: the
     time limit, live-instruction and pause files are dropped. The turn runs in
@@ -9914,12 +9303,6 @@ def run_author_conversation(workflow_path, options, request):
         prompts = prepare(workflow, options)
         lifecycle = _lifecycle_map(node["lifecycle"])
         settings = _settings(node, options)
-        if author_mode(node, options) == "coordinator" and (multi_agent_version(settings["model"]) != 0
-                                                            or options.get("author_team", "builtin") == "tcs"):
-            # The author coordinator's own prompts where its binding replaces the author's (the summary). A Codex
-            # model that gets no subagent tool worked alone, with the author's prompts, unless its subagents were
-            # TCS Prover's team (see _execute).
-            lifecycle.update(_lifecycle_map(node["coordinator"]["lifecycle"]))
         key = "summary" if kind == "summary" else "conversation"
         if key not in lifecycle:
             raise WorkflowDefinitionError(f"The workflow's author node binds no {key} prompt.")
@@ -10041,21 +9424,10 @@ def _main(argv=None):
     parser.add_argument("--author-subagents", type=author_subagents,
                         help=f"subagents the proof author may start at a time (0 to {MAX_AUTHOR_SUBAGENTS}; the "
                              "workflow's default, 3 in author_critic.yaml; 0 gives it no subagent tool)")
-    parser.add_argument("--author-mode", choices=AUTHOR_MODES,
-                        help="coordinator: the proof author coordinates its subagents (the coordinator prompts); "
-                             "author: it works alone even with subagents; auto, the default: coordinator when "
-                             "--author-subagents is 1 or more")
     parser.add_argument("--goal-loop", choices=GOAL_LOOPS, default="tcs",
-                        help="who runs the goal loop of a Codex author or coordinator: tcs, the default, TCS "
-                             "Prover (it starts every turn; the model ends its goal with TCS Prover's update_goal "
-                             "tool); codex: Codex's built-in goal mode")
-    parser.add_argument("--author-team", choices=AUTHOR_TEAMS, default="tcs",
-                        help="the author coordinator's subagents: tcs, the default, TCS Prover's team (any model "
-                             "for each member, see --author-subagent-models); builtin: the CLI's own subagent tool")
-    parser.add_argument("--author-subagent-models", type=author_subagent_models, metavar="JSON",
-                        help="the model of each of the coordinator's team members: a JSON list of exactly "
-                             "--author-subagents entries {\"model\": MODEL, \"effort\": EFFORT}; null or omitted: "
-                             "every member runs the coordinator's model")
+                        help="who runs the goal loop of a Codex author: tcs, the default, TCS Prover (it starts "
+                             "every turn; the model ends its goal with TCS Prover's update_goal tool); codex: Codex's "
+                             "built-in goal mode")
     parser.add_argument("--prompt-set-file",
                         help="a JSON object {prompt name: text} that replaces the workflows' prompts of those names "
                              "(a job's saved texts)")

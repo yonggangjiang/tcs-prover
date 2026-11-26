@@ -131,10 +131,7 @@ run through, and LaTeX, one card each:
   form's selected roles only, and a job that waits for a program or a login
   links to Setup from its line under **Needs your attention**, its row and its
   page. None of this stops a start: the job retries every minute and continues
-  by itself. An author subagent's program is the exception the hint beside
-  **Start workflow** names: until it is set up, the coordinator's assignments to
-  that subagent fail and come back to it with the reason (see
-  [the author's team](workflow.md#the-authors-team)).
+  by itself.
 - Setup is not available through the live gateway; open TCS Prover from its own
   launch link.
 
@@ -163,10 +160,7 @@ missing, not running, not on the jobs' path or, for a built-in model, not signed
 in, the chip adds it (for example *Claude Code · not installed*) and a hint under
 the menus links to Setup; nothing stops a start. Only the model you chose for a
 role of a selected stage gets this note: the **Source** menus offer every source
-without marks. Each author subagent of **Choose for each** counts like a role:
-its row's chip says the same, the hint names it (*Claude Code is not installed on
-this computer; the author subagent 2 uses it.*), and the Setup page counts its
-program as needed (an API connection's program installed, without a sign-in).
+without marks.
 
 ## Codex CLI
 
@@ -190,21 +184,14 @@ saved `ultra` runs as `max`) and always run at standard speed.
 Earlier versions of TCS Prover called this program the Claude CLI; the activity
 logs of jobs run then keep that name.
 
-- **Tools.** Every Claude process gets an explicit tool list and no MCP servers
-  (an author coordinator with [TCS Prover's team](workflow.md#the-authors-team)
-  gets only TCS Prover's own, which gives it its team's tools), user settings,
-  skills, plugins, hooks or `CLAUDE.md`, and never waits for a permission prompt
-  (see [Sandbox and network](sandbox.md#claude-code)). Web-search tools follow
-  the job's search mode. Only the critic, and an author with **Author
-  subagents** 1 or more whose subagents are Claude Code's own (a coordinator of
-  a job from before TCS Prover's team, or of a rerun that keeps them, and the
-  author of a job from before coordinator mode), get the subagent tool (Task);
-  TCS Prover limits how many subagents run at once and keeps them in the
-  foreground through Claude Code's environment (see
+- **Tools.** Every Claude process gets an explicit tool list and no MCP servers,
+  user settings, skills, plugins, hooks or `CLAUDE.md`, and never waits for a
+  permission prompt (see [Sandbox and network](sandbox.md#claude-code)).
+  Web-search tools follow the job's search mode. Only the critic, and an author
+  with **Parallel agents** 2 or more, get the subagent tool (Task); TCS Prover
+  limits how many subagents run at once and keeps them in the foreground
+  through Claude Code's environment (see
   [what the program enforces](workflow.md#subagents-what-the-program-enforces)).
-  A coordinator with TCS Prover's team, as every new one is, gets no subagent
-  tool: its subagents are the team's members, which it reaches through the team
-  tools.
 - If Claude Code offers a tool beyond the list (its subagent tool counts as one
   tool under either name, Task or Agent), the attempt ends and the next one
   denies that tool with `--disallowedTools`. A tool this does not remove stops
@@ -266,19 +253,21 @@ type a model id.
   latency and the provider's message with the key removed. Testing unchanged
   saved settings records the result on the connection. For an OpenAI-format
   connection whose catalog loaded, the Test then sends one request shaped as
-  runs send TCS Prover's team tools to a coordinator (a tool in the namespace
-  `mcp__tcs`; for a model the Codex CLI runs as "Responses Lite", such as
-  gpt-6.1-sol, in the same place of the request as the Codex CLI puts it), with
+  runs send TCS Prover's tools to a Codex author under TCS Prover's goal loop
+  (`update_goal`: a tool in the namespace `mcp__tcs`; for a model the Codex CLI
+  runs as "Responses Lite", such as gpt-6.1-sol, in the same place of the
+  request as the Codex CLI puts it), with
   the first such model of the catalog, else its first model (one model per
   Test, within its own 30-second deadline), and it says plainly whether the
   model called the tool back with its namespace. When it did not
   (the endpoint refused the request but answers the same request without the
   tool, the model called the tool without its namespace, which the Codex CLI
   refuses, or called none), the line is a warning, and the saved connection's
-  row keeps it: a coordinator on that connection could not use its team. An
-  answer that says nothing about the team tools leaves them *not checked*, a
-  warning too, with what came back: no answer within the deadline, a failure
-  that may pass (HTTP 408, 425, 429 or 5xx, such as a proxy's "cooling down"),
+  row keeps it: an author on that connection could not end its goal with
+  `update_goal`. An answer that says nothing about TCS Prover's tools leaves
+  them *not checked*, a warning too, with what came back: no answer within the
+  deadline, a failure that may pass (HTTP 408, 425, 429 or 5xx, such as a
+  proxy's "cooling down"),
   a refused key or model (401, 403, 404), or a refusal of the same request
   without the tool as well (a second request, with its own 30-second
   deadline). The service's words in these lines are clipped to fit the 300
@@ -309,9 +298,9 @@ type a model id.
   and the other GPT 6 and GPT 5.6 models of Codex's own model list) through an
   API connection, unless the connection's **Web search through this
   connection** is on: its own web search otherwise comes only with its built-in
-  OpenAI provider, that is, the **Codex CLI** source. A live run whose author or
-  author subagent has such a model says so in the activity log as the author
-  starts (**No web search**), and goes on without web search. A job that
+  OpenAI provider, that is, the **Codex CLI** source. A live run whose author has
+  such a model says so in the activity log as the author starts (**No web
+  search**), and goes on without web search. A job that
   searches through a connection whose saved test search did not pass says so as
   each of its runners starts (**Web search may fail**, with when it was tested
   and what the test found), and a search that fails during the run says so after

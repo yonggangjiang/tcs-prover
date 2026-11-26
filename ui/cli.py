@@ -206,23 +206,19 @@ def direct_cli_options(
     speed_mode=DEFAULT_SPEED,
     reasoning_summary=DEFAULT_REASONING_SUMMARY,
     author_prompt_file=None, critic_prompt_file=None, final_prompt_file=None,
-    coordinator_prompt_file=None, goal_loop=DEFAULT_GOAL_LOOP, author_subagent_models=None,
-    author_mode=None, examiner=DEFAULT_EXAMINER,
+    goal_loop=DEFAULT_GOAL_LOOP, examiner=DEFAULT_EXAMINER,
 ):
     """Load optional prompt files and validate direct-workflow CLI settings.
 
     As in every new job, a terminal run's author proves the statement itself: alone with 0 author subagents, and
-    with 1 or more it may start that many with its program's own subagent tool. ``author_mode`` "coordinator" asks
-    for the earlier team design instead (see server.recorded_author_mode()), to which the coordinator prompt and
-    ``author_subagent_models`` (a JSON list of {"model", "effort"}, or None: every member runs the coordinator's
-    model) apply. ``goal_loop`` is the Goal loop setting and ``examiner`` the Examiner setting.
+    with 1 or more it may start that many with its program's own subagent tool. ``goal_loop`` is the Goal loop
+    setting and ``examiner`` the Examiner setting.
     """
 
     prompt_files = {
         "author": author_prompt_file,
         "critic": critic_prompt_file,
         "final": final_prompt_file,
-        "coordinator": coordinator_prompt_file,
     }
     prompts = {
         name: read_utf8(path, f"{name} prompt") if path else None
@@ -243,14 +239,10 @@ def direct_cli_options(
         author_prompt=prompts["author"],
         critic_prompt=prompts["critic"],
         final_prompt=prompts["final"],
-        coordinator_prompt=prompts["coordinator"],
         speed_mode=speed_mode,
         reasoning_summary=reasoning_summary,
         include_review=False,
-        goal_loop=goal_loop,
-        author_subagent_models=json.loads(author_subagent_models) if isinstance(author_subagent_models, str)
-        else author_subagent_models,
-        author_mode=author_mode, examiner=examiner,
+        goal_loop=goal_loop, examiner=examiner,
     )
     return {
         "critic_rounds": options["criticRounds"],
@@ -267,12 +259,9 @@ def direct_cli_options(
         "author_prompt": options["authorPrompt"],
         "critic_prompt": options["criticPrompt"],
         "final_prompt": options["finalPrompt"],
-        "coordinator_prompt": options["coordinatorPrompt"],
         "speed_mode": options["speedMode"],
         "reasoning_summary": options["reasoningSummary"],
-        "author_mode": options["authorMode"],
-        "team_options": {"goal_loop": options["goalLoop"], "author_subagent_models": options["authorSubagentModels"],
-                         "examiner": options["examiner"], "prompt_overrides": {}},
+        "team_options": {"goal_loop": options["goalLoop"], "examiner": options["examiner"], "prompt_overrides": {}},
     }
 
 
@@ -311,7 +300,7 @@ def research_resume_cli_settings(args, parser, argv):
     if "reasoningEffort" in options:
         for role in ("author", "critic", "writer"):
             options.setdefault(f"{role}Effort", options["reasoningEffort"])
-    for role in ("author", "critic", "final", "coordinator"):
+    for role in ("author", "critic", "final"):
         path = getattr(args, f"{role}_prompt_file")
         if path:
             options[f"{role}Prompt"] = read_utf8(path, f"{role} prompt")
@@ -751,30 +740,12 @@ def main():
             "N: it may start up to N subagents with its program's own subagent tool"
         ),
     )
-    # Not --author-mode: no new option may share a prefix with --author-model, which is abbreviated (--author-m).
-    parser.add_argument(
-        "-teamCoordinator", "--teamCoordinator", "--team-coordinator",
-        dest="team_coordinator", action="store_true",
-        help=(
-            "run the earlier team design: the proof author does not prove the statement itself but coordinates "
-            "--author-subagents author subagents (1 or more) through TCS Prover's team tools"
-        ),
-    )
     parser.add_argument(
         "-examiner", "--examiner",
         dest="examiner", choices=("on", "off"), default="on" if DEFAULT_EXAMINER else "off",
         help=(
             "the author's examiner (default: on): each time the author's conversation is compacted, TCS Prover "
             "starts a fresh session of the author's model that examines the whole run and reports to the author"
-        ),
-    )
-    parser.add_argument(
-        "-authorSubagentModels", "--authorSubagentModels", "--author-subagent-models",
-        dest="author_subagent_models", metavar="JSON", default=None,
-        help=(
-            "with --team-coordinator, the model of each author subagent: a JSON list of exactly N entries "
-            "{\"model\": MODEL, \"effort\": EFFORT} (N = --author-subagents), any model the role menus offer; "
-            "omitted: every author subagent runs the author's model"
         ),
     )
     parser.add_argument(
@@ -843,7 +814,7 @@ def main():
         default=DEFAULT_REASONING_SUMMARY,
         help="public reasoning-summary detail shown in the activity log",
     )
-    for role in ("author", "critic", "final", "coordinator"):
+    for role in ("author", "critic", "final"):
         camel = f"{role}PromptFile"
         parser.add_argument(
             f"-{camel}", f"--{camel}", f"--{role}-prompt-file",
@@ -888,10 +859,7 @@ def main():
                 author_prompt_file=args.author_prompt_file,
                 critic_prompt_file=args.critic_prompt_file,
                 final_prompt_file=args.final_prompt_file,
-                coordinator_prompt_file=args.coordinator_prompt_file,
-                goal_loop=args.goal_loop,
-                author_subagent_models=args.author_subagent_models,
-                author_mode="coordinator" if args.team_coordinator else "author", examiner=args.examiner == "on",
+                goal_loop=args.goal_loop, examiner=args.examiner == "on",
                 verbose_events=args.verbose_events,
             )
         except (OSError, TypeError, ValueError) as exc:
@@ -976,12 +944,7 @@ def main():
                     resume_settings["finalPrompt"] = read_utf8(
                         args.final_prompt_file, "final prompt"
                     )
-                if args.coordinator_prompt_file:
-                    resume_settings["coordinatorPrompt"] = read_utf8(
-                        args.coordinator_prompt_file, "coordinator prompt"
-                    )
-                # Author subagents only when given: otherwise the saved job's number, and with it how its author
-                # worked (an author that worked alone stays one), is kept.
+                # Author subagents only when given: otherwise the saved job's number is kept.
                 if supplied_on_command_line(parser, sys.argv[1:], "author_subagents"):
                     resume_settings["authorSubagents"] = args.author_subagents
                 resume_app = server.start_saved_critic_job(

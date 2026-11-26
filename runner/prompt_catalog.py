@@ -5,17 +5,26 @@ the statement reviewer, in ui/review.py; this module names them, groups them, sa
 placeholders it may use, and checks an edit as the runner checks it before a launch (workflow_runner.prompt_rules()).
 
 A catalog name is the key of a job's promptOverrides and promptSet. The per-job prompts that existed before keep their
-keys (review, author, coordinator, critic, final); every other text uses its name in the workflow. Jobs from before
-may also hold a RETIRED text, which nothing uses any more.
+keys (review, author, critic, final); every other text uses its name in the workflow. Jobs from before may also hold
+a RETIRED text, which nothing uses any more.
 """
 
-GROUPS = ("Statement review", "Author", "Coordinator", "Goal loop", "Team", "Team tools", "Critic", "Writer", "Other")
+GROUPS = ("Statement review", "Author", "Goal loop", "Critic", "Writer", "Other")
 
 # Catalog names whose workflow prompt has another name, and the texts that live outside the workflows.
 WORKFLOW_NAMES = {}
 # Texts that jobs from before saved but that no step uses any more: the convention critic's (a step removed on
-# 20 Nov 2026). A job made from such a job leaves them out (problems() does not know them).
-RETIRED = frozenset({"convention"})
+# 20 Nov 2026), and those of coordinator mode (removed on 26 Nov 2026). A job made from such a job leaves them out,
+# and saved settings or a request that name them drop them (problems() does not know them).
+RETIRED = frozenset({
+    "convention",
+    "coordinator", "coordinator_goal", "coordinator_continuation", "coordinator_reopen", "coordinator_compaction",
+    "coordinator_resume", "coordinator_repair", "coordinator_summary", "coordinator_report", "codex_coordinator_note",
+    "team_note", "team_member", "team_examiner", "team_examiner_note",
+    "team_tool_members", "team_tool_assign", "team_tool_assign_member", "team_tool_assign_assignment",
+    "team_tool_wait", "team_tool_wait_timeout_minutes", "team_tool_followup", "team_tool_followup_member",
+    "team_tool_followup_message", "team_tool_stop", "team_tool_stop_member",
+})
 REVIEW = "review"
 
 # (name, group, label, when it is used), in display order. A workflow prompt not listed here is shown in "Other".
@@ -23,8 +32,7 @@ ENTRIES = (
     (REVIEW, "Statement review", "Statement reviewer",
      "The instructions of the statement review (Review step), before the statement and any revision request."),
     ("author", "Author", "Author prompt",
-     "The proof author's first prompt when it works alone (Author subagents 0). [STATEMENT] is replaced by the "
-     "statement."),
+     "The proof author's first prompt. [STATEMENT] is replaced by the statement."),
     ("goal", "Author", "Author goal",
      "The author's goal: the objective of Codex's goal mode (Goal loop: Codex), the {objective} of the goal "
      "continuation (Goal loop: TCS Prover) and of Claude Code's goal note."),
@@ -33,6 +41,9 @@ ENTRIES = (
      "loop); with Codex's goal mode, only when Codex does not continue by itself; Claude Code gets it as it is."),
     ("reopen", "Author", "Reopened conversation",
      "The first message when a paused, stopped or restarted author's saved conversation is reopened."),
+    ("new_goal", "Author", "New goal",
+     "The first message when you set a new goal for a finished job: the author's saved conversation continues in the "
+     "same working directory. {original_prompt} is the author's first prompt with the new goal as its statement."),
     ("compaction", "Author", "After compaction",
      "Sent into the running turn after the author's conversation was compacted."),
     ("resume", "Author", "New conversation",
@@ -56,77 +67,30 @@ ENTRIES = (
      "Appended to the author's first prompt while the job's Examiner is on: it tells the author what its examiner "
      "is and what to do with its reports."),
     ("chat", "Author", "Chat message",
-     "Frames a chat message sent to the working author or coordinator: {message}, and {answer_file} for an answer."),
+     "Frames a chat message sent to the working author: {message}, and {answer_file} for an answer."),
     ("related_works", "Author", "Related works",
      "Appended to the first prompt when the job has related works."),
     ("subagents", "Author", "Subagents note",
      "Appended to the first prompt of an author with Parallel agents 2 or more, which may start subagents of its "
      "own; {author_subagents} is their number (one fewer than Parallel agents)."),
-    ("coordinator", "Coordinator", "Coordinator prompt",
-     "The first prompt of the author coordinator, the earlier team design that a job runs only when it asks for "
-     "it. {author_subagents} is the number of author subagents; [STATEMENT] is replaced by the statement."),
-    ("coordinator_goal", "Coordinator", "Coordinator goal", "Replaces the author goal for the coordinator."),
-    ("coordinator_continuation", "Coordinator", "Coordinator continuation",
-     "Replaces the author continuation for the coordinator."),
-    ("coordinator_reopen", "Coordinator", "Coordinator reopened conversation",
-     "Replaces the reopened-conversation message for the coordinator."),
-    ("coordinator_compaction", "Coordinator", "Coordinator after compaction",
-     "Replaces the after-compaction message for the coordinator."),
-    ("coordinator_resume", "Coordinator", "Coordinator new conversation",
-     "Replaces the new-conversation message for the coordinator."),
-    ("coordinator_repair", "Coordinator", "Coordinator critic rejection",
-     "Replaces the critic-rejection message for the coordinator."),
-    ("coordinator_summary", "Coordinator", "Coordinator progress summary",
-     "Replaces the progress summary for the coordinator."),
-    ("coordinator_report", "Coordinator", "Answer to a report",
-     "Sent in place of the continuation when the coordinator's final reply names no proof file (it is kept as a "
-     "progress report)."),
-    ("codex_coordinator_note", "Coordinator", "Note for a Codex coordinator",
-     "Sent to a Codex coordinator with TCS Prover's team as a developer message after Codex's own instructions, "
-     "which ask for a commentary update every 60 seconds and for no wait longer than 60 seconds; the note says "
-     "that neither applies to an unattended run. Empty: no note is sent."),
     ("goal_continuation", "Goal loop", "Goal continuation",
-     "Goal loop TCS Prover: the next turn after every turn of a Codex author or coordinator that did not end its "
-     "goal. {continuation} is the continuation (or the answer to a report), {objective} the goal, {elapsed} the "
-     "working time and {limit} the time limit. Default: Codex's own continuation text."),
+     "Goal loop TCS Prover: the next turn after every turn of a Codex author that did not end its goal. "
+     "{continuation} is the continuation, {objective} the goal, {elapsed} the working time and {limit} the time "
+     "limit. Default: Codex's own continuation text."),
     ("goal_tool_update_goal", "Goal loop", "update_goal tool",
-     "Goal loop TCS Prover: the description of the update_goal tool with which a Codex author or coordinator ends "
-     "its goal (complete hands its final reply on; blocked and paused are recorded and the work goes on). Default: "
-     "Codex's own."),
+     "Goal loop TCS Prover: the description of the update_goal tool with which a Codex author ends its goal "
+     "(complete hands its final reply on; blocked and paused are recorded and the work goes on). Default: Codex's "
+     "own."),
     ("goal_tool_update_goal_status", "Goal loop", "update_goal: status",
      "The description of update_goal's status argument. Default: Codex's own."),
     ("goal_tool_update_goal_note", "Goal loop", "update_goal: note",
      "The description of update_goal's optional note, shown on the job page."),
     ("claude_goal_harness", "Goal loop", "Claude Code goal note",
-     "Added to the system prompt of a Claude Code author or coordinator, which ends every turn with a goal status; "
-     "{objective} is the goal."),
+     "Added to the system prompt of a Claude Code author, which ends every turn with a goal status; {objective} is "
+     "the goal."),
     ("codex_compact_prompt", "Goal loop", "Codex compaction summary",
-     "Codex's compact_prompt setting for Codex authors, coordinators and team members: the instructions for the "
-     "summary Codex writes when it compacts a conversation. Empty: Codex's own."),
-    ("team_note", "Team", "Team note",
-     "Appended to the coordinator's first prompt when its subagents are TCS Prover's team; {members} lists them."),
-    ("team_member", "Team", "Member assignment",
-     "What a team member receives for an assignment or a follow-up; {assignment} is the coordinator's text."),
-    ("team_examiner", "Team", "Examiner instructions",
-     "The whole instruction of the examiner: a seat beside the authors that TCS Prover starts itself while an author "
-     "works (about once an hour, once an author has reported), each time in a fresh conversation with the "
-     "coordinator's model. Its report reaches the coordinator through team_wait. Empty: the team has no examiner."),
-    ("team_examiner_note", "Team", "What the coordinator is told about the examiner",
-     "Added to the description of team_wait when the team has an examiner."),
-    ("team_tool_members", "Team tools", "team_members tool", "The description of team_members."),
-    ("team_tool_assign", "Team tools", "team_assign tool", "The description of team_assign."),
-    ("team_tool_assign_member", "Team tools", "team_assign: member", "The description of team_assign's member."),
-    ("team_tool_assign_assignment", "Team tools", "team_assign: assignment",
-     "The description of team_assign's assignment."),
-    ("team_tool_wait", "Team tools", "team_wait tool", "The description of team_wait."),
-    ("team_tool_wait_timeout_minutes", "Team tools", "team_wait: timeout_minutes",
-     "The description of team_wait's timeout_minutes."),
-    ("team_tool_followup", "Team tools", "team_followup tool", "The description of team_followup."),
-    ("team_tool_followup_member", "Team tools", "team_followup: member", "The description of team_followup's member."),
-    ("team_tool_followup_message", "Team tools", "team_followup: message",
-     "The description of team_followup's message."),
-    ("team_tool_stop", "Team tools", "team_stop tool", "The description of team_stop."),
-    ("team_tool_stop_member", "Team tools", "team_stop: member", "The description of team_stop's member."),
+     "Codex's compact_prompt setting for Codex authors and their examiner: the instructions for the summary Codex "
+     "writes when it compacts a conversation. Empty: Codex's own."),
     ("critic", "Critic", "Critic instructions",
      "The critic's instructions in every critic round; {count} is the number of independent critics."),
     ("critic_input", "Critic", "Critic request",

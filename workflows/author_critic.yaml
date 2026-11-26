@@ -7,17 +7,11 @@ nodes:
     role: author
     stage: solve
     prompt: author
-    lifecycle: [goal, continuation, compaction, repair, resume, reopen, summary, conversation, chat, related_works, handoff_refused, subagents, examiner_note]
+    lifecycle: [goal, continuation, compaction, repair, resume, reopen, new_goal, summary, conversation, chat, related_works, handoff_refused, subagents, examiner_note]
     # The run's Parallel agents setting, as the number of subagents the author may start (author_subagents, 0 to 10:
     # one fewer than Parallel agents). 0, the default: the author works alone and has no subagent tool. 1 or more:
     # it gets its program's own subagent tool, limited to that many at a time, and the subagents note below.
     subagents: {option: author_subagents, default: 0, minimum: 0}
-    # The earlier team design, for a run that asks for it (author mode "coordinator", with 1 or more subagents) and
-    # for the jobs that recorded it: the author node runs a coordinator whose first prompt is the per-job coordinator
-    # prompt, and these lifecycle prompts replace the author's; the others stay shared.
-    coordinator:
-      prompt: coordinator
-      lifecycle: {goal: coordinator_goal, continuation: coordinator_continuation, reopen: coordinator_reopen, compaction: coordinator_compaction, resume: coordinator_resume, repair: coordinator_repair, summary: coordinator_summary, report: coordinator_report}
     task: state.statement
     marker: '[STATEMENT]'
     resume: {solution: state.solution, bugs: state.report.bugs, round: state.round}
@@ -100,8 +94,8 @@ prompts:
   # the lifecycle prompts: {original_prompt} (the first prompt), {directory}, {solution}, {bugs}, {round},
   # {revision_number} and {instruction}.
   goal: >-
-    Prove the exact statement given in the initial prompt with a complete,
-    rigorous argument.
+    Prove the exact statement of your current task with a complete, rigorous
+    argument.
   # EDIT AUTHOR CONTINUATION HERE: sent after an author turn that did not end the goal: TCS Prover's goal
   # loop places it first in goal_continuation; Codex's goal mode sends it only when Codex does not continue
   # by itself; Claude Code gets it as it is. Placeholders as for the goal.
@@ -112,6 +106,14 @@ prompts:
   # reopened. Placeholders as for the goal.
   reopen: >-
     Keep working on the same statement.
+  # EDIT NEW GOAL HERE: the first message when the user sets a new goal for a finished job: the author's saved
+  # conversation continues in the same working directory, with the new goal as its statement. {original_prompt} is
+  # the author's first prompt with the new goal in place of the earlier statement. Placeholders as for the goal.
+  new_goal: |-
+    The user has set a new goal for this work. It replaces the statement you worked on until now. Your earlier work stays in your working directory and your memory folder, and each earlier statement, with the proof and paper that came of it, is kept in the goals folder of your working directory. Build on them where they help.
+
+    YOUR NEW TASK:
+    {original_prompt}
   # EDIT COMPACTION HERE: sent into the running turn after the author's conversation was compacted;
   # {original_prompt} is its first prompt. Placeholders as for the goal.
   compaction: |-
@@ -144,27 +146,29 @@ prompts:
 
     Fix this and submit the complete proof again.
   # EDIT PAUSED AUTHOR HERE: the reply prompt has {message} and no other placeholder; the summary has none. Write any other brace twice.
-  # The paused author's conversation turns (workflow_runner.py --converse): a
-  # progress summary, and a reply to the user's message.
+  # The author's conversation turns while the job is paused or stopped at the author, or has finished
+  # (workflow_runner.py --converse): a progress summary, and a reply to the user's message.
   summary: >-
-    The proof work is paused. Write a progress summary for the user: what you
-    have proved so far, with precise statements, and where it is written; what
-    remains open or uncertain, and why; and what is currently achievable,
-    including the most promising next steps. Do not continue the proof work or
-    change any files in this turn.
+    The proof work is not running now. Write a progress summary for the user:
+    what you have proved so far, with precise statements, and where it is
+    written; what remains open or uncertain, and why; and what is currently
+    achievable, including the most promising next steps. Do not continue the
+    proof work or change any files in this turn.
   conversation: |-
-    The proof work is paused. Reply to the user's message below. Do not continue the proof work or change any files in this turn; the work continues when the user resumes the run.
+    The proof work is not running now. Reply to the user's message below. Do not continue the proof work or change any files in this turn.
 
     USER MESSAGE:
     {message}
   # EDIT CHAT HERE.
   # Sent with every chat message while the author works (a live instruction): {message} is the user's text,
-  # {answer_file} where the author writes an answer the message asks for; TCS Prover shows it in the chat.
+  # {answer_file} where the author writes its reply; TCS Prover shows it in the chat. Every message gets a reply, an
+  # answer or a short confirmation, and the chat shows the author replying until it does; a job whose chat prompt
+  # differs from this one is not expected to reply to an instruction.
   chat: |-
     [MESSAGE FROM THE USER]
     {message}
 
-    If this message asks you a question or asks for information, answer it for the user: write your answer, addressed to the user, to the file {answer_file}, then continue your proof work. If it only gives an instruction, follow it; no answer file is needed.
+    If this message asks you a question or asks for information, answer it for the user: write your answer, addressed to the user, to the file {answer_file}, then continue your proof work. If it only gives an instruction, write a short confirmation, addressed to the user, to the file {answer_file}: that you received it and how you will follow it, in one or two sentences. Then follow it.
   # EDIT RELATED WORKS HERE: appended as written.
   # Appended to the author's first prompt when the run has related works.
   related_works: |-
@@ -200,71 +204,10 @@ prompts:
     [REPORT FROM THE EXAMINER]
     {report}
 
-  # EDIT COORDINATOR HERE: the first prompt of the author coordinator (author mode "coordinator", only when a run asks
-  # for it), a per-job prompt like the author's. {author_subagents} is the number of subagents it may run at a time
-  # (one fewer than Parallel agents).
-  coordinator: |-
-    You are the coordinator of a team of author subagents working on the statement below. You do not try to prove the statement yourself. Your job is to run and check the healthiness of the team so that progress on solving the problem grows steadily with the time spent, until the team has a complete proof.
-
-    The team must solve it, even if it looks like a long-standing open problem. Do not let the team give up because the problem is hard or open.
-
-    YOUR TEAM
-    You can run up to {author_subagents} author subagents at a time. The authors do the mathematics: give them the original exact statement to solve. Do not decide yourself what each author should solve.
-
-    YOUR MEMORY
-    Your conversation will be compacted from time to time, and whatever is not written down is lost, including what your subagents are doing. Keep the team's memory in the memory folder of your working directory, organized as you see fit. You should observe and decide how the memory should be maintained, so that the author team with this memory can make steady progress along the time, instead of circulating or being stuck. Keep a log of the team's progress in memory/progress.md; the user reads it on the job page.
-
-    EXAMINING PROGRESS
-    An examiner examines the whole run about once an hour; its report reaches you with team_wait. Use its reports and the authors' to judge whether you should change how you instruct the authors and organize the team and its memory, and check later whether the change helped.
-
-    HANDING IN
-    When the team has a complete proof, write it to proof.md and reply with exactly this line and nothing else:
-    PROOF_FILE: proof.md
-    The critic reads only proof.md and the statement, so the proof must be complete and self-contained.
-
-    STATEMENT:
-    [STATEMENT]
-  # EDIT COORDINATOR LIFECYCLE HERE: placeholders as for the author's lifecycle prompts.
-  # The author coordinator's lifecycle prompts (the coordinator binding of the author node); each replaces the
-  # author's prompt of the same lifecycle key. The goal and the continuation point to the coordinator prompt (Codex
-  # repeats the goal in each of its automatic turns); reopen, compaction, resume and repair repeat it.
-  coordinator_goal: |-
-    Coordinate the team as your coordinator prompt says, until the team hands in a complete proof.
-  coordinator_continuation: |-
-    Continue coordinating the team as your coordinator prompt says; do not end the work.
-  coordinator_reopen: |-
-    ORIGINAL COORDINATOR PROMPT:
-    {original_prompt}
-  coordinator_compaction: |-
-    ORIGINAL COORDINATOR PROMPT:
-    {original_prompt}
-  coordinator_resume: |-
-    ORIGINAL COORDINATOR PROMPT:
-    {original_prompt}
-  coordinator_repair: |-
-    The critic rejected the proof the team handed in. Save the current candidate below to a file first: it holds the critic's safe fixes, which proof.md does not. Record the critic's findings in your memory and have the team fix every unresolved error in that candidate. If not fixable, resume the solution finding progress using the original prompt.
-
-    CURRENT CANDIDATE:
-    {solution}
-
-    CRITIC BUGS:
-    {bugs}
-
-    ORIGINAL COORDINATOR PROMPT:
-    {original_prompt}
-  coordinator_summary: |-
-    The work is paused. Write a progress summary for the user from the team's memory: what has been verified so far, with precise statements, and where it is written; what remains open or uncertain, and why; and the most promising next steps. Do not continue the work, start subagents or change any files in this turn.
-  # EDIT REPORT ANSWER HERE: placeholders as for the author's lifecycle prompts.
-  # Sent instead of the continuation when a coordinator's final reply names no proof file (it is kept as a
-  # progress report and never reaches the critic).
-  coordinator_report: |-
-    Your last reply was not handed to the critic: TCS Prover takes a reply as a hand-in only when it is the line PROOF_FILE: proof.md and nothing else, so it was kept as a progress report. If the team's proof is complete, write it to proof.md and reply with exactly that line. Otherwise keep coordinating the team; do not end the work.
-
-  # EDIT GOAL LOOP HERE. TCS Prover's goal loop (Goal loop "TCS Prover", the default): a Codex author or coordinator
-  # works in turns that TCS Prover starts. After every turn that did not end the goal, it sends this text as the next
-  # turn. Placeholders: {continuation} is the role's continuation prompt (the author's continuation, the coordinator's
-  # coordinator_continuation, or coordinator_report after a reply that names no proof file), placed first;
-  # {objective} the rendered goal (goal or coordinator_goal); {elapsed} the job's working time ("5 h 12 min");
+  # EDIT GOAL LOOP HERE. TCS Prover's goal loop (Goal loop "TCS Prover", the default): a Codex author works in turns
+  # that TCS Prover starts. After every turn that did not end the goal, it sends this text as the next turn.
+  # Placeholders: {continuation} is the author's continuation prompt, placed first; {objective} the rendered goal;
+  # {elapsed} the job's working time ("5 h 12 min");
   # {limit} its time limit and what is left of it ("10 h, about 4 h 48 min left"), or "none". Default: Codex 0.160's
   # own continuation text (goals/continuation.md), with its token lines replaced by the time lines; its update_goal
   # is the name the model sees for TCS Prover's tool (update_goal, in the namespace mcp__tcs).
@@ -315,7 +258,7 @@ prompts:
     - Never use status "blocked" merely because the work is hard, slow, uncertain, incomplete, or would benefit from clarification.
     Call update_goal only after the completion or blocked audit passes, or when the user explicitly requests pausing this goal. For a requested pause, use status "paused", report the returned status, and stop goal work; never pause on your own initiative. Do not mark a goal complete merely because the budget is nearly exhausted or because you are stopping work.
   # EDIT GOAL TOOL HERE: the description of the update_goal tool (TCS Prover's MCP server "tcs") with which a Codex
-  # author or coordinator under TCS Prover's goal loop ends its goal: status complete hands its turn's final reply on
+  # author under TCS Prover's goal loop ends its goal: status complete hands its turn's final reply on
   # (as Codex's goal mode does); blocked and paused are recorded and the next turn follows (TCS Prover never stops by
   # itself). No placeholders; used as written. Default: Codex 0.160's update_goal description.
   goal_tool_update_goal: |-
@@ -337,8 +280,8 @@ prompts:
   # The description of update_goal's optional note argument (TCS Prover's own, shown on the job page).
   goal_tool_update_goal_note: |-
     Optional. A short note for the user on the goal's state, for example the blocking condition; it is shown on the job page.
-  # EDIT CLAUDE GOAL NOTE HERE: the harness note added to the system prompt of a Claude Code author or coordinator,
-  # which ends every turn with a structured goal status. {objective} is the rendered goal (goal or coordinator_goal).
+  # EDIT CLAUDE GOAL NOTE HERE: the harness note added to the system prompt of a Claude Code author, which ends every
+  # turn with a structured goal status. {objective} is the rendered goal.
   claude_goal_harness: |-
     TCS PROVER HARNESS NOTE (provider plumbing; the task itself arrives in the user messages)
     You are working on one long-running, autonomous goal in a persistent conversation. Nobody answers questions during the work; keep working with your tools.
@@ -350,72 +293,9 @@ prompts:
     - goal_status "complete" only when the goal objective is fully achieved. final_answer must then be exactly the final response the task instructions ask for (for example "PROOF_FILE: proof.md", or the complete inline proof) and nothing else.
     - Otherwise goal_status "in_progress" (more work remains) or "blocked" (no further progress is possible right now), an empty final_answer and a short progress_note. You will then be asked to continue.
   # EDIT CODEX COMPACTION HERE: Codex's compact_prompt setting, the instructions for the summary Codex writes when it
-  # compacts the conversation of a Codex author, coordinator or team member. Empty (the default): Codex's own. No
+  # compacts the conversation of a Codex author or of its examiner. Empty (the default): Codex's own. No
   # placeholders.
   codex_compact_prompt: ''
-  # EDIT CODEX COORDINATOR NOTE HERE: sent to a Codex coordinator with TCS Prover's team as a developer message, after
-  # Codex's own instructions. Those tell the model not to leave the user without a commentary update for more than 60
-  # seconds and to avoid blocking waits longer than 60 seconds, so a coordinator woke every minute while its team
-  # worked, and about half of its model calls only waited. Empty: no note is sent. No placeholders.
-  codex_coordinator_note: |-
-    This run is unattended: no user reads your commentary or waits for you while it runs. Two of your instructions therefore do not apply to this run: that the user should not be left without a commentary update for more than 60 seconds, and that blocking sleep or wait calls longer than 60 seconds should be avoided.
-
-  # EDIT TEAM HERE: appended to the coordinator's first prompt (after the related works), so that {original_prompt}
-  # carries it into the later prompts. {members} is the list of members, one line each
-  # ("- member 1: GPT 6.2 Sol (Codex CLI)").
-  team_note: |-
-    YOUR TEAM
-    Your author subagents are TCS Prover team members, each running its own model:
-    {members}
-    Give a member an assignment with team_assign; each member works on one assignment at a time and starts fresh, knowing only what you write. Use team_wait to wait for reports (up to 30 minutes at a time), team_members to see who is working, team_followup to continue a member's last assignment in its own conversation, and team_stop to stop an assignment. A member's final reply is its report, also saved in the run folder.
-  # EDIT TEAM MEMBER HERE.
-  # What a team member receives for an assignment (team_assign) or a follow-up (team_followup): {assignment} is the
-  # coordinator's text.
-  team_member: |-
-    {assignment}
-
-    Your final reply is your report to the coordinator.
-
-  # EDIT TEAM EXAMINER HERE: the team examiner's whole instruction. The examiner is a seat beside the authors that
-  # TCS Prover itself starts while an author works (about once an hour, once an author has reported), each time in a
-  # fresh conversation with the coordinator's model; examining the run is its only task, and its report reaches the
-  # coordinator through team_wait like an assignment's. Leave it empty to run without an examiner.
-  team_examiner: |-
-    You are the examiner of a team that works on the statement in checked-statement.md in this folder: a coordinator who runs the team and author subagents who do the mathematics and choose their own approaches. This folder is the team's working directory: its memory folder holds the team's notes and its progress log, team/ holds the authors' reports in order, team/timeline.md lists the assignments and reports with their times, and transcript.jsonl is the complete raw record of every step (it is very large, so search it rather than read it whole).
-
-    Examine the whole trajectory, not only the latest work. Judge whether progress towards a complete proof of the statement is growing steadily with the time spent: what is still missing between the team's work and a complete proof, and how that has changed since several hours ago and since your own previous reports, which are in team/ beside the authors'.
-
-    Examine the coordination: how the coordinator instructs the authors, organizes the team and keeps its memory, and how that shapes the trajectory. Where progress is not growing, find what causes it and say what should change in how the team is run; the authors decide the mathematics, so do not choose it for them. Check whether changes made after your earlier reports helped.
-
-    Your final reply is your report to the coordinator.
-  # What the coordinator is told about the examiner: added to the description of team_wait when there is one.
-  team_examiner_note: |-
-    An examiner also works beside your authors: TCS Prover starts it itself from time to time while an author works, in a fresh conversation whose only task is to examine the whole run so far, and its report comes with this tool like an assignment's.
-
-  # EDIT TEAM TOOLS HERE: the descriptions of the coordinator's team tools (TCS Prover's MCP server "tcs") and of their
-  # arguments, as the coordinator reads them. No placeholders; used as written.
-  team_tool_members: |-
-    List your team's members: each member's number, its model and the program that runs it, and its state (idle; working on an assignment, named by its first line, since a given time; or stopping). Check it before you assign work, so that no member stays idle.
-  team_tool_assign: |-
-    Start an assignment on an idle team member and return at once; the member works in the background while you go on. The member starts a fresh conversation in your working directory, which it shares with you and the other members (it may read and write files there), and knows only what you write: make the assignment concrete and self-contained (the exact statement or claim, the approach to take, the files to read and the file to write its results to). Its final reply is its report to you, also saved in the run folder; collect it with team_wait. Delegating is your job: keep every member working on a distinct, useful assignment. Refused for a busy member, an unknown member number or an empty assignment.
-  team_tool_assign_member: |-
-    The member's number, as team_members lists it (1 is the first member).
-  team_tool_assign_assignment: |-
-    The complete assignment: everything the member needs to know, since it sees nothing else of your conversation.
-  team_tool_wait: |-
-    Wait for reports from your team. Returns as soon as an assignment finishes or fails, with every assignment that finished since the last wait, each once: the member, its report (its final reply) and the path of the saved report file; or, when none finishes in time, at the timeout with the members' states. Waiting is part of your normal work as the coordinator: prefer long waits (up to 30 minutes) to repeated short ones. The wait also ends early when TCS Prover sends you a live instruction or a chat message, which follows this result.
-  team_tool_wait_timeout_minutes: |-
-    How long to wait, in minutes: 1 to 30; 30 when omitted.
-  team_tool_followup: |-
-    Send a follow-up to a team member in the same conversation as its last assignment, so it keeps everything it did and learned there, and return at once; its next final reply is a new report, collected with team_wait. Use it to continue or redirect the same line of work, and team_assign for unrelated work. Refused for a member that is working (stop it first) or whose conversation cannot be continued.
-  team_tool_followup_member: |-
-    The member's number, as team_members lists it (1 is the first member).
-  team_tool_followup_message: |-
-    The follow-up for the member.
-  team_tool_stop: |-
-    Stop a member's current assignment. Its report then says that it was stopped (the files it wrote stay), and the member is idle. A stopped member keeps its conversation: team_followup continues it with everything it did and learned there, so stopping a member and following up is the way to tell a working member something it needs to know now. Use team_assign afterwards instead when the line of work no longer pays off.
-  team_tool_stop_member: |-
-    The member's number, as team_members lists it (1 is the first member).
 
   # EDIT CRITIC HERE: the critic's instructions. {count} is the run's Independent critics setting.
   critic: |-

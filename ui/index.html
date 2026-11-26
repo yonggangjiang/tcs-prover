@@ -9,6 +9,8 @@
   <meta name="theme-color" content="#0c0e11" media="(prefers-color-scheme: dark)">
   <title>TCS Prover</title>
   <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/vendor/katex/katex.min.css">
+  <link rel="stylesheet" href="/markdown.css">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 </head>
 <body>
@@ -647,8 +649,8 @@
                 <div class="settings-group prompt-setting">
                   <div>
                     <strong>Prompts</strong>
-                    <span id="promptSettingText">Every text the workflow sends its models, including the goal loop and
-                      the team's; edits apply to the next job</span>
+                    <span id="promptSettingText">Every text the workflow sends its models, including the goal
+                      loop's; edits apply to the next job</span>
                   </div>
                   <button id="editPromptsButton" class="secondary compact" type="button"
                     aria-haspopup="dialog">Edit prompts</button>
@@ -727,28 +729,6 @@
             <p id="batchSharedStatus" class="help" role="status"></p>
             <input id="batchSharedFiles" type="file" multiple hidden
               aria-label="Related works to share with every problem in this batch">
-          </section>
-          <!-- Shared with a folder run: each folder run keeps one store that every job of the run sees in
-               its related-works folder. app.js lists the stores named by the folderBatch of the /jobs
-               rows and reads each one from /batch-related-works; additions reach every job of that run. -->
-          <section id="batchRelatedWorks" class="batch-related-works card" aria-labelledby="batchRelatedWorksHeading" hidden>
-            <h2 id="batchRelatedWorksHeading" class="batch-related-heading">Shared with a folder run</h2>
-            <p id="batchRelatedWorksHelp" class="help">Shared by every problem of a folder run, including queued ones.
-              Running and paused authors are told about new ones.</p>
-            <ul id="batchRelatedGroups" class="batch-related-groups"></ul>
-            <div id="batchNoteForm" class="related-note-form" hidden>
-              <p id="batchNoteTarget" class="help"></p>
-              <label for="batchNoteTitle">Note title <span>(optional)</span></label>
-              <input id="batchNoteTitle" type="text" maxlength="200" autocomplete="off">
-              <label for="batchNoteText">Note</label>
-              <textarea id="batchNoteText" rows="4"></textarea>
-              <div class="related-note-actions">
-                <button id="batchSaveNoteButton" class="secondary compact" type="button">Add note</button>
-                <button id="batchCancelNoteButton" class="ghost compact" type="button">Cancel</button>
-              </div>
-            </div>
-            <p id="batchRelatedStatus" class="help" role="status"></p>
-            <input id="batchRelatedFiles" type="file" multiple hidden aria-label="Related works for the folder run">
           </section>
           <!-- Show one status at a time; app.js keeps the counts current. -->
           <div class="jobs-toolbar">
@@ -859,7 +839,7 @@
               <div class="mcb-search"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="7" cy="7" r="4.25"/><path d="m10.25 10.25 3.25 3.25"/></svg><input id="callsFilterText" type="search" placeholder="Filter by role, model or words" aria-label="Filter calls" autocomplete="off"></div>
               <div id="callsFilter" class="mcb-filter" role="group" aria-label="Show calls">
                 <button class="filter active" type="button" data-calls="all" aria-pressed="true">All</button>
-                <button class="filter" type="button" data-calls="author" aria-pressed="false">Coordinator</button>
+                <button class="filter" type="button" data-calls="author" aria-pressed="false">Author</button>
                 <button class="filter" type="button" data-calls="members" aria-pressed="false">Members</button>
                 <button class="filter" type="button" data-calls="critics" aria-pressed="false">Critics</button>
               </div>
@@ -962,24 +942,49 @@
                 </details>
               </div>
               <div id="jobRecovery" class="job-recovery" hidden></div>
-              <!-- The author coordinator's progress log, for coordinator jobs only: memory/progress.md in the author's
-                   working folder, which the server reads (state.coordinatorProgress). app.js sets its text as plain
-                   text, never markup, and keeps the box scrolled to the end unless you scrolled up (renderProgressLog). -->
-              <section id="progressLog" class="progress-log" aria-labelledby="progressLogHeading" hidden>
-                <h3 id="progressLogHeading">Progress log</h3>
-                <p id="progressLogMeta" class="progress-log-meta" hidden></p>
-                <pre id="progressLogText" class="progress-log-text" role="region" aria-labelledby="progressLogHeading"
-                  tabindex="0" hidden></pre>
-                <p id="progressLogNote" class="help progress-log-note" hidden></p>
-                <!-- When each version of the log was saved, oldest first (state.coordinatorProgressVersions). -->
-                <details id="progressLogVersions" class="progress-log-versions" hidden>
-                  <summary id="progressLogVersionsSummary"></summary>
-                  <p id="progressLogVersionsText"></p>
-                </details>
-                <p id="progressLogEmpty" class="help progress-log-empty" hidden>The coordinator has not written its progress log yet.</p>
-                <!-- In place of the log when the job's model has no subagent tool, so its author works alone. -->
-                <p id="progressLogAlone" class="help progress-log-alone" hidden></p>
-              </section>
+              <!-- The author's memory: every file the author keeps in the memory folder of its working folder
+                   (GET /memory-files), and the file you open (GET /memory-file). A Markdown note is rendered for
+                   reading (app.js through TCSMarkdown, the model's raw HTML never run), with its source a click away;
+                   any other file is set as plain text, never markup. Closed until you open it; opening it shows the
+                   note changed last. app.js renderAuthorMemory lists the files and reads them again while it is open. -->
+              <details id="authorMemory" class="author-memory" hidden>
+                <summary><span class="author-memory-title">Memory</span><span id="authorMemoryCount" class="author-memory-count"></span></summary>
+                <p id="authorMemoryHelp" class="help">What the author keeps in its memory folder so that nothing is lost
+                  when its conversation is compacted: its notes, checks, data and sources. The note it changed last
+                  opens first. Open any file to read it here.</p>
+                <div class="author-memory-tools">
+                  <label class="visually-hidden" for="authorMemoryFilter">Filter the files by name</label>
+                  <input id="authorMemoryFilter" type="search" placeholder="Filter by name…" autocomplete="off"
+                    spellcheck="false">
+                  <div class="author-memory-sort">
+                    <label for="authorMemorySort">Sort by</label>
+                    <select id="authorMemorySort">
+                      <option value="changed">Last changed</option>
+                      <option value="name">Name</option>
+                    </select>
+                  </div>
+                </div>
+                <ul id="authorMemoryList" class="author-memory-list" aria-label="Files in the author's memory"></ul>
+                <p id="authorMemoryNote" class="help" role="status"></p>
+                <!-- The file you opened: its name, size and last change, then its text, or why it has none. -->
+                <section id="authorMemoryFile" class="author-memory-file" aria-labelledby="authorMemoryFileName" hidden>
+                  <div class="author-memory-file-head">
+                    <h4 id="authorMemoryFileName" tabindex="-1"></h4>
+                    <button id="authorMemorySourceButton" class="ghost compact" type="button" aria-pressed="false" hidden>Show source</button>
+                    <button id="authorMemoryDownloadButton" class="ghost compact" type="button">Download</button>
+                    <button id="authorMemoryCloseButton" class="ghost compact" type="button">Close</button>
+                  </div>
+                  <p id="authorMemoryFileMeta" class="author-memory-meta"></p>
+                  <div id="authorMemoryFileDoc" class="author-memory-doc" role="region" aria-labelledby="authorMemoryFileName"
+                    tabindex="0" hidden></div>
+                  <pre id="authorMemoryFileText" class="author-memory-text" role="region" aria-labelledby="authorMemoryFileName"
+                    tabindex="0" hidden></pre>
+                  <p id="authorMemoryFileNote" class="help" role="status"></p>
+                </section>
+              </details>
+              <!-- In place of the section when this server is older than the page: it has no /memory-files route.
+                   app.js says where the folder is, and what a restart does to a running job. -->
+              <p id="authorMemoryOlder" class="help author-memory-older" hidden></p>
               <!-- Talk to the author: your messages and the author's answers, the author's questions and the
                    progress summaries, oldest first (app.js fills it from state.conversation), then the box that
                    sends a message. -->
@@ -1014,12 +1019,58 @@
                   </div>
                   <p id="authorSteerCount" class="help steer-count" aria-live="polite"></p>
                 </div>
+                <!-- A finished job continues with a new goal (POST /new-goal, state.newGoal): the same job, run folder,
+                     memory and author conversation; the finished goal's results stay under Earlier goals.
+                     app.js renderNewGoal. -->
+                <div id="newGoalControl" class="new-goal-control" hidden>
+                  <button id="newGoalOpenButton" class="secondary compact" type="button" aria-expanded="false"
+                    aria-controls="newGoalForm">Set a new goal…</button>
+                  <p id="newGoalReason" class="help" hidden></p>
+                  <div id="newGoalForm" class="new-goal-form" hidden>
+                    <label for="newGoalText">New goal</label>
+                    <textarea id="newGoalText" rows="5" aria-describedby="newGoalHelp"
+                      placeholder="The statement the author should prove next."></textarea>
+                    <p id="newGoalHelp" class="help">Write it as a precise statement. The author proves it in the same
+                      conversation, with its memory and earlier work, then the critic checks the proof against it
+                      (and Writing &amp; polishing runs, if selected). This goal's proof and paper stay under Earlier
+                      goals.</p>
+                    <div id="newGoalLimit" class="new-goal-limit">
+                      <label for="newGoalHours">Time limit for the whole job, in hours (0 = none)</label>
+                      <input id="newGoalHours" type="number" min="0" step="0.5" inputmode="decimal">
+                      <p id="newGoalLimitHelp" class="help"></p>
+                    </div>
+                    <div class="new-goal-actions">
+                      <button id="newGoalStartButton" class="primary compact" type="button">Start the new goal</button>
+                      <button id="newGoalCancelButton" class="ghost compact" type="button">Cancel</button>
+                    </div>
+                  </div>
+                </div>
               </section>
             </div>
 
             <details id="statementDetails" class="statement-panel card" open>
               <summary id="statementHeading">Statement being solved</summary>
               <pre id="runStatement" class="statement-copy"></pre>
+            </details>
+
+            <!-- The earlier goals of a job continued with new goals (state.goals), newest first: each one's statement
+                 and results, kept in goals/<n>/ of the run folder (GET /goal-file). The proof you open is rendered
+                 for reading like the current proof. app.js renderEarlierGoals. -->
+            <details id="earlierGoalsPanel" class="statement-panel card earlier-goals" hidden>
+              <summary id="earlierGoalsHeading">Earlier goals</summary>
+              <ol id="earlierGoalsList" class="earlier-goals-list"></ol>
+              <section id="earlierGoalView" class="earlier-goal-view" aria-labelledby="earlierGoalViewTitle" hidden>
+                <div class="current-proof-head">
+                  <h4 id="earlierGoalViewTitle" tabindex="-1"></h4>
+                  <span class="earlier-goal-view-actions">
+                    <button id="earlierGoalSourceButton" class="ghost compact" type="button" aria-pressed="false">Show source</button>
+                    <button id="earlierGoalCloseButton" class="ghost compact" type="button">Close</button>
+                  </span>
+                </div>
+                <div id="earlierGoalDoc" class="proof-doc" role="region" aria-labelledby="earlierGoalViewTitle" tabindex="0" hidden></div>
+                <pre id="earlierGoalText" class="statement-copy" hidden></pre>
+                <p id="earlierGoalNote" class="help" role="status"></p>
+              </section>
             </details>
 
             <!-- Related works: the files and notes in the author's related-works folder (app.js fills it
@@ -1048,9 +1099,27 @@
               <input id="relatedFilesInput" type="file" multiple hidden aria-label="Related works to add">
             </details>
 
+            <!-- The current proof, while the critic checks it or the paper is written from it (state.currentProof,
+                 its text from GET /current-proof): rendered for reading by TCSMarkdown (the model's raw HTML is shown
+                 as text, never run), with its Markdown source a click away. app.js renderCurrentProof. -->
+            <details id="currentProofPanel" class="run-result current-proof card" open hidden>
+              <summary id="currentProofHeading">Current proof</summary>
+              <div class="current-proof-head">
+                <p id="currentProofDescription" class="help"></p>
+                <button id="currentProofSourceButton" class="ghost compact" type="button" aria-pressed="false">Show source</button>
+              </div>
+              <div id="currentProofDoc" class="proof-doc" role="region" aria-labelledby="currentProofHeading" tabindex="0" hidden></div>
+              <pre id="currentProofText" class="statement-copy" hidden></pre>
+              <p id="currentProofNote" class="help" role="status"></p>
+            </details>
+
             <details id="resultPanel" class="run-result card" hidden>
               <summary id="resultHeading">Final answer</summary>
-              <p id="resultDescription" class="help"></p>
+              <div class="current-proof-head">
+                <p id="resultDescription" class="help"></p>
+                <button id="resultSourceButton" class="ghost compact" type="button" aria-pressed="false" hidden>Show source</button>
+              </div>
+              <div id="resultDoc" class="proof-doc" role="region" aria-labelledby="resultHeading" tabindex="0" hidden></div>
               <pre id="resultOutput" class="statement-copy"></pre>
             </details>
 
@@ -1347,6 +1416,9 @@
     </dialog>
   </div>
 
+  <script src="/vendor/markdown-it/markdown-it.min.js"></script>
+  <script src="/vendor/katex/katex.min.js"></script>
+  <script src="/markdown.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>
