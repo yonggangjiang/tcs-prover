@@ -683,20 +683,17 @@ class BatchCatalog:
 
     def examiner_reports(self, batch_id, run_id):
         """A saved job's examiner reports as GET /examiner-reports gives them (server.App.examiner_reports())."""
-        from .server import EXAMINER_LINE_MARKERS, follow_examiner_report
+        from .server import follow_examiner_line
 
         directory = self._run(batch_id, run_id)
-        entries = {}
+        scan = {'entries': {}, 'times': None}
         try:
             with self._open(directory, 'transcript.jsonl') as stream:
                 for line in stream:
-                    if any(marker in line for marker in EXAMINER_LINE_MARKERS):
-                        try:
-                            follow_examiner_report(entries, json.loads(line))
-                        except (ValueError, RecursionError):
-                            pass
+                    follow_examiner_line(scan, line.rstrip(b'\r\n'))
         except (OSError, ValueError):
             pass
+        entries = scan['entries']
         workspace = self._memory_workspace(batch_id, run_id)
         reports = sorted((dict(entry) for entry in entries.values()), key=lambda entry: (
             entry['startedAt'] or entry['finishedAt'] or entry['deliveredAt'], entry['seat'], entry['number']))

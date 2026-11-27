@@ -456,12 +456,16 @@ server add:
   routes.
 - **The examiner's reports.** `GET /examiner-reports?job=…`
   (`App.examiner_reports()`) returns `{reports: [{id, seat, number, state,
-  startedAt, finishedAt, deliveredAt, file, bytes}], count}`, oldest first: one
-  entry per examination (`member-<seat>-<k>`), from the examiner seat's
-  "Author subagent started/finished/failed" records and the author's "Examiner
-  report delivered" (`follow_examiner_report()`). Only transcript lines that
-  name the examiner (`EXAMINER_LINE_MARKERS`) are parsed, and each request
-  reads on from where the previous one stopped. `GET
+  startedAt, finishedAt, deliveredAt, startedWork, finishedWork, deliveredWork,
+  file, bytes}], count}`, oldest first: one entry per examination
+  (`member-<seat>-<k>`), from the examiner seat's "Author subagent
+  started/finished/failed" records and the author's "Examiner report delivered"
+  (`follow_examiner_report()`). The `…Work` fields are the author's working
+  time at those moments in seconds, pauses left out, counted along the
+  transcript as the step times are (`follow_step_times()`); a model event's line
+  is not parsed for it, only its `time` (`follow_examiner_line()`). Each request
+  reads on from where the previous one stopped (about 0.1 s for a first read of
+  a 12 MB transcript). `GET
   /examiner-report?job=…&id=member-1-3` returns the report
   (`team/member-1/3-report.md` in the author's working folder) as
   `/memory-file` returns a file: the same readers, below `team/` instead of

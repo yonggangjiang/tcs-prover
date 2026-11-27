@@ -5874,20 +5874,23 @@ function examinerReportTitle(entry) {
   return `Report ${entry.number}` + (entry.seat > 1 ? ` (examiner seat ${entry.seat})` : "");
 }
 
-// When an examination started, was done and reached the author, in words; a day other than today is named once.
+// When an examination started, was done and reached the author, as the author's working time then (pauses left
+// out, as on the step's timer: "started at 1h 26m · done at 1h 37m · reached the author at 1h 37m"). A report
+// listed by a server that gives no working time shows its clock times.
 function examinerReportTimes(entry) {
-  const first = timeText(entry.startedAt || entry.finishedAt || entry.deliveredAt || "");
-  const day = (text) => (text.includes(" ") ? text.slice(0, text.lastIndexOf(" ")) : "");
-  const time = (value) => {
-    const text = timeText(value ?? "");
-    return value !== (entry.startedAt || entry.finishedAt || entry.deliveredAt) && day(text) && day(text) === day(first)
-      ? text.slice(text.lastIndexOf(" ") + 1) : text;
-  };
-  return [entry.startedAt ? `started ${time(entry.startedAt)}` : "",
-    entry.state === "failed" ? (entry.finishedAt ? `failed ${time(entry.finishedAt)}` : "failed")
-      : entry.finishedAt ? `done ${time(entry.finishedAt)}` : "examining…",
-    entry.deliveredAt ? `reached the author ${time(entry.deliveredAt)}`
+  const at = (work, value) => (Number.isFinite(work) ? `at ${durationText(work)}` : timeText(value ?? ""));
+  return [entry.startedAt ? `started ${at(entry.startedWork, entry.startedAt)}` : "",
+    entry.state === "failed" ? (entry.finishedAt ? `failed ${at(entry.finishedWork, entry.finishedAt)}` : "failed")
+      : entry.finishedAt ? `done ${at(entry.finishedWork, entry.finishedAt)}` : "examining…",
+    entry.deliveredAt ? `reached the author ${at(entry.deliveredWork, entry.deliveredAt)}`
       : entry.state === "finished" ? "not received by the author yet" : ""].filter(Boolean).join(" · ");
+}
+
+// The same moments by the clock, for a row's tooltip.
+function examinerReportClock(entry) {
+  return [entry.startedAt ? `Started ${timeText(entry.startedAt)}` : "",
+    entry.finishedAt ? `${entry.state === "failed" ? "failed" : "done"} ${timeText(entry.finishedAt)}` : "",
+    entry.deliveredAt ? `reached the author ${timeText(entry.deliveredAt)}` : ""].filter(Boolean).join(", ");
 }
 
 // What the list says of a report now, to read it again when it changed.
@@ -5910,6 +5913,7 @@ function examinerReportRow(entry, open) {
   time.className = "author-memory-time";
   time.textContent = examinerReportTimes(entry);
   button.append(name, size, time);
+  button.title = examinerReportClock(entry);
   // A report that is not written yet (the examination runs, or it failed) cannot be opened.
   button.disabled = !entry.bytes;
   button.onclick = () => openExaminerReport(entry.id);
@@ -5940,7 +5944,8 @@ function renderExaminerReports() {
   if (!reports.length) return;
   const latest = reports.filter((entry) => entry.deliveredAt).at(-1);
   const count = `${reports.length.toLocaleString("en-US")} report${reports.length === 1 ? "" : "s"}`
-    + (latest ? ` · latest reached the author ${timeText(latest.deliveredAt)}` : "")
+    + (latest ? ` · latest reached the author ${Number.isFinite(latest.deliveredWork)
+      ? `at ${durationText(latest.deliveredWork)} of its work` : timeText(latest.deliveredAt)}` : "")
     + (reports.some((entry) => entry.state === "running") ? " · examining now" : "");
   if (ui.examinerReportsCount.textContent !== count) ui.examinerReportsCount.textContent = count;
   const signature = `${JSON.stringify(reports)}\n${examinerReports.id}\n${new Date().toDateString()}`;

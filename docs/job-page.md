@@ -158,13 +158,16 @@ Each time the author's conversation is compacted, an examiner reads the whole
 run and sends the author a report (see [Workflow](workflow.md#the-examiner)).
 **Examiner reports**, under **Memory**, lists them once there is one, closed
 until you open it. Its line counts them and says when the latest reached the
-author (*Examiner reports · 4 reports · latest reached the author 23:43*).
+author (*Examiner reports · 4 reports · latest reached the author at 4h 14m of
+its work*).
 
-- **Each row** is one examination, oldest first: its report's size and when the
-  examination started, when its report was done and when it reached the author
-  (*started 20:28 · done 20:33 · reached the author 20:33*). An examination
-  still running says *examining…*, one that failed says so; neither can be
-  opened yet.
+- **Each row** is one examination, oldest first: its report's size and at what
+  point of the author's working time the examination started, its report was
+  done and it reached the author (*started at 1h 26m · done at 1h 37m · reached
+  the author at 1h 37m*). Working time leaves pauses out and is the time the
+  step shows in **Workflow**; the clock times are in the row's tooltip. An
+  examination still running says *examining…*, one that failed says so; neither
+  can be opened yet.
 - **Open a report** by clicking its row: it is shown rendered, its formulas
   typeset, as the author received it; **Show source** shows its text as written.
   Nothing in it is run.

@@ -1459,10 +1459,39 @@ EXAMINATION_ID = re.compile(r"member-([1-9][0-9]{0,5})-([1-9][0-9]{0,6})\Z")
 EXAMINER_REPORT_PATH = re.compile(r"team/member-([1-9][0-9]{0,5})/([1-9][0-9]{0,6})-report\.md\Z")
 EXAMINER_TEAM_FOLDER = "team"
 _examiner_scan_lock = threading.Lock()
+# A model event's line of a transcript: "time" is its last field (App.add_trace()), and it is all a scan of the
+# author's working time needs of it (follow_examiner_line()).
+TRANSCRIPT_LINE_TIME = re.compile(rb'"time": "([^"]{10,40})"\}\s*$')
 
 
-def follow_examiner_report(entries, record):
-    """Add what one transcript record says of the examiner's reports to ``entries`` ({examination id: entry})."""
+def follow_examiner_line(scan, line):
+    """One transcript line (bytes) for the examiner's reports. ``scan`` holds "entries" ({examination id: entry},
+    follow_examiner_report()) and "times" (the steps' working time so far, follow_step_times()), from which each
+    entry learns how long the author had worked when it started, was done and reached the author. A model event of
+    the job is not parsed: its time is all the working time needs."""
+
+    plain = (line.startswith(b'{"kind": "codex_event"') and b'"stage": "conversation"' not in line[:200]
+             and not any(marker in line for marker in EXAMINER_LINE_MARKERS))
+    if plain:
+        found = TRANSCRIPT_LINE_TIME.search(line[-80:])
+        if not found:
+            return
+        record = {"kind": "codex_event", "time": found.group(1).decode("ascii", errors="replace")}
+    else:
+        try:
+            record = json.loads(line)
+        except (ValueError, RecursionError):
+            return
+    scan["times"] = follow_step_times(scan.get("times"), record)
+    if not plain:
+        times = scan["times"] if isinstance(scan["times"], dict) else {}
+        work = (times.get("seconds") or {}).get("author", 0.0)
+        follow_examiner_report(scan["entries"], record, work)
+
+
+def follow_examiner_report(entries, record, work=None):
+    """Add what one transcript record says of the examiner's reports to ``entries`` ({examination id: entry}).
+    ``work``: how long the author had worked when the record was written (seconds, pauses left out)."""
 
     if not isinstance(record, dict):
         return
@@ -1482,13 +1511,17 @@ def follow_examiner_report(entries, record):
         return
     entry = entries.setdefault(f"member-{seat}-{number}", {
         "id": f"member-{seat}-{number}", "seat": seat, "number": number, "state": "running", "startedAt": "",
-        "finishedAt": "", "deliveredAt": "", "file": f"{EXAMINER_TEAM_FOLDER}/member-{seat}/{number}-report.md"})
+        "finishedAt": "", "deliveredAt": "", "startedWork": None, "finishedWork": None, "deliveredWork": None,
+        "file": f"{EXAMINER_TEAM_FOLDER}/member-{seat}/{number}-report.md"})
+    work = round(work, 1) if isinstance(work, (int, float)) and not isinstance(work, bool) else None
     if state == "started":
-        entry["startedAt"] = entry["startedAt"] or when
+        if not entry["startedAt"]:
+            entry.update(startedAt=when, startedWork=work)
     elif state == "delivered":
-        entry["deliveredAt"] = entry["deliveredAt"] or when
+        if not entry["deliveredAt"]:
+            entry.update(deliveredAt=when, deliveredWork=work)
     else:
-        entry.update(state=state, finishedAt=when)
+        entry.update(state=state, finishedAt=when, finishedWork=work)
 
 
 def delivered_repair(record):
@@ -9051,9 +9084,10 @@ class App:
     def examiner_reports(self):
         """The examiner's reports of this job as the job page lists them (GET /examiner-reports): {"reports":
         [{"id", "seat", "number", "state" (running, finished, failed), "startedAt", "finishedAt", "deliveredAt": when
-        the author's conversation received it, "file", "bytes": the report's size, 0 while there is none}], oldest
-        first, "count"}. From the job's transcript, read on from where the previous request stopped (only lines
-        that name the examiner are parsed), outside the job lock."""
+        the author's conversation received it, "startedWork", "finishedWork", "deliveredWork": how long the author
+        had worked then (seconds, pauses left out, as the step's time on the page; None when not known), "file",
+        "bytes": the report's size, 0 while there is none}], oldest first, "count"}. From the job's transcript, read
+        on from where the previous request stopped (follow_examiner_line()), outside the job lock."""
 
         with self.lock:
             if self.run_dir is None or not self.trace_file:
@@ -9062,13 +9096,13 @@ class App:
         with _examiner_scan_lock:
             scan = getattr(self, "_examiner_scan", None)
             if not isinstance(scan, dict) or scan.get("file") != str(trace_file):
-                scan = {"file": str(trace_file), "offset": 0, "entries": {}}
+                scan = {"file": str(trace_file), "offset": 0, "entries": {}, "times": None}
             try:
                 size = trace_file.stat().st_size
             except OSError:
                 size = 0
             if size < scan["offset"]:  # The transcript was replaced: read it again.
-                scan = {"file": str(trace_file), "offset": 0, "entries": {}}
+                scan = {"file": str(trace_file), "offset": 0, "entries": {}, "times": None}
             if size > scan["offset"]:
                 try:
                     with open(trace_file, "rb") as stream:
@@ -9078,11 +9112,7 @@ class App:
                     data = b""
                 end = data.rfind(b"\n") + 1
                 for line in data[:end].splitlines():
-                    if any(marker in line for marker in EXAMINER_LINE_MARKERS):
-                        try:
-                            follow_examiner_report(scan["entries"], json.loads(line))
-                        except (ValueError, RecursionError):
-                            pass
+                    follow_examiner_line(scan, line)
                 scan["offset"] += end
             self._examiner_scan = scan
             entries = [dict(entry) for entry in scan["entries"].values()]
