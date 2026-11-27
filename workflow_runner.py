@@ -80,6 +80,10 @@ MAX_AUTHOR_SUBAGENTS = 10
 # The total time limit has no upper bound, and 0 (unlimited) is the default.
 MAX_AUTHOR_HOURS = None
 DEFAULT_AUTHOR_HOURS = 0
+# The author's examiner (the run's examiner_period option, the job's Examiner setting): an examination starts every
+# this many compactions of the author's conversation; 0: no examiner.
+DEFAULT_EXAMINER_PERIOD = 4
+MAX_EXAMINER_PERIOD = 100
 STRUCTURED_WORKSPACE = ROOT / ".codex-structured-workspace"
 _GOAL_LIFECYCLE = ("goal", "continuation", "compaction", "repair", "resume")
 # Lifecycle prompts a goal node may also bind: the short prompt of a reopened
@@ -4348,19 +4352,39 @@ def member_usage(event, trace):
             "modelCalls": own.get("calls")}
 
 
+def examiner_period(value):
+    """The run's examiner_period option as a whole number from 0 to MAX_EXAMINER_PERIOD: how many compactions of the
+    author's conversation start an examination; 0: no examiner. Error otherwise."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_EXAMINER_PERIOD:
+        raise Error(f"examiner_period must be a whole number from 0 to {MAX_EXAMINER_PERIOD}: the compactions of the "
+                    "author's conversation between two examinations, 0 for no examiner.")
+    return value
+
+
+def run_examiner_period(options):
+    """The run's examination period (examiner_period(); DEFAULT_EXAMINER_PERIOD without the option). The option
+    examiner=false of earlier versions still means no examiner."""
+
+    if options.get("examiner") is False:
+        return 0
+    return examiner_period(options.get("examiner_period", DEFAULT_EXAMINER_PERIOD))
+
+
 def examine_after_compaction(examiner, emit, thread):
-    """The author's conversation was compacted: its examiner (start_team(lone=True)) starts an examination, unless
-    the last one is still running."""
+    """The author's conversation was compacted: its examiner (start_team(lone=True)) counts it and starts an
+    examination every examiner.period compactions (Team.compacted()), unless the last one is still running, when
+    the next compaction starts it."""
 
-    if not examiner.examine():
+    if examiner.compacted() == "busy":
         emit("diagnostic", text="The author's conversation was compacted while the examiner was still examining the "
-                                "run; no new examination starts.", threadId=thread)
+                                "run; the next compaction starts the examination that is due.", threadId=thread)
 
 
-def start_team(members, *, prompts, directory, settings, stage, node_name, examiner=None, lone=True):
+def start_team(members, *, prompts, directory, settings, stage, node_name, examiner=None, lone=True, period=1):
     """The author's examiner (runner/team.Team): ``members`` is empty and ``lone`` true, ``examiner`` its seat
-    (team.team_members()). It examines the run each time the author's conversation is compacted (goal_session's
-    examiner).
+    (team.team_members()). It examines the run every ``period`` compactions of the author's conversation
+    (goal_session's examiner).
 
     Its records and events go to the run's records as the author's subagents (stage ``stage``, node ``node_name``),
     each with its seat's number and model and its examination's id (subagentId, team_module.assignment_id()).
@@ -4415,7 +4439,7 @@ def start_team(members, *, prompts, directory, settings, stage, node_name, exami
                      render=render_template, retry_note=AUTHOR_RETRY_NOTE, retry_seconds=MODEL_RETRY_SECONDS,
                      stop_process=stop_process, conversation=conversation, discard=sessions.discard,
                      unavailable=lambda error: isinstance(error, ConversationUnavailable),
-                     describe=describe_failure, examiner=examiner, lone=lone)
+                     describe=describe_failure, examiner=examiner, lone=lone, period=period)
 
 
 def save_final_input(statement, solution, directory=None):
@@ -5278,8 +5302,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                  texts=None, service=None, examiner=None):
     """Run one goal-enabled thread with lifecycle instructions supplied by YAML.
 
-    ``examiner`` is a lone author's examiner (start_team(lone=True)): it examines the run each time the author's
-    conversation is compacted, and each report it finishes is sent into the author's running turn as
+    ``examiner`` is a lone author's examiner (start_team(lone=True)): it examines the run every examiner.period
+    compactions of the author's conversation (examine_after_compaction()), and each report it finishes is sent into the author's running turn as
     author_examiner_report, the way a live instruction is.
 
     Yield its final answer only after goal completion; accept follow-up feedback
@@ -8955,16 +8979,17 @@ def _execute(workflow, state, options, prompts):
                         # The most subagents at once (Codex's own limits, see subagent_limits()).
                         settings["subagents"] = count
                     texts = {name: prompts[name] for name in HARNESS_TEXTS if name in prompts}
-                    # Whether the author gets an examiner: the run's ``examiner`` option (the job's Examiner
-                    # setting; on unless it says otherwise) with an author_examiner text.
-                    examined = (options.get("examiner", True) is not False
-                                and bool(str(texts.get("author_examiner") or "").strip()))
+                    # Whether the author gets an examiner: the run's examination period (its examiner_period option,
+                    # the job's Examiner setting; DEFAULT_EXAMINER_PERIOD unless it says otherwise; 0: none) with an
+                    # author_examiner text.
+                    period = run_examiner_period(options)
+                    examined = period > 0 and bool(str(texts.get("author_examiner") or "").strip())
                     start = plan(examined)
                     if count is not None:
                         note_no_subagent_tool(stage_name, settings["model"], count)
                     prompt, session_prompts, instruction = start["prompt"], start["prompts"], start["recovery"]
-                    # The author's examiner (``examined`` above): TCS Prover starts it each time the author's
-                    # conversation is compacted and its reports go into the author's running turn (the goal
+                    # The author's examiner (``examined`` above): TCS Prover starts it every ``period`` compactions
+                    # of the author's conversation and its reports go into the author's running turn (the goal
                     # session's ``examiner``).
                     lone_examiner = None
                     if examined:
@@ -8975,7 +9000,7 @@ def _execute(workflow, state, options, prompts):
                             lone_examiner = examiners[current] = start_team(
                                 [], prompts={**texts, "team_examiner": texts["author_examiner"]},
                                 directory=directory, settings=settings, stage=stage_name, node_name=current,
-                                examiner=seat, lone=True)
+                                examiner=seat, lone=True, period=period)
                     # A live run whose author's model gets no web search tool from Codex says so as it starts (the
                     # run goes on without it).
                     note_no_web_search(stage_name, current, settings["model"], directory=directory)
@@ -9481,6 +9506,8 @@ def _main(argv=None):
         for name in SUBAGENT_OPTIONS:
             if name in options:
                 options[name] = SUBAGENT_OPTIONS[name](options[name])  # --set critic_count=N too.
+        if "examiner_period" in options:
+            options["examiner_period"] = examiner_period(options["examiner_period"])  # --set examiner_period=N.
         # A saved job, script or flag may still say Ultra: it runs as Max, and the log says so once.
         note_retired_efforts([options.get(name) for name in ("effort", "author_effort", "critic_effort",
                                                               "writer_effort")])

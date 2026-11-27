@@ -102,7 +102,9 @@ it opens, so connections added or removed in another tab count.
   model chosen for each author subagent, which settings saved by an earlier
   version may hold, is dropped as they load.
 - TCS Prover's original settings have the [examiner](workflow.md#the-examiner)
-  on, and so do saved settings from before that setting existed.
+  every 4 compactions, and so do saved settings from before that setting
+  existed. Settings saved with the earlier on/off **Examiner** load as every 4
+  compactions (on) or 0 (off).
 - Settings saved while the form still offered a goal loop may hold one: it is
   left out as they load, without a note, and the job runs TCS Prover's goal
   loop.

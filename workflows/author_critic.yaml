@@ -179,10 +179,11 @@ prompts:
   # start subagents with its program's own subagent tool.
   subagents: |-
     You may start up to {author_subagents} independent subagents at a time, for example to explore other approaches or to check calculations; you do not need to ask the user.
-  # EDIT EXAMINER HERE: the whole instruction of the author's examiner (the job's Examiner setting, on by default).
-  # TCS Prover starts it itself each time the author's conversation is compacted (unless the last examination is still
-  # running), in a fresh conversation with the author's model in the author's folder; its report is saved in team/ and
-  # sent into the author's running turn framed by author_examiner_report. Empty: no examiner, whatever the setting.
+  # EDIT EXAMINER HERE: the whole instruction of the author's examiner (the job's Examiner setting: every N
+  # compactions, 4 by default, 0 for none). TCS Prover starts it itself every N compactions of the author's
+  # conversation (when the last examination is still running, at the next one), in a fresh conversation with the
+  # author's model in the author's folder; its report is saved in team/ and sent into the author's running turn framed
+  # by author_examiner_report. Empty: no examiner, whatever the setting.
   author_examiner: |-
     You are the examiner of an author who is trying to prove the statement in checked-statement.md. This folder is the author's working directory: team/ holds your earlier reports, and transcript.jsonl is the complete record of its work (very large: search it rather than read it whole).
 
@@ -194,11 +195,11 @@ prompts:
 
     Your final reply is your report to the author.
   # EDIT EXAMINER NOTE HERE: appended as written.
-  # Appended to the author's first prompt while the job's Examiner is on (with an author_examiner text), so that
+  # Appended to the author's first prompt while the job has an examiner (with an author_examiner text), so that
   # {original_prompt} carries it into the later prompts: it tells the author what its examiner is.
   examiner_note: |-
     YOUR EXAMINER
-    Each time your conversation is compacted, an examiner reads your whole record and your memory folder from outside and sends you a report headed [REPORT FROM THE EXAMINER]. Take its findings seriously, but your goal does not change: a complete proof of the original statement.
+    Every few times your conversation is compacted, an examiner reads your whole record and your memory folder from outside and sends you a report headed [REPORT FROM THE EXAMINER]. Take its findings seriously, but your goal does not change: a complete proof of the original statement.
   # EDIT EXAMINER REPORT HERE: how the examiner's report reaches the author: {report} is the report.
   author_examiner_report: |-
     [REPORT FROM THE EXAMINER]

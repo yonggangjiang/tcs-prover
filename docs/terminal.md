@@ -24,9 +24,10 @@ The proof author proves the statement itself and keeps its memory in the
 `memory` folder of the job's folder under `runs/`. With `-authorSubagents N`
 it may also start up to N subagents of its own at a time (its program's
 subagent tool; the web form's **Parallel agents** is this number plus one, the
-author itself). Each time the author's conversation is compacted, an examiner, a
-fresh session of the author's model, examines the whole run and reports to the
-author; `-examiner off` runs without it.
+author itself). Every 4 compactions of the author's conversation, an examiner,
+a fresh session of the author's model, examines the whole run and reports to
+the author; `-examinerPeriod N` sets how many compactions, and `-examinerPeriod
+0` runs without it (`-examiner off` still does too).
 
 A Codex author runs TCS Prover's goal loop by default (`-goalLoop tcs`): TCS
 Prover starts every turn and the author ends its goal with TCS Prover's
@@ -67,7 +68,7 @@ python3 web_ui.py statement.md --author-model gpt-6-astra --speed-mode standard
 | `-criticRounds N` | `2` | Maximum consecutive edited critic passes; an edited pass at the limit accepts the latest repaired solution. `1` to `100`. An unchanged pass accepts at once. A rejection (a critical error the critic cannot fix) returns to the author and resets the count. |
 | `-criticCount N` | `3` | Independent critics the critic starts as its subagents on each proof version before it decides: `1` to `10`. Every round starts this many fresh critics. |
 | `-authorSubagents N` | `0` | Subagents the proof author may start at a time, `0` to `10`: one fewer than the form's **Parallel agents**. `0`: the author works alone. N: it may start up to N subagents with its program's own subagent tool. |
-| `-examiner on\|off` | `on` | The author's examiner: each time the author's conversation is compacted, a fresh session of the author's model examines the whole run and reports to the author. |
+| `-examinerPeriod N` | `4` | The author's examiner: every N compactions of the author's conversation, `0` to `100`, a fresh session of the author's model examines the whole run and reports to the author. `0`: no examiner. |
 | `-goalLoop LOOP` | `tcs` | Who runs a Codex author's goal loop: `tcs`, TCS Prover (it sends the editable goal continuation after every turn that did not end the goal, and the author ends it with `update_goal`), or `codex`, Codex's built-in goal mode. Claude Code authors always run TCS Prover's loop. |
 | `-thinkingHours HOURS` | `0` | Time limit in hours of the job's active work: `0` (the default) for none, or any positive number. Reaching it stops the proof author; the critic and LaTeX steps after a submission always finish, so an accepted proof is never cut off. Saved work is kept. |
 | `-authorModel MODEL` | `gpt-6.2-sol` | Author model: Codex CLI `gpt-6.2-sol`, `gpt-6.2-astra`, `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, or `gpt-6-luna`; Claude Code `claude-fable-5-2`, `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, or `claude-haiku-5-5`; or a discovered model's `api:<id>` selection from **Models & API → API connections**. The older `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` are still accepted so saved runs and scripts keep working, but the web page no longer lists them. |

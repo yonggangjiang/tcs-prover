@@ -43,7 +43,7 @@ role's model and reasoning (see [Models and API connections](models.md)) and:
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | Parallel agents | 1 | 1 to 11: how many agents work at a time. 1: the author works alone. 2 or more: the author may also start subagents of its own, up to one fewer than this number at a time. See [the proof author](#the-author). |
-| Examiner | On | Each time the author's conversation is compacted, a fresh session of the author's model examines the whole run and reports to the author. See [the examiner](#the-examiner). |
+| Examiner: every N compactions | 4 | Every N compactions of the author's conversation, a fresh session of the author's model examines the whole run and reports to the author (see [The examiner](#the-examiner)). 0: no examiner. |
 | Independent critics | 3 | Fresh critics the critic starts on each proof version, 1 to 10. |
 | Maximum consecutive critic rounds | 2 | Edited passes in a row, 1 to 100; at the limit the latest repaired proof is accepted. |
 | Time limit in hours | 0 (none) | See [the job page](job-page.md#time-limit-and-progress-summary). |
@@ -153,10 +153,13 @@ author.
 
 ### The examiner
 
-With **Examiner** on (the default), TCS Prover starts an examiner beside the
-author each time the author's conversation is compacted (not a subagent's, and
-not while the job is paused); a compaction while the last examination is still
-running starts none. Each examination is a fresh conversation of the author's
+**Examiner: every N compactions** (4 by default) sets how often TCS Prover
+starts an examiner beside the author: every N compactions of the author's own
+conversation (not a subagent's, and not while the job is paused); 0 runs the
+author without one. When an examination is due while the last one is still
+running, the next compaction starts it. The count carries over a pause: the
+examiner's timeline (`team/timeline.md`) lists every compaction, and the job's
+next runner counts on from it. Each examination is a fresh conversation of the author's
 model in the author's folder, with the `author_examiner` text as its whole
 instruction (**Edit prompts → Author → Examiner instructions**): it works out
 what is still missing between the author's work and a complete proof, checking
@@ -172,14 +175,17 @@ report), the way a chat message is; the author goes on working with it, and the
 activity log shows *Examiner report delivered*. Codex and Claude Code authors
 both get it.
 
-The author is told of its examiner: while the examiner is on, the author's
+The author is told of its examiner: while the job has one, the author's
 first prompt ends with the `examiner_note` text (**Edit prompts → Author →
-Examiner note**), which says that a report arrives under that heading after
-each compaction, that the author should take its findings seriously, and that
-its goal does not change: a complete proof of the original statement. The
+Examiner note**), which says that a report arrives under that heading every few
+compactions, that the author should take its findings seriously, and that its
+goal does not change: a complete proof of the original statement. The
 post-compaction re-anchor repeats the first prompt, so the note is fresh when a
-report arrives. **Examiner** off, or an empty `author_examiner` text, runs the
+report arrives. **Examiner** 0, or an empty `author_examiner` text, runs the
 author without an examiner and without the note.
+
+A job saved before this setting keeps what it ran with: with the earlier
+**Examiner** on, an examination at every compaction (1); with it off, none.
 
 ### The goal loop
 

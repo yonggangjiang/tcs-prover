@@ -1704,8 +1704,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                  texts=None, examiner=None):
     """Run the persistent author through Claude with the Codex goal-session protocol.
 
-    ``examiner`` is the author's examiner (workflow_runner.start_team(lone=True)): it examines the run each time the
-    author's conversation is compacted, and each report it finishes is sent into the author's running turn as
+    ``examiner`` is the author's examiner (workflow_runner.start_team(lone=True)): it examines the run every
+    examiner.period compactions of the author's conversation (workflow_runner.examine_after_compaction()), and each
+    report it finishes is sent into the author's running turn as
     author_examiner_report, the way a live instruction is.
 
     Drop-in replacement for workflow_runner.goal_session: same generator

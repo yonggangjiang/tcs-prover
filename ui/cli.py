@@ -19,7 +19,7 @@ from .current_run import CurrentRunError, select_current_dashboard
 from .review import review_worker_main
 from .server import (
     App, Server, AUTO_LAUNCH_SPACING_SECONDS, AUTO_RESUME_SECONDS, DEFAULT_AUTHOR_MODEL, DEFAULT_AUTHOR_SUBAGENTS,
-    DEFAULT_EXAMINER, DEFAULT_GOAL_LOOP,
+    DEFAULT_EXAMINER_PERIOD, DEFAULT_GOAL_LOOP, MAX_EXAMINER_PERIOD,
     DEFAULT_CRITIC_COUNT, MAX_AUTHOR_SUBAGENTS,
     DEFAULT_CRITIC_MODEL, DEFAULT_CRITIC_ROUNDS, DEFAULT_REASONING_EFFORT, DEFAULT_REASONING_SUMMARY,
     DEFAULT_SPEED, DEFAULT_THINKING_HOURS, DEFAULT_WRITER_MODEL, HOST,
@@ -206,13 +206,13 @@ def direct_cli_options(
     speed_mode=DEFAULT_SPEED,
     reasoning_summary=DEFAULT_REASONING_SUMMARY,
     author_prompt_file=None, critic_prompt_file=None, final_prompt_file=None,
-    goal_loop=DEFAULT_GOAL_LOOP, examiner=DEFAULT_EXAMINER,
+    goal_loop=DEFAULT_GOAL_LOOP, examiner_period=DEFAULT_EXAMINER_PERIOD,
 ):
     """Load optional prompt files and validate direct-workflow CLI settings.
 
     As in every new job, a terminal run's author proves the statement itself: alone with 0 author subagents, and
     with 1 or more it may start that many with its program's own subagent tool. ``goal_loop`` is the Goal loop
-    setting and ``examiner`` the Examiner setting.
+    setting and ``examiner_period`` the Examiner setting (an examination every this many compactions; 0: none).
     """
 
     prompt_files = {
@@ -242,7 +242,7 @@ def direct_cli_options(
         speed_mode=speed_mode,
         reasoning_summary=reasoning_summary,
         include_review=False,
-        goal_loop=goal_loop, examiner=examiner,
+        goal_loop=goal_loop, examiner_period=examiner_period,
     )
     return {
         "critic_rounds": options["criticRounds"],
@@ -261,7 +261,8 @@ def direct_cli_options(
         "final_prompt": options["finalPrompt"],
         "speed_mode": options["speedMode"],
         "reasoning_summary": options["reasoningSummary"],
-        "team_options": {"goal_loop": options["goalLoop"], "examiner": options["examiner"], "prompt_overrides": {}},
+        "team_options": {"goal_loop": options["goalLoop"], "examiner_period": options["examinerPeriod"],
+                         "prompt_overrides": {}},
     }
 
 
@@ -741,13 +742,17 @@ def main():
         ),
     )
     parser.add_argument(
-        "-examiner", "--examiner",
-        dest="examiner", choices=("on", "off"), default="on" if DEFAULT_EXAMINER else "off",
+        "-examinerPeriod", "--examinerPeriod", "--examiner-period",
+        dest="examiner_period", type=int, default=None, metavar="N",
         help=(
-            "the author's examiner (default: on): each time the author's conversation is compacted, TCS Prover "
-            "starts a fresh session of the author's model that examines the whole run and reports to the author"
+            f"the author's examiner: every N compactions of the author's conversation (0 to {MAX_EXAMINER_PERIOD}, "
+            f"default {DEFAULT_EXAMINER_PERIOD}), TCS Prover starts a fresh session of the author's model that "
+            "examines the whole run and reports to the author; 0: no examiner"
         ),
     )
+    # The on/off form of earlier versions: off is -examinerPeriod 0, on the default period.
+    parser.add_argument("-examiner", "--examiner", dest="examiner", choices=("on", "off"), default=None,
+                        help=argparse.SUPPRESS)
     parser.add_argument(
         "-goalLoop", "--goalLoop", "--goal-loop",
         dest="goal_loop", choices=runtime.GOAL_LOOPS, default=DEFAULT_GOAL_LOOP,
@@ -859,7 +864,9 @@ def main():
                 author_prompt_file=args.author_prompt_file,
                 critic_prompt_file=args.critic_prompt_file,
                 final_prompt_file=args.final_prompt_file,
-                goal_loop=args.goal_loop, examiner=args.examiner == "on",
+                goal_loop=args.goal_loop,
+                examiner_period=(args.examiner_period if args.examiner_period is not None
+                                 else 0 if args.examiner == "off" else DEFAULT_EXAMINER_PERIOD),
                 verbose_events=args.verbose_events,
             )
         except (OSError, TypeError, ValueError) as exc:

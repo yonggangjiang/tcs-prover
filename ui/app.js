@@ -135,7 +135,7 @@ const ui = {
   criticModelProvider: $("criticModelProvider"), writerModelProvider: $("writerModelProvider"),
   criticRounds: $("criticRounds"),
   criticCount: $("criticCount"),
-  parallelAgents: $("parallelAgents"), authorExaminer: $("authorExaminer"),
+  parallelAgents: $("parallelAgents"), examinerPeriod: $("examinerPeriod"),
   thinkingHours: $("thinkingHours"),
   speedMode: $("speedMode"),
   reasoningSummary: $("reasoningSummary"),
@@ -3191,8 +3191,10 @@ function renderRunOverview() {
           : ` · ${state.authorSubagents + 1} parallel agents: up to ${state.authorSubagents} subagent${
             state.authorSubagents === 1 ? "" : "s"} of its own at a time`) : "Off"],
     // The author's examiner (the Examiner setting; a job that ran in coordinator mode had none of this kind).
-    ...(stages.author && !state.coordinatorJob && typeof state.examiner === "boolean"
-      ? [["Examiner", state.examiner ? "On: reports to the author after each compaction of its conversation" : "Off"]] : []),
+    ...(stages.author && !state.coordinatorJob && Number.isInteger(state.examinerPeriod)
+      ? [["Examiner", state.examinerPeriod === 0 ? "Off"
+        : state.examinerPeriod === 1 ? "Reports to the author after each compaction of its conversation"
+          : `Reports to the author every ${state.examinerPeriod} compactions of its conversation`]] : []),
     // How the author's turns follow one another (a job from before the setting records none).
     ...(stages.author && ["tcs", "codex"].includes(state.goalLoop) ? [["Goal loop", jobGoalLoopText()]] : []),
     // The limit now, and every change of it and pause at it (the server's records).
@@ -4616,7 +4618,8 @@ function render(next) {
     // Parallel agents: the author and its own subagents (authorSubagents, one fewer).
     ui.parallelAgents.value = (Number.isInteger(state.authorSubagents) ? state.authorSubagents
       : state.workflow?.settings?.author_subagents?.default ?? 0) + 1;
-    ui.authorExaminer.value = state.examiner === false ? "off" : "on";
+    // The Examiner setting: an examination every N compactions (4 by default), 0 for none.
+    ui.examinerPeriod.value = Number.isInteger(state.examinerPeriod) ? state.examinerPeriod : 4;
     ui.thinkingHours.value = state.thinkingHours ?? 0;
     restoreWorkflowStages(state);
     checkEdited();
@@ -4836,7 +4839,8 @@ function applyComposerSettings(source) {
   ui.parallelAgents.value = (Number.isInteger(source.authorSubagents) ? source.authorSubagents : subagents.default ?? 0) + 1;
   ui.parallelAgents.min = (subagents.minimum ?? 0) + 1;
   ui.parallelAgents.max = (subagents.maximum ?? 10) + 1;
-  ui.authorExaminer.value = source.examiner === false ? "off" : "on";
+  ui.examinerPeriod.value = Number.isInteger(source.examinerPeriod) ? source.examinerPeriod
+    : source.examiner === false ? 0 : 4;
   ui.thinkingHours.value = source.thinkingHours ?? 0;
   ui.thinkingHours.min = hours.minimum ?? 0;
   // No maximum: any positive number of hours is a valid limit.
@@ -6533,7 +6537,7 @@ async function startReview(statement, feedback = "") {
   const stages = fromComposer ? selectedWorkflowStages() : workflowStagesFor(state);
   if (!Object.values(stages).some(Boolean)) return showCreateError("Select at least one workflow stage.");
   if (!statement.trim()) return showCreateError("Enter the text for this workflow.");
-  if (stages.author && !(validateWorkflowHours() && validateAuthorSubagents())) return;
+  if (stages.author && !(validateWorkflowHours() && validateAuthorSubagents() && validateExaminerPeriod())) return;
   // The composer's related works go with a new problem only; a retried review keeps its job's own.
   const relatedProblem = fromComposer ? composerRelatedWorksProblem(stages) : "";
   if (relatedProblem) return showRelatedWorksProblem(relatedProblem);
@@ -6611,8 +6615,8 @@ function proofJobSettings() {
     criticCount: Number(ui.criticCount.value),
     // "4 · Parallel agents" counts the author itself: the job setting is the subagents it may start, one fewer.
     authorSubagents: Number(ui.parallelAgents.value) - 1,
-    // "5 · Examiner": whether the author gets an examiner.
-    examiner: ui.authorExaminer.value !== "off",
+    // "5 · Examiner": an examination every this many compactions of the author's conversation, 0 for none.
+    examinerPeriod: Number(ui.examinerPeriod.value),
     // The author's goal loop (selectedGoalLoop).
     ...(typeof selectedGoalLoop === "function" ? { goalLoop: selectedGoalLoop() } : {}),
     thinkingHours: Number(ui.thinkingHours.value),
@@ -6644,6 +6648,22 @@ function validateAuthorSubagents() {
   if (value !== "" && Number.isInteger(agents) && agents >= min && agents <= max) return true;
   ui.notice.textContent = `Enter ${min} to ${max} parallel agents: 1 for the author working alone, 2 or more to let `
     + "it start subagents of its own.";
+  show(ui.notice, true);
+  const advanced = field.closest?.("details");
+  if (advanced) advanced.open = true;
+  field.focus?.();
+  return false;
+}
+
+// The examiner's period must be a whole number in the field's range (0 to 100): Number() would send an empty field
+// as 0, no examiner. Checked, like Parallel agents, while the Author stage is on.
+function validateExaminerPeriod() {
+  const field = ui.examinerPeriod;
+  const value = String(field.value ?? "").trim(), period = Number(value);
+  const min = Number(field.min || 0), max = field.max ? Number(field.max) : 100;
+  if (value !== "" && Number.isInteger(period) && period >= min && period <= max) return true;
+  ui.notice.textContent = `Enter ${min} to ${max} for the examiner: how many compactions of the author's `
+    + "conversation pass between two examinations, 0 for no examiner.";
   show(ui.notice, true);
   const advanced = field.closest?.("details");
   if (advanced) advanced.open = true;
@@ -6886,7 +6906,7 @@ async function startFolderBatch(files) {
   const chosen = [...(files || [])];
   // A single job being created also blocks the folder run (and the reverse).
   if (!chosen.length || folderBatchBusy || ui.check.disabled) return;
-  if (!validateRetrievalSettings({ folder: true }) || (selectedWorkflowStages().author && !(validateWorkflowHours() && validateAuthorSubagents()))) return;
+  if (!validateRetrievalSettings({ folder: true }) || (selectedWorkflowStages().author && !(validateWorkflowHours() && validateAuthorSubagents() && validateExaminerPeriod()))) return;
   const relatedProblem = composerRelatedWorksProblem(selectedWorkflowStages());
   if (relatedProblem) return showRelatedWorksProblem(relatedProblem);
   folderBatchBusy = true;
@@ -6927,7 +6947,7 @@ async function sendFolderBatch(chosen) {
     return;
   }
   // File reading is asynchronous; recheck the current settings before sending.
-  if (!validateRetrievalSettings({ folder: true }) || (selectedWorkflowStages().author && !(validateWorkflowHours() && validateAuthorSubagents()))) return;
+  if (!validateRetrievalSettings({ folder: true }) || (selectedWorkflowStages().author && !(validateWorkflowHours() && validateAuthorSubagents() && validateExaminerPeriod()))) return;
   const relatedProblem = composerRelatedWorksProblem(selectedWorkflowStages());
   if (relatedProblem) return showRelatedWorksProblem(relatedProblem);
   // The listed related works go to the folder run's own store, which every one of its jobs sees.
@@ -10634,7 +10654,7 @@ function presetSignature() {
   const number = (input) => (String(input.value).trim() === "" ? "" : Number(input.value));
   return JSON.stringify([selectedWorkflowStages(),
     ...["review", "author", "critic", "writer"].flatMap((role) => [ui[`${role}Model`].value, ui[`${role}Effort`].value]),
-    number(ui.parallelAgents), ui.authorExaminer.value, number(ui.criticCount), number(ui.criticRounds),
+    number(ui.parallelAgents), number(ui.examinerPeriod), number(ui.criticCount), number(ui.criticRounds),
     number(ui.thinkingHours), ui.speedMode.value, ui.reasoningSummary.value, selectedRetrievalSettings()]);
 }
 
@@ -10646,7 +10666,7 @@ function presetFormSettings() {
   delete settings.promptOverrides;
   // The goal loop is no setting of the form (see selectedGoalLoop): saved settings never hold it.
   delete settings.goalLoop;
-  const builtIn = { authorSubagents: 0, criticCount: 3, criticRounds: 2, thinkingHours: 0,
+  const builtIn = { authorSubagents: 0, examinerPeriod: 4, criticCount: 3, criticRounds: 2, thinkingHours: 0,
     ...presetStore().builtIn?.settings };
   for (const { key, stage, problem } of presetNumberFields()) {
     if (problem && !settings.workflowStages[stage]) settings[key] = builtIn[key];
@@ -10669,6 +10689,8 @@ function presetNumberFields() {
   return [
     { key: "authorSubagents", field: ui.parallelAgents, stage: "author",
       problem: whole(ui.parallelAgents, "parallel agents") },
+    { key: "examinerPeriod", field: ui.examinerPeriod, stage: "author",
+      problem: whole(ui.examinerPeriod, "compactions between examinations for the examiner (0: no examiner)") },
     { key: "criticCount", field: ui.criticCount, stage: "critic",
       problem: whole(ui.criticCount, "independent critics") },
     { key: "criticRounds", field: ui.criticRounds, stage: "critic", problem: whole(ui.criticRounds, "critic rounds") },

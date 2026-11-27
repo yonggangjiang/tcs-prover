@@ -184,7 +184,7 @@ while the author works, with `{message}` and `{answer_file}`), `related_works`
 critic feedback, to an author resumed after its last submission was refused; it
 gets the reason as `{reason}`, which the state keeps as `handoff_refused` until
 the author submits again), `subagents` and `examiner_note` (added to the first
-prompt while the examiner is on). `--set related_works=true` appends
+prompt while the author has an examiner). `--set related_works=true` appends
 the `related_works` prompt to the first prompt, which `resume` restates, and
 `--set goal_reanchor=true` sends a reopened author the full `resume` prompt
 instead of `reopen`; the server sets both when they apply. Where the author's
@@ -325,14 +325,24 @@ server add:
   limit of foreground subagents: a live instruction or a chat
   message reaches a working Claude author only once its running subagents have
   reported.
-- **The examiner** (the job setting `examiner`, `--set examiner=false` for
-  off; the `author_examiner` text, empty for none). `_execute` starts it with
-  `start_team(lone=True)`: a `runner/team.Team` without members, with one seat
-  (number 1, the author's model and reasoning), kept across the author's
-  attempts. Each time the author's own conversation is compacted (a Codex
-  `contextCompaction` item, a Claude `compact_boundary`), both goal sessions call
-  `examine_after_compaction()`, which starts an examination unless the last one
-  still runs (a diagnostic then says so). An examination is a one-shot run
+- **The examiner** (the job setting `examinerPeriod`, which the server passes
+  as `--set examiner_period=N`: an examination every N compactions,
+  `DEFAULT_EXAMINER_PERIOD` 4, 0 for none, at most `MAX_EXAMINER_PERIOD` 100;
+  the earlier `--set examiner=false` still means none; the `author_examiner`
+  text, empty for none). `_execute` starts it with `start_team(lone=True,
+  period=N)`: a `runner/team.Team` without members, with one seat (number 1,
+  the author's model and reasoning), kept across the author's attempts. Each
+  time the author's own conversation is compacted (a Codex `contextCompaction`
+  item, a Claude `compact_boundary`), both goal sessions call
+  `examine_after_compaction()`, and `Team.compacted()` adds an entry to
+  `team/timeline.md` and starts an examination once N compactions have passed
+  since the last one started; when the last one still runs, a diagnostic says
+  so and the next compaction starts it. A new runner of the job counts on from
+  the compactions the timeline lists after its last examination
+  (`team.compactions_since_examination()`). A saved job's period comes from
+  `saved_examiner_period()`: its `examinerPeriod`, else its earlier
+  `examiner` (true: 1, every compaction, as it ran; false: 0), else 1 only
+  with an `author_examiner` text of its own. An examination is a one-shot run
   (`member_attempt()`) in the author's working folder: `codex exec --json`
   (persisted session, `exec fork` for a retry, `--disable multi_agent`,
   `--disable goals` and `-c agents.enabled=false`, `--ignore-user-config`,

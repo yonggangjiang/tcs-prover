@@ -1979,11 +1979,13 @@ def web_prompt_options(body, roles, source=None):
 # A job's goal loop when it records none: every job from before has Codex's goal mode (workflow_runner.GOAL_LOOPS);
 # new jobs, saved settings and requests without the setting get TCS Prover's.
 DEFAULT_GOAL_LOOP = "tcs"
-# The Examiner setting of a new job (the job setting examiner): an examiner beside the proof author, which TCS Prover
-# starts each time the author's conversation is compacted and whose report it sends to the author (the
-# author_examiner text). A job from before
-# the setting records none: it has an examiner only if it saved an author_examiner text of its own.
-DEFAULT_EXAMINER = True
+# The Examiner setting of a new job (the job setting examinerPeriod): an examiner beside the proof author, which TCS
+# Prover starts every this many compactions of the author's conversation and whose report it sends to the author (the
+# author_examiner text); 0: no examiner. A job saved with the earlier on/off setting (examiner) ran its examiner at
+# every compaction, and keeps that (1) or none (0); a job from before both has one at every compaction only if it
+# saved an author_examiner text of its own.
+DEFAULT_EXAMINER_PERIOD = runtime.DEFAULT_EXAMINER_PERIOD
+MAX_EXAMINER_PERIOD = runtime.MAX_EXAMINER_PERIOD
 LEGACY_GOAL_LOOP = "codex"
 # The texts a job runs with (its promptSet, by catalog name: prompt_catalog), saved at its start in its controller
 # folder and its run folder; every launch passes the controller's copy to the runner (--prompt-set-file).
@@ -2029,9 +2031,16 @@ def web_team_options(body, source=None):
         edits = ({**recorded, **{name: text for name, text in overrides.items() if isinstance(text, str)}}
                  if isinstance(recorded, dict) else False)
     source = source or {}
+    # The Examiner setting: the request's, else (a request of an earlier version) on for the default period and off
+    # for none, else the source job's, else the default.
+    if "examinerPeriod" in body:
+        period = body["examinerPeriod"]
+    elif isinstance(body.get("examiner"), bool):
+        period = DEFAULT_EXAMINER_PERIOD if body["examiner"] else 0
+    else:
+        period = source.get("examinerPeriod", DEFAULT_EXAMINER_PERIOD)
     return {"goal_loop": body.get("goalLoop", source.get("goalLoop", DEFAULT_GOAL_LOOP)),
-            # The Examiner setting: the request's, else the source job's, else on.
-            "examiner": body.get("examiner", source.get("examiner", DEFAULT_EXAMINER)),
+            "examiner_period": period,
             "prompt_overrides": texts, "prompt_edits": edits, "legacy_team": legacy}
 
 
@@ -2134,10 +2143,32 @@ def saved_team_state(run_dir):
         edits = saved_prompt_edits(run_dir)
         if edits is not None:
             state["promptEdits"] = edits
-    # The Examiner setting; a job from before it had an examiner only with an author_examiner text of its own.
-    state["examiner"] = (settings["examiner"] if isinstance(settings.get("examiner"), bool)
-                         else bool(texts is not None and str(texts.get("author_examiner") or "").strip()))
+    # The Examiner setting (saved_examiner_period()).
+    state["examinerPeriod"] = saved_examiner_period(settings, texts)
     return state
+
+
+def checked_examiner_period(value):
+    """The Examiner setting as a whole number from 0 to MAX_EXAMINER_PERIOD; ValueError otherwise."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_EXAMINER_PERIOD:
+        raise ValueError(f"Enter 0 to {MAX_EXAMINER_PERIOD} for the examiner: the compactions of the author's "
+                         "conversation between two examinations, 0 for no examiner.")
+    return value
+
+
+def saved_examiner_period(settings, texts):
+    """The examination period a saved job runs with, from its job-settings.json ``settings`` and its saved texts
+    ``texts`` (None for a job from before them): its examinerPeriod; else its earlier on/off examiner setting, which
+    examined at every compaction (1) or never (0); else, for a job from before both, 1 only with an author_examiner
+    text of its own."""
+
+    period = settings.get("examinerPeriod")
+    if isinstance(period, int) and not isinstance(period, bool) and 0 <= period <= MAX_EXAMINER_PERIOD:
+        return period
+    if isinstance(settings.get("examiner"), bool):
+        return 1 if settings["examiner"] else 0
+    return 1 if isinstance(texts, dict) and str(texts.get("author_examiner") or "").strip() else 0
 
 
 TRACE_LIMIT = 1500
@@ -2874,8 +2905,8 @@ def empty_state(trace=None, trace_version=0):
         # Who runs a Codex author's goal loop (workflow_runner.GOAL_LOOPS): a job from before records none and has
         # Codex's ("codex"), see restore_saved_app.
         "goalLoop": DEFAULT_GOAL_LOOP,
-        # The Examiner setting (DEFAULT_EXAMINER).
-        "examiner": DEFAULT_EXAMINER,
+        # The Examiner setting (DEFAULT_EXAMINER_PERIOD): an examination every this many compactions; 0: none.
+        "examinerPeriod": DEFAULT_EXAMINER_PERIOD,
         # The texts the job runs with, by Prompts-dialog name (PROMPT_SET_FILENAME), or None for a job from before.
         "promptSet": None,
         # Those of them the user edited (PROMPT_EDITS_FILENAME), which a rerun carries; None when the job saved none.
@@ -3992,7 +4023,7 @@ class App:
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
             "authorRepairDelivered", "pendingReanchor", "relatedWorksPending", "folderBatch", "authorQuestion",
             "timeLimitHistory", "resumeQueuedAt",
-            "goalLoop", "legacyTeam", "apiWebSearch", "examiner",
+            "goalLoop", "legacyTeam", "apiWebSearch", "examinerPeriod",
             "goals", "goalStartedAt", "newGoalPending",
         )
         # The solver rechecks historical settings while UI events persist
@@ -4718,11 +4749,12 @@ class App:
         retrieval_mode="live", retrieval_cutoff_utc="",
         workflow_stages=None,
         goal_loop=DEFAULT_GOAL_LOOP, prompt_overrides=None, prompt_edits=None,
-        legacy_team=False, examiner=DEFAULT_EXAMINER,
+        legacy_team=False, examiner_period=DEFAULT_EXAMINER_PERIOD,
     ):
         """Normalize and validate settings shared by both input modes.
 
-        ``examiner`` is the Examiner setting (DEFAULT_EXAMINER): whether the proof author gets an examiner.
+        ``examiner_period`` is the Examiner setting (DEFAULT_EXAMINER_PERIOD): an examination of the proof author's
+        run every this many compactions of its conversation, 0 for no examiner.
 
         ``goal_loop`` is who runs a Codex author's goal loop (runtime.GOAL_LOOPS; a web-cutoff job always records
         "codex": its audited configuration has no place for TCS Prover's server). ``legacy_team`` (a job made from a
@@ -4822,8 +4854,7 @@ class App:
             raise ValueError("Historical search requires Proof author enabled and Statement review disabled.")
         if goal_loop not in runtime.GOAL_LOOPS:
             raise ValueError("Choose TCS Prover or Codex as the goal loop.")
-        if not isinstance(examiner, bool):
-            raise ValueError("Choose on or off for the examiner.")
+        examiner_period = checked_examiner_period(examiner_period)
         historical = search_options["retrievalMode"] == "historical"
         if historical or legacy_team:
             goal_loop = LEGACY_GOAL_LOOP
@@ -4842,7 +4873,7 @@ class App:
                             **(prompt_overrides or {})}
         return {
             "goalLoop": goal_loop,
-            "examiner": examiner,
+            "examinerPeriod": examiner_period,
             "legacyTeam": bool(legacy_team),
             "promptSet": prompt_set,
             "promptEdits": None if prompt_edits is False else job_prompt_edits(prompt_edits, defaults_texts),
@@ -5602,9 +5633,11 @@ class App:
         if self.state.get("apiWebSearch"):
             # The API connections whose own search service the job searches through, as the job recorded them.
             options.extend(["--set", "api_web_search=" + json.dumps(self.state["apiWebSearch"])])
-        if self.state.get("examiner") is False:
-            # The Examiner setting is off (the runner's default is on, with an author_examiner text).
-            options.extend(["--set", "examiner=false"])
+        # The Examiner setting: an examination every this many compactions, 0 for none (a job whose state holds no
+        # valid number has none).
+        period = self.state.get("examinerPeriod")
+        period = period if isinstance(period, int) and not isinstance(period, bool) else 0
+        options.extend(["--set", f"examiner_period={period}"])
         texts = self.state.get("promptSet")
         if isinstance(texts, dict):
             path = self._save_controlled(PROMPT_SET_FILENAME,
@@ -10552,9 +10585,9 @@ def restore_saved_app(app, *, owned=True):
             if isinstance(settings.get("apiWebSearch"), list):
                 state["apiWebSearch"] = [value for value in settings["apiWebSearch"] if providers.is_api_id(value)]
             # The Examiner setting (a job from before records none, see below).
-            if isinstance(settings.get("examiner"), bool):
-                state["examiner"] = settings["examiner"]
-                persisted_settings.add("examiner")
+            if isinstance(settings.get("examinerPeriod"), int) or isinstance(settings.get("examiner"), bool):
+                state["examinerPeriod"] = saved_examiner_period(settings, None)
+                persisted_settings.add("examinerPeriod")
             # Roles a restart already moved to their replacement keep their warning.
             if isinstance(settings.get("replacedRoles"), list):
                 replaced_roles.update(role for role in settings["replacedRoles"] if role in ROLES)
@@ -10658,10 +10691,9 @@ def restore_saved_app(app, *, owned=True):
     app._saved_prompt_edits = state["promptEdits"]
     if "goalLoop" not in persisted_settings:
         state.update(goalLoop=LEGACY_GOAL_LOOP, goalLoopRecorded=False, legacyTeam=True)
-    if "examiner" not in persisted_settings:
+    if "examinerPeriod" not in persisted_settings:
         # A job from before the Examiner setting keeps what it had: an examiner only with a text of its own.
-        state["examiner"] = bool(isinstance(state["promptSet"], dict)
-                                 and str(state["promptSet"].get("author_examiner") or "").strip())
+        state["examinerPeriod"] = saved_examiner_period({}, state["promptSet"])
 
     direct_statement = False
     try:

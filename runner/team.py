@@ -52,11 +52,17 @@ MEMBER_LABELS = {"started": "Author subagent started", "finished": "Author subag
                  "failed": "Author subagent failed"}
 TEAM_FOLDER = "team"
 # The examiner (Team's ``examiner``): a seat beside the author whose only task is to examine the whole run, in a
-# fresh conversation each time, with the author_examiner text as its whole instruction. goal_session starts an
-# examination each time the author's conversation is compacted (examine()), unless the last one is still running.
+# fresh conversation each time, with the author_examiner text as its whole instruction. goal_session reports each
+# compaction of the author's conversation (compacted()), and every ``period``-th one starts an examination, unless the
+# last one is still running (then the next compaction starts it).
 EXAMINER_TASK = "Examination of the whole run"
-# The list of examinations with their times, which the examiner reads: team/timeline.md.
+# The list of examinations and of the author's compactions with their times, which the examiner reads:
+# team/timeline.md. It also keeps the count of compactions since the last examination for the job's next runner
+# (compactions_since_examination()).
 TIMELINE_FILE = "timeline.md"
+# Its entries for a compaction and for the start of an examination (Team.compacted(), Team._examine()).
+COMPACTION_ENTRY = re.compile(r"^## [^\n]*: author: conversation compacted\b", re.M)
+EXAMINATION_ENTRY = re.compile(r"^## [^\n]*: examiner: examination \S+ starts$", re.M)
 # A report's file name in its seat's folder (team/member-<n>/<k>-report.md): k is the examination's number.
 REPORT_FILE = re.compile(r"([0-9]+)-report\.md")
 # A Windows reparse point whose tag has this bit names another file: a symlink, a junction or a similar link, which
@@ -321,18 +327,23 @@ class Team:
     failed: <the text>". ``emit(kind, **fields)`` records (each record of an examination with its id,
     assignment_id(), which ``attempt`` finds as ``member.assignment``; a failed attempt's note carries the failure in
     plain words and the provider's own, ``describe(error)``, and when it is retried); ``directory`` is the author's
-    working folder, where reports are saved. examine() starts an examination, take_reports() collects the reports
-    that finished, close() stops the examiner (its record says why).
+    working folder, where reports are saved. compacted() counts a compaction of the author's conversation and starts
+    an examination every ``period`` of them (a whole number, 1 or more), counting on from the compactions the job's
+    earlier runners recorded since their last examination (team/timeline.md); examine() starts one at once;
+    take_reports() collects the reports that finished; close() stops the examiner (its record says why).
     """
 
     def __init__(self, members, *, prompts, directory, attempt, configuration, emit, render, retry_note,
                  retry_seconds=60, stop_process=None, conversation=None, discard=None, unavailable=None,
-                 describe=None, examiner=None, lone=True):
+                 describe=None, examiner=None, lone=True, period=1):
         self.members = {entry["member"]: _Member(entry) for entry in members}
         self.examiner = (_Member(examiner) if examiner and str(prompts.get("team_examiner") or "").strip()
                          and examiner["member"] not in self.members else None)
         self.lone = lone
         self.prompts, self.directory = prompts, Path(directory)
+        # How many compactions start an examination, and how many happened since the last one started.
+        self.period = max(1, int(period))
+        self.compactions = compactions_since_examination(self.directory) if self.examiner is not None else 0
         self.attempt, self.configuration, self.emit, self.render = attempt, configuration, emit, render
         self.retry_note, self.retry_seconds = retry_note, retry_seconds
         self.stop_process = stop_process or (lambda process: process.kill())
@@ -392,11 +403,33 @@ class Team:
             pass
 
     def examine(self):
-        """Start an examination now, unless the last one is still running or the examiner has stopped (goal_session
-        calls it when the author's conversation is compacted). True when one started."""
+        """Start an examination now, unless the last one is still running or the examiner has stopped. True when one
+        started."""
 
         with self.cond:
-            return self._examine()
+            started = self._examine()
+            if started:
+                self.compactions = 0
+            return started
+
+    def compacted(self):
+        """The author's conversation was compacted (goal_session, through workflow_runner.examine_after_compaction()):
+        count it in the timeline, and start an examination once ``period`` compactions have passed since the last one
+        started. "started", "counted" (not due yet), "busy" (due, but the last examination still runs: the next
+        compaction starts it) or "closed" (the examiner has stopped)."""
+
+        with self.cond:
+            if self.examiner is None or self.closed is not None:
+                return "closed"
+            self.compactions += 1
+            self._timeline(f"author: conversation compacted ({self.compactions} since the last examination started; "
+                           f"an examination starts every {self.period})")
+            if self.compactions < self.period:
+                return "counted"
+            if not self._examine():
+                return "busy"
+            self.compactions = 0
+            return "started"
 
     def take_reports(self):
         """The reports that finished since the last call, each once: {head, where, text, file}; they reach the
@@ -637,6 +670,27 @@ def highest_report(directory, number):
     except (OSError, ValueError):
         return 0
     return max((int(found.group(1)) for found in map(REPORT_FILE.fullmatch, names) if found), default=0)
+
+
+def compactions_since_examination(directory):
+    """How many compactions of the author's conversation team/timeline.md under ``directory`` records after its last
+    examination start (Team.compacted()), so that the job's next runner counts on; 0 without a readable timeline or
+    when it is reached through a link."""
+
+    folder = Path(directory, TEAM_FOLDER)
+    try:
+        info = os.lstat(folder)
+        if _linked(info) or not stat.S_ISDIR(info.st_mode):
+            return 0
+        descriptor = os.open(folder / TIMELINE_FILE, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                return 0
+            text = stream.read().decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return 0
+    starts = list(EXAMINATION_ENTRY.finditer(text))
+    return len(COMPACTION_ENTRY.findall(text, starts[-1].end() if starts else 0))
 
 
 def append_timeline(directory, text):

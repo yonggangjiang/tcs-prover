@@ -70,7 +70,7 @@ ROLE_WORDS = {"review": "Reviewer", "author": "Author", "critic": "Critic", "wri
 SETTINGS = ("workflowStages", "reviewModel", "reviewEffort", "authorModel", "authorEffort", "authorSubagents",
             "criticModel", "criticEffort", "criticCount", "criticRounds", "writerModel", "writerEffort",
             "thinkingHours", "speedMode", "reasoningSummary", "retrievalMode", "retrievalCutoffUtc",
-            "examiner")
+            "examinerPeriod")
 # What a preset keeps of each API model it names (from its catalog row): no key, no address.
 API_FIELDS = ("label", "model", "format", "sourceId", "sourceLabel")
 # Default settings: how the page names them, and their id in its list. The name always means them: it is never
@@ -130,7 +130,7 @@ def builtin_settings():
         "thinkingHours": server.DEFAULT_THINKING_HOURS, "speedMode": server.DEFAULT_SPEED,
         "reasoningSummary": server.DEFAULT_REASONING_SUMMARY, "retrievalMode": "live", "retrievalCutoffUtc": "",
         # The Examiner setting: saved settings from before have none and load with the default.
-        "examiner": server.DEFAULT_EXAMINER,
+        "examinerPeriod": server.DEFAULT_EXAMINER_PERIOD,
     }
 
 
@@ -212,7 +212,7 @@ def valid_settings(values, *, stored=False):
     (builtin_settings()), so a preset saved before a setting existed keeps loading. Models
     are kept for every role, also for stages that are off. As at Start, a setting that only
     a stage that is off uses (its role's model and reasoning, the author's subagents and
-    time limit, the critics and their rounds) is never refused: it is kept when it is
+    time limit and examiner, the critics and their rounds) is never refused: it is kept when it is
     valid, else it takes the original value, which Start runs a stage that is off with.
     ``stored``: read from the file (see _model()).
     """
@@ -233,7 +233,10 @@ def valid_settings(values, *, stored=False):
                    (f"{role}Effort", STAGES[role], lambda value, role=role: _effort(value, role))]
     checks += [("authorSubagents", "author", server.valid_author_subagents),
                ("criticCount", "critic", server.valid_critic_count), ("criticRounds", "critic", runtime.critic_limit),
-               ("thinkingHours", "author", _hours)]
+               ("thinkingHours", "author", _hours), ("examinerPeriod", "author", server.checked_examiner_period)]
+    if "examinerPeriod" not in values and isinstance(values.get("examiner"), bool):
+        # Settings saved with the on/off Examiner of earlier versions: on is the default period, off none.
+        settings["examinerPeriod"] = server.DEFAULT_EXAMINER_PERIOD if values["examiner"] else 0
     for key, stage, check in checks:
         if key not in values:
             continue
@@ -253,10 +256,6 @@ def valid_settings(values, *, stored=False):
             settings["reasoningSummary"] = values["reasoningSummary"]
         settings["retrievalMode"], settings["retrievalCutoffUtc"] = _cutoff(
             values.get("retrievalMode", "live"), values.get("retrievalCutoffUtc", ""))
-        if "examiner" in values:
-            if not isinstance(values["examiner"], bool):
-                raise PresetError("Choose on or off for the examiner.")
-            settings["examiner"] = values["examiner"]
     except PresetError:
         raise
     except (ValueError, runtime.Error) as exc:

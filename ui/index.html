@@ -363,15 +363,14 @@
                         2 or more: the author may also hand parts of the work to subagents of its own, up to one
                         fewer than this number at a time.
                       </p>
-                      <!-- The author's examiner (the job setting examiner; the author_examiner text). -->
-                      <label for="authorExaminer">5 · Examiner</label>
-                      <select id="authorExaminer" aria-describedby="authorExaminerHelp">
-                        <option value="on" selected>On — default</option>
-                        <option value="off">Off</option>
-                      </select>
-                      <p id="authorExaminerHelp" class="help model-setting-help">
-                        On: each time the author's conversation is compacted, a fresh session of the author's model
-                        examines the whole run and reports to the author, who goes on working with the report.
+                      <!-- The author's examiner (the job setting examinerPeriod; the author_examiner text). -->
+                      <label for="examinerPeriod">5 · Examiner: every N compactions</label>
+                      <input id="examinerPeriod" type="number" min="0" max="100" step="1" value="4"
+                        aria-describedby="examinerPeriodHelp">
+                      <p id="examinerPeriodHelp" class="help model-setting-help">
+                        Every N times the author's conversation is compacted (4 by default), a fresh session of the
+                        author's model examines the whole run and reports to the author, who goes on working with the
+                        report. 0: no examiner.
                       </p>
                     </div>
                     <div id="criticModelSetting" class="model-setting">
@@ -988,8 +987,8 @@
                    away. app.js renderExaminerReports draws it and reads the list again while the job runs. -->
               <details id="examinerReports" class="author-memory examiner-reports" hidden>
                 <summary><span class="author-memory-title">Examiner reports</span><span id="examinerReportsCount" class="author-memory-count"></span></summary>
-                <p class="help">Each time the author's conversation is compacted, an examiner reads the whole run and
-                  sends the author a report. Each row says at what point of the author's working time (pauses left
+                <p class="help">Every few compactions of the author's conversation (the job's Examiner setting), an
+                  examiner reads the whole run and sends the author a report. Each row says at what point of the author's working time (pauses left
                   out, as on the step's timer) the examination started, its report was done and it reached the author;
                   the clock times are in the row's tooltip. Open one to read it.</p>
                 <ol id="examinerReportsList" class="author-memory-list examiner-reports-list" aria-label="The examiner's reports"></ol>

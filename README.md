@@ -79,9 +79,9 @@ and `irm https://claude.ai/install.ps1 | iex`.
 1. **Statement review.** A model removes ambiguities and loopholes from your
    statement; you approve the result (**Approve and start**) or send feedback.
 2. **Author.** One author works on the proof, as long as it takes, in a single
-   conversation. It keeps its own memory on disk, and each time its
-   conversation is compacted an examiner (a fresh session of the same model)
-   examines the whole run and reports to it. With **Parallel agents** 2 or more it may also hand parts of
+   conversation. It keeps its own memory on disk, and every 4 compactions of
+   its conversation (**Examiner**, 0 for none) an examiner (a fresh session of
+   the same model) examines the whole run and reports to it. With **Parallel agents** 2 or more it may also hand parts of
    the work to subagents of its own. TCS Prover runs the author's turns
    itself; **Edit prompts** shows every text it sends, editable for the next
    job.

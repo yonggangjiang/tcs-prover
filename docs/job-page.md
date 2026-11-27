@@ -41,8 +41,9 @@ after 15 minutes of the same failure (see
 **Run settings**, below the activity log, lists the models and settings the job
 runs with. Its **Proof author** row ends with how the author works: *works
 alone* with **Parallel agents** 1, and with more *3 parallel agents: up to 2
-subagents of its own at a time*; the **Examiner** row below it says whether the
-author has an examiner.
+subagents of its own at a time*; the **Examiner** row below it says how often
+the author's examiner reports (*every 4 compactions of its conversation*), or
+*Off*.
 
 A **Goal loop** row follows: *TCS Prover (editable texts; this job runs with the
 texts saved when it started)* or *Codex built-in (the Codex CLI's own goal mode)*,
@@ -154,8 +155,9 @@ status.md, 14:05*), so you can see what the author works on without opening it.
 
 ## Examiner reports
 
-Each time the author's conversation is compacted, an examiner reads the whole
-run and sends the author a report (see [Workflow](workflow.md#the-examiner)).
+Every few compactions of the author's conversation (the job's **Examiner**
+setting), an examiner reads the whole run and sends the author a report (see
+[Workflow](workflow.md#the-examiner)).
 **Examiner reports**, under **Memory**, lists them once there is one, closed
 until you open it. Its line counts them and says when the latest reached the
 author (*Examiner reports · 4 reports · latest reached the author at 4h 14m of
